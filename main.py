@@ -5,7 +5,7 @@ from PIL import Image, ImageDraw
 
 from qvtree import QVTree
 
-# shit
+
 
 def get_device():
     if torch.cuda.is_available():
