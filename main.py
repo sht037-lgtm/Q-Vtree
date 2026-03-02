@@ -13,7 +13,7 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
-
+#111111
 @torch.no_grad()
 def get_clip_tokens_and_query_aligned(image_path, query_text, device,
                                       model_name="openai/clip-vit-large-patch14"):
