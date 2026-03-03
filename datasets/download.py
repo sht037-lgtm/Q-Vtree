@@ -8,6 +8,7 @@ import zipfile
 ATTENTION: Please log into your huggingface first.
 """
 
+
 def download_hf_dataset(
     repo_id: str,
     save_dir: str,
@@ -27,6 +28,7 @@ def download_hf_dataset(
 
     print("[INFO] Download complete.")
     return save_dir
+
 
 def download_zoom_eye_data(
     raw_dir: str = "./zoom_eye_data_raw",
