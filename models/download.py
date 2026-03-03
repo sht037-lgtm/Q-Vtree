@@ -4,10 +4,12 @@ from huggingface_hub import snapshot_download
 
 def download_hf_model(
     repo_id: str,
-    save_root: str = ".",
+    save_root: str = None,
     repo_type: str = "model",
-    use_symlinks: bool = False,
 ) -> str:
+
+    if save_root is None:
+        save_root = os.path.dirname(os.path.abspath(__file__))
 
     model_name = repo_id.split("/")[-1]
     local_dir = os.path.join(save_root, model_name)
@@ -22,7 +24,7 @@ def download_hf_model(
         repo_id=repo_id,
         repo_type=repo_type,
         local_dir=local_dir,
-        local_dir_use_symlinks=use_symlinks,
+        resume_download=True,
     )
 
     print(f"[INFO] Download complete: {local_dir}")
