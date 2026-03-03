@@ -58,14 +58,34 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return_dict=True
             ).pooler_output
 
-            # 2. Calculate global average query. [B, D]
-            if mm_token_type_ids is not None:
-                text_mask = (mm_token_type_ids == 0)  # 0 -> text, 1 -> image, 2 -> video
-                q = (inputs_embeds * text_mask.unsqueeze(-1)).sum(dim=1) / (
-                    text_mask.sum(dim=1, keepdim=True).clamp_min(1)
+            # 2. Compute TEXT semantic query q using LLM hidden states. q: [B, D]
+            with torch.no_grad():
+                if mm_token_type_ids is not None:
+                    text_mask = (mm_token_type_ids == 0)  # [B, L]
+                else:
+                    text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+                # Run a text-only LM pass to get contextualized representations
+                # (We don't inject image tokens here; inputs_embeds is still text embeddings.)
+                text_outputs = self.language_model(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    position_ids=None,  # text-only
+                    use_cache=False,
+                    return_dict=True,
+                    **kwargs,
                 )
-            else:
-                q = inputs_embeds.mean(dim=1)
+                hidden = text_outputs.last_hidden_state  # [B, L, D]
+
+                # take last text token per sample
+                B = hidden.size(0)
+                # set non-text positions to -1 then argmax -> last True index
+                idx = torch.arange(hidden.size(1), device=hidden.device).unsqueeze(0).expand(B, -1)  # [B, L]
+                idx = idx.masked_fill(~text_mask, -1)
+                last_text_pos = idx.argmax(dim=1)  # [B]
+
+                q = hidden[torch.arange(B, device=hidden.device), last_text_pos]  # [B, D]
 
             selected_idx_per_image = []
             new_image_tokens_list = []
