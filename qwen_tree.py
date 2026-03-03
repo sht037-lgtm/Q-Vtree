@@ -12,7 +12,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
     def __init__(self, config):
         super().__init__(config)
 
-        self.qvtree = QVTree(D=config.hidden_size)
+        self.qvtree = QVTree(D=config.text_config.hidden_size)
         self._debug_selected_idx = None
 
     def forward(
