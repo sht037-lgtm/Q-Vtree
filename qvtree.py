@@ -294,7 +294,7 @@ class QuadTreeNavigator:
                     sc = float(self.scorer(qb, cfeat).item())
                     # test threshold version
                     # if sc > sp:
-                    if sc > 0.1:
+                    if sc > 0.5:
                         better_children.append(cid)
 
                 if len(better_children) == 0:
