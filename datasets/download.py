@@ -6,18 +6,14 @@ from huggingface_hub import login, snapshot_download
 # ======================
 # Config
 # ======================
-HF_TOKEN = "to be filled"
 SAVE_DIR = "./zoom_eye_data_raw"
 UNZIP_DIR = "."
-
-if HF_TOKEN is None:
-    raise ValueError("Please set HF_TOKEN environment variable.")
 
 # ======================
 # Login
 # ======================
 print("Logging into HuggingFace...")
-login(HF_TOKEN)
+login("input your hf token here")
 
 # ======================
 # Download
