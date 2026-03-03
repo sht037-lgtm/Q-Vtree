@@ -32,7 +32,6 @@ def download_qwen():
 
     model_path = download_hf_model(
         repo_id="Qwen/Qwen2.5-VL-3B-Instruct",
-        save_root="./models"
     )
 
     print("Model path:", model_path)
