@@ -1,47 +1,65 @@
 import os
+from huggingface_hub import snapshot_download
 import shutil
 import zipfile
-from huggingface_hub import login, snapshot_download
+
 
 """
 ATTENTION: Please log into your huggingface first.
 """
 
-# ======================
-# Config
-# ======================
-SAVE_DIR = "./zoom_eye_data_raw"
-UNZIP_DIR = "."
+def download_hf_dataset(
+    repo_id: str,
+    save_dir: str,
+) -> str:
+    if os.path.exists(save_dir) and len(os.listdir(save_dir)) > 0:
+        print(f"[INFO] Dataset already exists at {save_dir}")
+        return save_dir
 
-# ======================
-# Download
-# ======================
-print("Downloading dataset...")
-snapshot_download(
-    repo_id="omlab/zoom_eye_data",
-    repo_type="dataset",
-    local_dir=SAVE_DIR,
-    local_dir_use_symlinks=False,
-)
+    print(f"[INFO] Downloading dataset: {repo_id}")
 
-print("Download complete.")
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=save_dir,
+        resume_download=True,
+    )
 
-# ======================
-# Unzip
-# ======================
-zip_path = os.path.join(SAVE_DIR, "zoom_eye_data.zip")
+    print("[INFO] Download complete.")
+    return save_dir
 
-if os.path.exists(zip_path):
-    print("Unzipping dataset...")
+def download_zoom_eye_data(
+    raw_dir: str = "./zoom_eye_data_raw",
+    extract_to: str = ".",
+    cleanup: bool = True,
+):
+    """
+    Download and extract ZoomEye dataset.
+    """
+
+    repo_id = "omlab/zoom_eye_data"
+
+    download_hf_dataset(
+        repo_id=repo_id,
+        save_dir=raw_dir,
+    )
+
+    zip_path = os.path.join(raw_dir, "zoom_eye_data.zip")
+
+    if not os.path.exists(zip_path):
+        print("[INFO] zip file not found. Possibly already extracted.")
+        return
+
+    print("[INFO] Extracting ZoomEye dataset...")
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        zip_ref.extractall(UNZIP_DIR)
-    print("Unzip complete.")
-else:
-    print("zip file not found. Maybe already extracted?")
+        zip_ref.extractall(extract_to)
 
-# ======================
-# Cleanup
-# ======================
-print("Cleaning up raw download folder...")
-shutil.rmtree(SAVE_DIR, ignore_errors=True)
-print("Cleanup complete.")
+    print("[INFO] Extraction complete.")
+
+    if cleanup:
+        print("[INFO] Cleaning up raw folder...")
+        shutil.rmtree(raw_dir, ignore_errors=True)
+        print("[INFO] Cleanup complete.")
+
+if __name__ == '__main__':
+    download_zoom_eye_data()
