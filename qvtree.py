@@ -295,11 +295,6 @@ class QuadTreeNavigator:
                     sc = float(self.scorer(qb, cfeat).item())
                     if sc > sp:
                         better_children.append(cid)
-
-                if len(better_children) == 0:
-                    selected[b].append(pid)
-                else:
-                    Q.extend(better_children)
                 """
 
                 # test threshold version
@@ -312,6 +307,11 @@ class QuadTreeNavigator:
 
                     if sc > sp + margin:
                         better_children.append(cid)
+
+                if len(better_children) == 0:
+                    selected[b].append(pid)
+                else:
+                    Q.extend(better_children)
 
         return selected, visited
 
