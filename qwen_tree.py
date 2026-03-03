@@ -60,11 +60,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             # 2. Compute TEXT semantic query q using LLM hidden states. q: [B, D]
             with torch.no_grad():
-                if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0)  # [B, L]
-                else:
-                    text_mask = torch.ones_like(input_ids, dtype=torch.bool)
-
                 # Run a text-only LM pass to get contextualized representations
                 # (We don't inject image tokens here; inputs_embeds is still text embeddings.)
                 text_outputs = self.language_model(
@@ -77,13 +72,18 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     **kwargs,
                 )
                 hidden = text_outputs.last_hidden_state  # [B, L, D]
+                B, L, D = hidden.shape
 
-                # take last text token per sample
-                B = hidden.size(0)
-                # set non-text positions to -1 then argmax -> last True index
-                idx = torch.arange(hidden.size(1), device=hidden.device).unsqueeze(0).expand(B, -1)  # [B, L]
-                idx = idx.masked_fill(~text_mask, -1)
-                last_text_pos = idx.argmax(dim=1)  # [B]
+                # build text_mask on the SAME device as hidden
+                if mm_token_type_ids is not None:
+                    text_mask = (mm_token_type_ids == 0).to(hidden.device)  # [B, L]
+                else:
+                    text_mask = torch.ones((B, L), dtype=torch.bool, device=hidden.device)
+
+                # pick last text token position per sample
+                pos = torch.arange(L, device=hidden.device).unsqueeze(0).expand(B, -1)  # [B, L]
+                pos = pos.masked_fill(~text_mask, -1)
+                last_text_pos = pos.argmax(dim=1)  # [B]
 
                 q = hidden[torch.arange(B, device=hidden.device), last_text_pos]  # [B, D]
 
