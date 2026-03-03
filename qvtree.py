@@ -288,19 +288,30 @@ class QuadTreeNavigator:
                     selected[b].append(pid)
                     continue
 
+                """
                 better_children = []
                 for cid in ch:
                     cfeat = feats[cid, b:b+1, :]
                     sc = float(self.scorer(qb, cfeat).item())
-                    # test threshold version
-                    # if sc > sp:
-                    if sc > 0.5:
+                    if sc > sp:
                         better_children.append(cid)
 
                 if len(better_children) == 0:
                     selected[b].append(pid)
                 else:
                     Q.extend(better_children)
+                """
+
+                # test threshold version
+                margin = 0.1  # adjustable
+
+                better_children = []
+                for cid in ch:
+                    cfeat = feats[cid, b:b + 1, :]
+                    sc = float(self.scorer(qb, cfeat).item())
+
+                    if sc > sp + margin:
+                        better_children.append(cid)
 
         return selected, visited
 
