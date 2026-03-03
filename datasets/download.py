@@ -3,17 +3,15 @@ import shutil
 import zipfile
 from huggingface_hub import login, snapshot_download
 
+"""
+ATTENTION: Please log into your huggingface first.
+"""
+
 # ======================
 # Config
 # ======================
 SAVE_DIR = "./zoom_eye_data_raw"
 UNZIP_DIR = "."
-
-# ======================
-# Login
-# ======================
-print("Logging into HuggingFace...")
-login("input your hf token here")
 
 # ======================
 # Download
