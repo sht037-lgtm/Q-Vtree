@@ -7,6 +7,9 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from collections import deque
+
 
 
 # =============================
@@ -47,6 +50,7 @@ class Node:
 # =============================
 # 2) Scoring (pluggable)
 # =============================
+
 class BaseScorer(nn.Module):
     """Interface: score(q, f) -> [B]."""
     def forward(self, q: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
@@ -57,9 +61,9 @@ class CosineScorer(nn.Module):
     """
     Cosine similarity scorer.
     Assumes q and f are already aligned: q.shape[-1] == f.shape[-1].
-    No projection. If mismatch, raise error.
+    No projection. If mismatched, raise error.
     """
-    def __init__(self, eps: float = 1e-8):
+    def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = float(eps)
 
@@ -70,11 +74,12 @@ class CosineScorer(nn.Module):
         return: [B]
         """
         if q.shape[-1] != f.shape[-1]:
-            raise ValueError(f"Expected aligned dims, but got q:{q.shape} and f:{f.shape}")
+            raise ValueError(f"Expected aligned dims, but got q:{q.shape[-1]} and f:{f.shape[-1]}")
 
         q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
         f = f / (f.norm(dim=-1, keepdim=True) + self.eps)
         return (q * f).sum(dim=-1)
+
 
 # =============================
 # 3) Full quadtree builder
@@ -95,6 +100,7 @@ class QuadTreeBuilder:
 
     @staticmethod
     def infer_hw(N: int, require_square_grid: bool = True) -> Tuple[int, int]:
+        """N -> H and W"""
         if require_square_grid:
             H = int(math.isqrt(N))
             if H * H != N:
@@ -134,7 +140,7 @@ class QuadTreeBuilder:
 
     @classmethod
     def region_mean(cls, prefix: torch.Tensor, reg: Region) -> torch.Tensor:
-        """Mean over region -> [B,D]"""
+        """Average Pooling: mean over region -> [B,D]"""
         return cls.region_sum(prefix, reg) / float(reg.area)
 
     @staticmethod
@@ -152,6 +158,7 @@ class QuadTreeBuilder:
             return None
         rm = (reg.r0 + reg.r1) // 2
         cm = (reg.c0 + reg.c1) // 2
+
         if rm == reg.r0 or rm == reg.r1 or cm == reg.c0 or cm == reg.c1:
             return None
 
@@ -186,9 +193,9 @@ class QuadTreeBuilder:
         next_id += 1
 
         # BFS to build FULL tree
-        queue = [0]
+        queue = deque([0])  # Optimization: O(n) -> O(1)
         while queue:
-            pid = queue.pop(0)
+            pid = queue.popleft()
             preg = nodes[pid].region
 
             if not self.can_split(preg):
@@ -220,11 +227,11 @@ class QuadTreeBuilder:
 
 
 # =============================
-# 4) Navigator (Algorithm 1)
+# 4) Navigator
 # =============================
 class QuadTreeNavigator:
     """
-    Implements your PDF Algorithm 1 (multi-branch synchronous zoom-in):
+    Implement Algorithm 1: multi-branch synchronous zoom-in:
 
       Q <- {root}
       S <- empty
@@ -250,8 +257,9 @@ class QuadTreeNavigator:
         rr, cc = torch.meshgrid(rows, cols, indexing="ij")
         return (rr * W + cc).reshape(-1)
 
+    # there is a problem about ".item()"
     @torch.no_grad()
-    def select_nodes(self, nodes: List[Node], q: torch.Tensor) -> List[List[int]]:
+    def select_nodes(self, nodes: List[Node], q: torch.Tensor) -> Tuple[List[List[int]], List[List[int]]]:
         """
         Per-sample navigation to keep logic exact.
         Return: selected_node_ids[b] = list of node ids in S for sample b.
@@ -265,10 +273,10 @@ class QuadTreeNavigator:
 
         for b in range(B):
             qb = q[b:b+1]  # [1,Dq] , query
-            Q = [0]        # root
+            Q = deque([0])  # root
 
             while Q:
-                pid = Q.pop(0)
+                pid = Q.popleft()  # Optimization: O(n) -> O(1)
                 visited[b].append(pid)
 
                 pfeat = feats[pid, b:b+1, :]  # [1,D]
