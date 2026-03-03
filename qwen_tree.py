@@ -1,0 +1,174 @@
+import torch
+import torch.nn as nn
+from qvtree import QVTree
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLModel,  # override
+    Qwen2_5_VLForConditionalGeneration,
+)
+
+
+class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.qvtree = QVTree(D=config.hidden_size)
+        self._debug_selected_idx = None
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        rope_deltas=None,
+        mm_token_type_ids=None,
+        cache_position=None,
+        second_per_grid_ts=None,
+        **kwargs,
+    ):
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        # =============================
+        # Vision Part
+        # =============================
+        if pixel_values is not None:
+
+            # 1. Get patch tokens（List[Tensor(Ni, D)]）
+            image_tokens_list = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                return_dict=True
+            ).pooler_output
+
+            # 2. Calculate global average query. [B, D]
+            if mm_token_type_ids is not None:
+                text_mask = (mm_token_type_ids == 0)  # 0 -> text, 1 -> image, 2 -> video
+                q = (inputs_embeds * text_mask.unsqueeze(-1)).sum(dim=1) / (
+                    text_mask.sum(dim=1, keepdim=True).clamp_min(1)
+                )
+            else:
+                q = inputs_embeds.mean(dim=1)
+
+            selected_idx_per_image = []
+            new_image_tokens_list = []
+
+            # run tree for every image
+            for i, tokens in enumerate(image_tokens_list):
+
+                # tokens: [Ni, D]
+                x = tokens.unsqueeze(0)  # [1, Ni, D]
+                qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th averaged query qi. [1, D]
+
+                out = self.qvtree(x, qi)
+                sel_idx = out["selected_token_indices"][0]
+
+                selected_idx_per_image.append(sel_idx)
+
+                # 4. Keep the length unchanged, only mask
+                keep = torch.zeros(tokens.size(0), device=tokens.device, dtype=tokens.dtype)  # [Ni]
+                keep[sel_idx] = 1.0  # [Ni]
+                tokens_masked = tokens * keep.unsqueeze(-1)  # broadcast
+
+                # tokens_masked is finally selected tokens with shape [Ni, D]
+                new_image_tokens_list.append(tokens_masked)
+
+            # debug save
+            self._debug_selected_idx = selected_idx_per_image
+
+            # 5. Concat back. List[Tensor(Ni, D)] -> Tensor(sum_i Ni, D)
+            image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
+                inputs_embeds.device,
+                inputs_embeds.dtype
+            )
+
+            # same as original version
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=image_embeds
+            )
+
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        # =============================
+        # 视频部分（不改）
+        # =============================
+        if pixel_values_videos is not None:
+            video_embeds = self.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                return_dict=True
+            ).pooler_output
+
+            video_embeds = torch.cat(video_embeds, dim=0).to(
+                inputs_embeds.device,
+                inputs_embeds.dtype
+            )
+
+            _, video_mask = self.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                video_features=video_embeds
+            )
+
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        # =============================
+        # position ids
+        # =============================
+        if position_ids is None:
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        # =============================
+        # LLM
+        # =============================
+        outputs = self.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        return outputs
+
+
+class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGeneration):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        # Change to tree-version backbone
+        self.model = Qwen2_5_VLModelWithTree(config)
