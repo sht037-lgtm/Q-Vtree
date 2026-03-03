@@ -31,7 +31,7 @@ def download_hf_dataset(
 
 
 def download_zoom_eye_data(
-    raw_dir: str = "./datasets/zoom_eye_data_raw",
+    raw_dir: str = "./zoom_eye_data_raw",
     extract_to: str = ".",
     cleanup: bool = True,
 ):
