@@ -4,6 +4,7 @@ from qvtree import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,  # override
     Qwen2_5_VLForConditionalGeneration,
+    Qwen2_5_VLModelOutputWithPast
 )
 
 
@@ -74,6 +75,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # tokens: [Ni, D]
                 x = tokens.unsqueeze(0)  # [1, Ni, D]
+                """
+                to be fixed: only support single image input now.
+                """
                 qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th averaged query qi. [1, D]
 
                 out = self.qvtree(x, qi)
@@ -98,7 +102,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 inputs_embeds.dtype
             )
 
-            # same as original version
+            # no change
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
@@ -108,7 +112,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         # =============================
-        # 视频部分（不改）
+        # Video part (no change)
         # =============================
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(
@@ -162,13 +166,25 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             **kwargs,
         )
 
-        return outputs
+        output = Qwen2_5_VLModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=self.rope_deltas,
+        )
+        return output if return_dict else output.to_tuple()
 
 
 class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGeneration):
-
     def __init__(self, config):
         super().__init__(config)
 
-        # Change to tree-version backbone
+        # Save original backbone weights
+        old_state_dict = self.model.state_dict()
+
+        # Replace backbone
         self.model = Qwen2_5_VLModelWithTree(config)
+
+        # Load the original weight
+        self.model.load_state_dict(old_state_dict, strict=False)
