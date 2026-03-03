@@ -6,7 +6,7 @@ from huggingface_hub import login, snapshot_download
 # ======================
 # Config
 # ======================
-HF_TOKEN = "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"
+HF_TOKEN = ""
 SAVE_DIR = "./zoom_eye_data_raw"
 UNZIP_DIR = "."
 
