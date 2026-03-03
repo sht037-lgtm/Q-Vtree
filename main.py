@@ -6,7 +6,6 @@ from PIL import Image, ImageDraw
 from qvtree import QVTree
 
 
-
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
