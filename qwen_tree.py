@@ -55,7 +55,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             # init debug container
             self._debug_patch_ids = []
 
-            # 1. Get patch tokens（List[Tensor(Ni, D)]）
+            # 1. Get patch tokens（List[Tensor(Ni, D)]）(After downsample)
             image_tokens_list = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
@@ -96,11 +96,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             for i, tokens in enumerate(image_tokens_list):
 
                 # tokens: [Ni, D]
-                x = tokens.unsqueeze(0)  # [1, Ni, D]
+                x = tokens.unsqueeze(0)  # [1, Ni, D] (after downsample)
                 """
                 to be fixed: only support single image input now.
                 """
-                qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th averaged query qi. [1, D]
+                qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th query qi. [1, D]
 
                 # selected nodes ids
                 out = self.qvtree(x, qi)
@@ -112,14 +112,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 grid_w = out["W"]
 
                 # node ids -> patch ids
-                patch_ids = []
-                for nid in sel_nodes:
-                    region = nodes[nid].region
+                token_out = self.qvtree.navigator.nodes_to_tokens(
+                    nodes,
+                    H=grid_h,
+                    W=grid_w,
+                    selected_node_ids=[sel_nodes],
+                    x=x
+                )
 
-                    for r in range(region.r0, region.r1):
-                        for c in range(region.c0, region.c1):
-                            patch_ids.append(r * grid_w + c)
-                patch_ids = sorted(set(patch_ids))
+                patch_ids = token_out["selected_token_indices"][0]
 
                 # debug store
                 self._debug_patch_ids.append(patch_ids)
