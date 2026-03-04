@@ -52,6 +52,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         if pixel_values is not None:
 
+            # init debug container
+            self._debug_patch_ids = []
+
             # 1. Get patch tokens（List[Tensor(Ni, D)]）
             image_tokens_list = self.get_image_features(
                 pixel_values,
