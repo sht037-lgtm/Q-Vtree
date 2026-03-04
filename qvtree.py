@@ -81,6 +81,29 @@ class CosineScorer(nn.Module):
         return (q * f).sum(dim=-1)
 
 
+class DotProductScorer(nn.Module):
+    """
+    Dot-product similarity scorer.
+    Assumes q and f are already aligned: q.shape[-1] == f.shape[-1].
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        """
+        q: [B, D]
+        f: [B, D]
+        return: [B]
+        """
+        if q.shape[-1] != f.shape[-1]:
+            raise ValueError(
+                f"Expected aligned dims, but got q:{q.shape[-1]} and f:{f.shape[-1]}"
+            )
+
+        return (q * f).sum(dim=-1)
+
+
 # =============================
 # 3) Full quadtree builder
 # =============================
@@ -370,7 +393,7 @@ class QVTree(nn.Module):
     def __init__(self, D: int, Dq: Optional[int] = None, use_proj_if_needed: bool = True):
         super().__init__()
         self.builder = QuadTreeBuilder(require_square_grid=True)
-        self.scorer = CosineScorer()
+        self.scorer = DotProductScorer()
         self.navigator = QuadTreeNavigator(self.scorer)
 
     @torch.no_grad()
