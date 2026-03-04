@@ -150,7 +150,7 @@ def main():
     device = get_device()
     print("Using device:", device)
 
-    IMAGE_PATH = "img/demo.jpg"
+    IMAGE_PATH = "img/demo_1.jpg"
     QUERY_TEXT = "how many flags are in the photo?"
 
     os.makedirs("output", exist_ok=True)
