@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from qvtree import QVTree, region_to_patch_ids
+from qvtree import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,  # override
     Qwen2_5_VLForConditionalGeneration,
@@ -14,6 +14,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
         self.qvtree = QVTree(D=config.text_config.hidden_size)
         self._debug_selected_idx = None
+        self._debug_patch_ids = None
 
     def forward(
         self,
@@ -98,20 +99,26 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 """
                 qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th averaged query qi. [1, D]
 
+                # selected nodes ids
                 out = self.qvtree(x, qi)
-                sel_nodes = out["selected_token_indices"][0]
+                sel_nodes = out["selected_node_ids"][0]
                 selected_idx_per_image.append(sel_nodes)
-
+                # tree nodes
+                nodes = out["nodes"]
                 grid_w = int(tokens.size(0) ** 0.5)
 
                 # node ids -> patch ids
                 patch_ids = []
                 for nid in sel_nodes:
-                    region = self.qvtree.nodes[nid].region
+                    region = nodes[nid].region
+
                     for r in range(region.r0, region.r1):
                         for c in range(region.c0, region.c1):
                             patch_ids.append(r * grid_w + c)
                 patch_ids = sorted(set(patch_ids))
+
+                # debug store
+                self._debug_patch_ids.append(patch_ids)
 
                 keep = torch.zeros(tokens.size(0), device=tokens.device, dtype=tokens.dtype)
                 keep[patch_ids] = 1.0

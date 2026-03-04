@@ -416,10 +416,3 @@ class QVTree(nn.Module):
             "visited_node_ids": visited_node_ids,
             **token_out,
         }
-
-def region_to_patch_ids(region: Region, grid_w: int):
-    ids = []
-    for r in range(region.r0, region.r1):
-        for c in range(region.c0, region.c1):
-            ids.append(r * grid_w + c)
-    return ids
