@@ -108,7 +108,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 selected_idx_per_image.append(sel_nodes)
                 # tree nodes
                 nodes = out["nodes"]
-                _, grid_h, grid_w = image_grid_thw[i]
+                grid_h = out["H"]
+                grid_w = out["W"]
 
                 # node ids -> patch ids
                 patch_ids = []
