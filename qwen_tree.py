@@ -80,12 +80,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 else:
                     text_mask = torch.ones((B, L), dtype=torch.bool, device=hidden.device)
 
-                # pick last text token position per sample
-                pos = torch.arange(L, device=hidden.device).unsqueeze(0).expand(B, -1)  # [B, L]
-                pos = pos.masked_fill(~text_mask, -1)
-                last_text_pos = pos.argmax(dim=1)  # [B]
+                # compute average text embedding
+                mask = text_mask.unsqueeze(-1)  # [B,L,1]
 
-                q = hidden[torch.arange(B, device=hidden.device), last_text_pos]  # [B, D]
+                q = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
 
             selected_idx_per_image = []
             new_image_tokens_list = []
