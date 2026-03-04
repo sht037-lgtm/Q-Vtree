@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from qvtree import QVTree
+from qvtree import QVTree, region_to_patch_ids
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,  # override
     Qwen2_5_VLForConditionalGeneration,
@@ -99,14 +99,24 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th averaged query qi. [1, D]
 
                 out = self.qvtree(x, qi)
-                sel_idx = out["selected_token_indices"][0]
+                sel_nodes = out["selected_token_indices"][0]
+                selected_idx_per_image.append(sel_nodes)
 
-                selected_idx_per_image.append(sel_idx)
+                grid_w = int(tokens.size(0) ** 0.5)
 
-                # 4. Keep the length unchanged, only mask
-                keep = torch.zeros(tokens.size(0), device=tokens.device, dtype=tokens.dtype)  # [Ni]
-                keep[sel_idx] = 1.0  # [Ni]
-                tokens_masked = tokens * keep.unsqueeze(-1)  # broadcast
+                # node ids -> patch ids
+                patch_ids = []
+                for nid in sel_nodes:
+                    region = self.qvtree.nodes[nid].region
+                    for r in range(region.r0, region.r1):
+                        for c in range(region.c0, region.c1):
+                            patch_ids.append(r * grid_w + c)
+                patch_ids = sorted(set(patch_ids))
+
+                keep = torch.zeros(tokens.size(0), device=tokens.device, dtype=tokens.dtype)
+                keep[patch_ids] = 1.0
+
+                tokens_masked = tokens * keep.unsqueeze(-1)
 
                 # tokens_masked is finally selected tokens with shape [Ni, D]
                 new_image_tokens_list.append(tokens_masked)
