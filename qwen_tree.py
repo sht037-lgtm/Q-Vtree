@@ -136,6 +136,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 )
 
                 patch_ids = token_out["selected_token_indices"][0]
+                patch_offset = tokens.size(0) - grid_h * grid_w
+                patch_ids = patch_ids + patch_offset
 
                 # debug store
                 self._debug_patch_ids.append(patch_ids)

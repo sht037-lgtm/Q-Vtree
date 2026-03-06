@@ -450,7 +450,7 @@ class QVTree(nn.Module):
     def __init__(self, D: int, Dq: Optional[int] = None, use_proj_if_needed: bool = True):
         super().__init__()
         self.builder = QuadTreeBuilder(require_square_grid=True)
-        self.scorer = DotProductScorer()
+        self.scorer = AttentionScorer()
         self.navigator = QuadTreeNavigator(self.scorer)
 
     @torch.no_grad()
