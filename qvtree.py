@@ -106,56 +106,66 @@ class DotProductScorer(nn.Module):
 
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6):
+    def __init__(self, eps=1e-6, tau=2.0):
         super().__init__()
         self.eps = eps
+        self.tau = tau
 
     def forward(self, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
         t : [B, Lt, D]   text tokens
         v : [B, Lv, D]   vision tokens
 
-        return : [B, Lv]   the attention scores of all vision tokens
+        return : [B, Lv]   attention scores of all vision tokens
         """
 
-        t = F.normalize(t, dim=-1)
-        v = F.normalize(v, dim=-1)
+        t = F.normalize(t, dim=-1, eps=self.eps)
+        v = F.normalize(v, dim=-1, eps=self.eps)
 
-        # vision -> text similarity S_vt
-        S_vt = v @ t.transpose(-1, -2)  # [B, Lv, D] @ [B, D, Lt] -> [B, Lv, Lt]
+        t = torch.nan_to_num(t)
+        v = torch.nan_to_num(v)
 
-        # vision -> text attention A_vt
-        A_vt = torch.softmax(S_vt, dim=2)  # softmax on text dimension, [B, Lv, Lt]
+        # vision -> text similarity
+        S_vt = v @ t.transpose(-1, -2)   # [B, Lv, Lt]
+        S_vt = torch.nan_to_num(S_vt)
 
-        # compute average text attention scores
-        text_score = A_vt.mean(dim=1)  # [B, Lv, Lt] -> [B, Lt]
+        # stable softmax over text
+        S_vt = S_vt / self.tau
+        S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
+        A_vt = torch.softmax(S_vt, dim=2)
+        A_vt = torch.nan_to_num(A_vt)
 
-        # compute mean score as the threshold
+        # average text attention scores
+        text_score = A_vt.mean(dim=1)    # [B, Lt]
         mean_score = text_score.mean(dim=1, keepdim=True)
 
-        # choose text tokens with higher score than mean as final raters
         scores = []
         for b in range(t.shape[0]):
-            rater_mask = text_score[b] >= mean_score[b]  # [lt, ]
+            rater_mask = text_score[b] >= mean_score[b]
 
-            #
+            # fallback: keep at least one rater
             if rater_mask.sum() == 0:
                 t_r = t[b]
             else:
-                t_r = t[b][rater_mask]  # [lt, D] -> [lr, D], lr means num(raters)
+                t_r = t[b][rater_mask]   # [Lr, D]
 
-            # raters to vision similarity S_tv
-            S_tv = v[b] @ t_r.T  # [lv, D] @ [D, lr] -> [lv, lr]
+            # raters -> vision similarity
+            S_tv = v[b] @ t_r.T          # [Lv, Lr]
+            S_tv = torch.nan_to_num(S_tv)
 
-            # text to vision attention A_tv
-            A_tv = torch.softmax(S_tv, dim=0)  # softmax on vision dimension, [lv, lr]
+            # stable softmax over vision
+            S_tv = S_tv / self.tau
+            S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
+            A_tv = torch.softmax(S_tv, dim=0)
+            A_tv = torch.nan_to_num(A_tv)
 
-            # compute average vision attention scores
-            vision_score = A_tv.mean(dim=1)  # [lv, lr] -> [lv]
+            # average vision attention scores
+            vision_score = A_tv.mean(dim=1)   # [Lv]
+            vision_score = torch.nan_to_num(vision_score)
 
             scores.append(vision_score)
 
-        return torch.stack(scores)  # [B, lv]
+        return torch.stack(scores)  # [B, Lv]
 
 
 # =============================

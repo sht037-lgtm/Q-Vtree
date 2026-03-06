@@ -136,6 +136,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 )
 
                 patch_ids = token_out["selected_token_indices"][0]
+
+                # fallback 1: if empty patch, return and keep all.
+                if patch_ids.numel() == 0:
+                    patch_ids = torch.arange(tokens.size(0), device=tokens.device)
+
+                # fallback 2: boundary inspection
+                patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
+                patch_ids = torch.unique(patch_ids)
+
                 patch_offset = tokens.size(0) - grid_h * grid_w
                 patch_ids = patch_ids + patch_offset
 
@@ -158,7 +167,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 inputs_embeds.dtype
             )
 
-            # no change
+            image_embeds = torch.nan_to_num(image_embeds)
+            inputs_embeds = torch.nan_to_num(inputs_embeds)
+
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
@@ -166,6 +177,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             )
 
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = torch.nan_to_num(inputs_embeds)
 
         # =============================
         # Video part (no change)
