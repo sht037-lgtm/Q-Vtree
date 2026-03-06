@@ -466,6 +466,9 @@ class QVTree(nn.Module):
         # ---------- 1. compute patch importance once ----------
         patch_scores = self.navigator.scorer(t, x)  # [B, N]
 
+        # debug store
+        self._debug_patch_scores = patch_scores
+
         # ---------- 2. tree navigation ----------
         selected_node_ids, visited_node_ids = self.navigator.select_nodes(
             nodes,
