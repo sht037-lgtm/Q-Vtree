@@ -104,6 +104,60 @@ class DotProductScorer(nn.Module):
         return (q * f).sum(dim=-1)
 
 
+class AttentionScorer(nn.Module):
+
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        t : [B, Lt, D]   text tokens
+        v : [B, Lv, D]   vision tokens
+
+        return : [B, Lv]   the attention scores of all vision tokens
+        """
+
+        t = F.normalize(t, dim=-1)
+        v = F.normalize(v, dim=-1)
+
+        # vision -> text similarity S_vt
+        S_vt = v @ t.transpose(-1, -2)  # [B, Lv, D] @ [B, D, Lt] -> [B, Lv, Lt]
+
+        # vision -> text attention A_vt
+        A_vt = torch.softmax(S_vt, dim=2)  # softmax on text dimension, [B, Lv, Lt]
+
+        # compute average text attention scores
+        text_score = A_vt.mean(dim=1)  # [B, Lv, Lt] -> [B, Lt]
+
+        # compute mean score as the threshold
+        mean_score = text_score.mean(dim=1, keepdim=True)
+
+        # choose text tokens with higher score than mean as final raters
+        scores = []
+        for b in range(t.shape[0]):
+            rater_mask = text_score[b] >= mean_score[b]  # [lt, ]
+
+            #
+            if rater_mask.sum() == 0:
+                t_r = t[b]
+            else:
+                t_r = t[b][rater_mask]  # [lt, D] -> [lr, D], lr means num(raters)
+
+            # raters to vision similarity S_tv
+            S_tv = v[b] @ t_r.T  # [lv, D] @ [D, lr] -> [lv, lr]
+
+            # text to vision attention A_tv
+            A_tv = torch.softmax(S_tv, dim=0)  # softmax on vision dimension, [lv, lr]
+
+            # compute average vision attention scores
+            vision_score = A_tv.mean(dim=1)  # [lv, lr] -> [lv]
+
+            scores.append(vision_score)
+
+        return torch.stack(scores)  # [B, lv]
+
+
 # =============================
 # 3) Full quadtree builder
 # =============================
@@ -282,39 +336,42 @@ class QuadTreeNavigator:
 
     # there is a problem about ".item()"
     @torch.no_grad()
-    def select_nodes(self, nodes: List[Node], q: torch.Tensor) -> Tuple[List[List[int]], List[List[int]]]:
-        """
-        Per-sample navigation to keep logic exact.
-        Return: selected_node_ids[b] = list of node ids in S for sample b.
-        """
-        B = q.shape[0]
-        selected: List[List[int]] = [[] for _ in range(B)]
+    def select_nodes(
+            self,
+            nodes: List[Node],
+            patch_scores: torch.Tensor,
+            W: int
+    ):
+
+        B = patch_scores.shape[0]
+
+        selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
 
-        # stack feats for easy indexing: [M,B,D]
-        feats = torch.stack([n.feat for n in nodes], dim=0)
-
         for b in range(B):
-            qb = q[b:b+1]  # [1,Dq] , query
             Q = deque([0])  # root
-
             while Q:
-                pid = Q.popleft()  # Optimization: O(n) -> O(1)
+                pid = Q.popleft()
                 visited[b].append(pid)
 
-                pfeat = feats[pid, b:b+1, :]  # [1,D]
-                sp = float(self.scorer(qb, pfeat).item())
+                preg = nodes[pid].region
+                idx = self.region_to_token_indices(preg, W, patch_scores.device)  # parent node token ids
 
+                sp = float(patch_scores[b, idx].mean().item())  # parent score (avg)
                 ch = nodes[pid].children
+
                 if ch is None:
-                    # leaf
                     selected[b].append(pid)
                     continue
 
                 better_children = []
+
                 for cid in ch:
-                    cfeat = feats[cid, b:b+1, :]
-                    sc = float(self.scorer(qb, cfeat).item())
+                    creg = nodes[cid].region
+                    idx = self.region_to_token_indices(creg, W, patch_scores.device)  # child node token ids
+
+                    sc = float(patch_scores[b, idx].mean().item())  # child score (avg)
+
                     if sc > sp:
                         better_children.append(cid)
 
@@ -397,20 +454,46 @@ class QVTree(nn.Module):
         self.navigator = QuadTreeNavigator(self.scorer)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, q: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, Any]:
+        """
+        x : [B, N, D]   vision tokens
+        t : [B, Lt, D]  text tokens
+        """
+
         built = self.builder.build(x)
         H, W, nodes = built["H"], built["W"], built["nodes"]
 
-        selected_node_ids, visited_node_ids = self.navigator.select_nodes(nodes, q)
-        selected_regions = [[nodes[nid].region for nid in row] for row in selected_node_ids]
+        # ---------- 1. compute patch importance once ----------
+        patch_scores = self.navigator.scorer(t, x)  # [B, N]
 
-        token_out = self.navigator.nodes_to_tokens(nodes, H, W, selected_node_ids, x=x)
+        # ---------- 2. tree navigation ----------
+        selected_node_ids, visited_node_ids = self.navigator.select_nodes(
+            nodes,
+            patch_scores,
+            W
+        )
+
+        # ---------- 3. region info ----------
+        selected_regions = [
+            [nodes[nid].region for nid in row]
+            for row in selected_node_ids
+        ]
+
+        # ---------- 4. convert nodes -> tokens ----------
+        token_out = self.navigator.nodes_to_tokens(
+            nodes,
+            H,
+            W,
+            selected_node_ids,
+            x=x
+        )
 
         return {
             "H": H,
             "W": W,
-            "nodes":nodes,
+            "nodes": nodes,
             "num_nodes": len(nodes),
+            "patch_scores": patch_scores,  # optional debug
             "selected_node_ids": selected_node_ids,
             "selected_regions": selected_regions,
             "visited_node_ids": visited_node_ids,

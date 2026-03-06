@@ -62,6 +62,22 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return_dict=True
             ).pooler_output
 
+            # 2. Compute TEXT tokens using embedding (NO LLM)
+            with torch.no_grad():
+
+                text_embed = inputs_embeds  # [B, L, D]
+
+                if mm_token_type_ids is not None:
+                    text_mask = (mm_token_type_ids == 0)
+                else:
+                    text_mask = torch.ones((text_embed.shape[0], text_embed.shape[1]),
+                                           dtype=torch.bool,
+                                           device=text_embed.device)
+
+                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
+                text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
+
+            """
             # 2. Compute TEXT semantic query q using LLM hidden states. q: [B, D]
             with torch.no_grad():
                 # Run a text-only LM pass to get contextualized representations
@@ -86,27 +102,26 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # compute average text embedding
                 mask = text_mask.unsqueeze(-1)  # [B,L,1]
-
                 q = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            """
 
             selected_idx_per_image = []
             new_image_tokens_list = []
 
             # run tree for every image
             for i, tokens in enumerate(image_tokens_list):
-
                 # tokens: [Ni, D]
-                x = tokens.unsqueeze(0)  # [1, Ni, D] (after downsample)
-                """
-                to be fixed: only support single image input now.
-                """
-                qi = q[i:i+1].to(tokens.device, tokens.dtype)  # get i-th query qi. [1, D]
+                x = tokens.unsqueeze(0)  # [1, Ni, D]
 
-                # selected nodes ids
-                out = self.qvtree(x, qi)
+                # text tokens
+                ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
+
+                # run tree
+                out = self.qvtree(x, ti)
+
                 sel_nodes = out["selected_node_ids"][0]
                 selected_idx_per_image.append(sel_nodes)
-                # tree nodes
+
                 nodes = out["nodes"]
                 grid_h = out["H"]
                 grid_w = out["W"]
@@ -130,7 +145,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 tokens_masked = tokens * keep.unsqueeze(-1)
 
-                # tokens_masked is finally selected tokens with shape [Ni, D]
                 new_image_tokens_list.append(tokens_masked)
 
             # debug save
