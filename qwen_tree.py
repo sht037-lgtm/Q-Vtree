@@ -62,6 +62,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return_dict=True
             ).pooler_output
 
+            """
             # 2. Compute TEXT tokens using embedding (NO LLM)
             with torch.no_grad():
 
@@ -76,34 +77,37 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
-
             """
-            # 2. Compute TEXT semantic query q using LLM hidden states. q: [B, D]
+
+            # 2. Compute TEXT tokens using LLM hidden states
             with torch.no_grad():
-                # Run a text-only LM pass to get contextualized representations
-                # (We don't inject image tokens here; inputs_embeds is still text embeddings.)
+
+                # Run text-only LLM forward
                 text_outputs = self.language_model(
                     input_ids=None,
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
-                    position_ids=None,  # text-only
+                    position_ids=None,
                     use_cache=False,
                     return_dict=True,
                     **kwargs,
                 )
+
                 hidden = text_outputs.last_hidden_state  # [B, L, D]
-                B, L, D = hidden.shape
 
-                # build text_mask on the SAME device as hidden
+                # text token mask
                 if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0).to(hidden.device)  # [B, L]
+                    text_mask = (mm_token_type_ids == 0).to(hidden.device)
                 else:
-                    text_mask = torch.ones((B, L), dtype=torch.bool, device=hidden.device)
+                    text_mask = torch.ones(
+                        (hidden.shape[0], hidden.shape[1]),
+                        dtype=torch.bool,
+                        device=hidden.device
+                    )
 
-                # compute average text embedding
-                mask = text_mask.unsqueeze(-1)  # [B,L,1]
-                q = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
-            """
+                # keep only text tokens
+                text_tokens = hidden[text_mask].view(1, -1, hidden.size(-1))
+                text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
             selected_idx_per_image = []
             new_image_tokens_list = []
