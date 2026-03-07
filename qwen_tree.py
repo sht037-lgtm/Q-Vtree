@@ -62,7 +62,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return_dict=True
             ).pooler_output
 
-            """
             # 2. Compute TEXT tokens using embedding (NO LLM)
             with torch.no_grad():
 
@@ -76,37 +75,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                                            device=text_embed.device)
 
                 text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
-                text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
-            """
-
-            # 2. Compute TEXT tokens using LLM hidden states
-            with torch.no_grad():
-
-                # Run text-only LLM forward
-                text_outputs = self.language_model(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    position_ids=None,
-                    use_cache=False,
-                    return_dict=True,
-                    **kwargs,
-                )
-
-                hidden = text_outputs.last_hidden_state  # [B, L, D]
-
-                # text token mask
-                if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0).to(hidden.device)
-                else:
-                    text_mask = torch.ones(
-                        (hidden.shape[0], hidden.shape[1]),
-                        dtype=torch.bool,
-                        device=hidden.device
-                    )
-
-                # keep only text tokens
-                text_tokens = hidden[text_mask].view(1, -1, hidden.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
             selected_idx_per_image = []
