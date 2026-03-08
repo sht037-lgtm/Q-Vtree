@@ -165,7 +165,9 @@ class AttentionScorer(nn.Module):
 
             scores.append(vision_score)
 
-        return torch.stack(scores)  # [B, Lv]
+        scores = torch.stack(scores)  # [B, Lv]
+        scores = scores * scores.shape[1]  # scale by Lv
+        return scores
 
 
 # =============================
