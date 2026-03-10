@@ -364,7 +364,7 @@ class QuadTreeNavigator:
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
 
-                if s_max < global_avg[b].item():
+                if s_max < global_avg[b]:
                     print("discard")
                     continue
 
@@ -375,8 +375,11 @@ class QuadTreeNavigator:
                     continue
 
                 s_avg = vals.mean().item()
-
                 split_score = (s_max - s_avg) / (s_avg + self.eps)
+
+                print("max:", s_max)
+                print("mean:", s_avg)
+                print("diff:", s_max - s_avg)
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
