@@ -330,7 +330,10 @@ class QuadTreeNavigator:
         B, N = patch_scores.shape
 
         # global_avg = patch_scores.mean(dim=1)
-        global_thr = torch.quantile(patch_scores, 0.7, dim=1)
+
+        # global softmax pooling
+        weights = torch.softmax(patch_scores, dim=1)
+        global_thr = (weights * patch_scores).sum(dim=1)
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
