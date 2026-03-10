@@ -352,6 +352,10 @@ class QuadTreeNavigator:
                 s_avg = vals.mean()
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
 
+                print("softmax:", s_soft)
+                print("mean:", s_avg)
+                print("diff:", s_soft - s_avg)
+
                 if split_score > self.split_threshold:
                     # refine: pop parent, push children
                     Q.extend(children)
@@ -360,6 +364,36 @@ class QuadTreeNavigator:
                     # stop here and keep current node
                     print("stop")
                     selected[b].append(pid)
+
+                """          
+                # ---------- discard decision ----------
+                s_max = vals.max().item()
+
+                if s_max < global_avg[b]:
+                    print("discard")
+                    continue
+
+                # ---------- split decision ----------
+                children = nodes[pid].children
+                if not children:
+                    selected[b].append(pid)
+                    continue
+
+                s_avg = vals.mean().item()
+                split_score = (s_max - s_avg) / (s_avg + self.eps)
+
+                print("max:", s_max)
+                print("mean:", s_avg)
+                print("diff:", s_max - s_avg)
+                print("threshold:", self.split_threshold)
+
+                if split_score > self.split_threshold:
+                    Q.extend(children)
+                    print("split")
+                else:
+                    print("stop")
+                    selected[b].append(pid)
+                """
 
         return selected, visited
 
