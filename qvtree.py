@@ -158,7 +158,7 @@ class QuadTreeBuilder:
 # =============================
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, tau=1.0):
+    def __init__(self, eps=1e-6, tau=2.0):
         super().__init__()
         self.eps = eps
         self.tau = tau
@@ -235,7 +235,7 @@ class QuadTreeNavigator:
     Navigation is performed independently for each sample in the batch.
     """
 
-    def __init__(self, split_threshold: float = 0.2, softmax_temperature: float = 1.0, eps: float = 1e-6):
+    def __init__(self, split_threshold: float = 0.02, softmax_temperature: float = 1.0, eps: float = 1e-6):
         super().__init__()
         self.split_threshold = float(split_threshold)
         self.softmax_temperature = float(softmax_temperature)
@@ -425,7 +425,7 @@ class QVTree(nn.Module):
         B, N, D = x.shape
 
         # --------------------------------------------------
-        # 1️⃣ compute patch scores using AttentionScorer
+        # compute patch scores using AttentionScorer
         # --------------------------------------------------
 
         patch_scores = self.scorer(t, x)  # [B, N]
