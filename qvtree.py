@@ -355,6 +355,7 @@ class QuadTreeNavigator:
                 pid = Q.popleft()
                 visited[b].append(pid)
 
+                """
                 s_soft = node_soft[b, pid].item()
 
                 # discard
@@ -381,8 +382,13 @@ class QuadTreeNavigator:
                 else:
                     print("stop")
                     selected[b].append(pid)
-
                 """
+
+                # ---------- get region patches  ----------
+                reg = nodes[pid].region
+                idx = self.region_to_token_indices(reg, W, patch_scores.device)
+                vals = patch_scores[b, idx]  # [M]
+
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
 
@@ -405,7 +411,6 @@ class QuadTreeNavigator:
                 else:
                     print("stop")
                     selected[b].append(pid)
-                """
 
         return selected, visited
 
