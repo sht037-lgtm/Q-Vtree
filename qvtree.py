@@ -237,7 +237,7 @@ class QuadTreeNavigator:
     Navigation is performed independently for each sample in the batch.
     """
 
-    def __init__(self, split_threshold: float, softmax_temperature: float, eps: float):
+    def __init__(self, split_threshold: float = 0.1, softmax_temperature: float = 1.0, eps: float = 1e-6):
         super().__init__()
         self.split_threshold = float(split_threshold)
         self.softmax_temperature = float(softmax_temperature)
