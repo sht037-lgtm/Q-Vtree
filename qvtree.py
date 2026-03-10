@@ -364,13 +364,13 @@ class QuadTreeNavigator:
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
 
-                if s_max < global_avg[b]:
+                if s_max < global_avg[b].item():
                     print("discard")
                     continue
 
                 # ---------- split decision ----------
                 children = nodes[pid].children
-                if children is None:
+                if not children:
                     selected[b].append(pid)
                     continue
 
