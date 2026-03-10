@@ -297,6 +297,7 @@ class QuadTreeNavigator:
                 s_soft = self._softmax_pool(vals)
                 if s_soft < global_avg[b]:
                     # discard this node completely
+                    print("discard")
                     continue
 
                 # 2) split decision
@@ -305,25 +306,16 @@ class QuadTreeNavigator:
                     # leaf node cannot split; keep it
                     selected[b].append(pid)
                     continue
-                """
+
                 s_avg = vals.mean()
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
 
                 if split_score > self.split_threshold:
                     # refine: pop parent, push children
                     Q.extend(children)
+                    print("split")
                 else:
                     # stop here and keep current node
-                    selected[b].append(pid)                
-                """
-                s_max = vals.max()
-                s_avg = vals.mean()
-
-                split_score = s_max - s_avg
-
-                if split_score > self.split_threshold:
-                    Q.extend(children)
-                else:
                     selected[b].append(pid)
 
         return selected, visited
