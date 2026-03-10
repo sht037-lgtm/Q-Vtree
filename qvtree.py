@@ -354,9 +354,9 @@ class QuadTreeNavigator:
 
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
+                s_soft = self._softmax_pool(vals).item()
 
-                if s_max < global_thr[b].item():
-                    print("discard")
+                if s_soft < global_thr[b].item():
                     continue
 
                 # ---------- split decision ----------
@@ -371,7 +371,6 @@ class QuadTreeNavigator:
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
-                    print("split")
 
                 else:
                     print("stop")
