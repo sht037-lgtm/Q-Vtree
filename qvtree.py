@@ -329,18 +329,6 @@ class QuadTreeNavigator:
 
         B, N = patch_scores.shape
 
-        # compute node scores (mean and softmax)
-        node_mean = self.compute_tree_mean_scores(
-            nodes,
-            patch_scores,
-            W,
-        )
-
-        node_soft = self.compute_tree_softmax_scores(
-            nodes,
-            patch_scores,
-        )
-
         global_avg = patch_scores.mean(dim=1)
 
         selected = [[] for _ in range(B)]
@@ -355,44 +343,15 @@ class QuadTreeNavigator:
                 pid = Q.popleft()
                 visited[b].append(pid)
 
-                """
-                s_soft = node_soft[b, pid].item()
-
-                # discard
-                if s_soft < global_avg[b].item():
-                    print("discard")
-                    continue
-
-                children = nodes[pid].children
-                if not children:
-                    selected[b].append(pid)
-                    continue
-
-                s_avg = node_mean[b, pid].item()
-                split_score = (s_soft - s_avg) / (s_avg + self.eps)
-
-                print("softmax:", s_soft)
-                print("average:", s_avg)
-                print("split score:", split_score)
-
-                if split_score > self.split_threshold:
-                    Q.extend(children)
-                    print("split")
-
-                else:
-                    print("stop")
-                    selected[b].append(pid)
-                """
-
-                # ---------- get region patches  ----------
+                # ---------- get region patches ----------
                 reg = nodes[pid].region
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
-                vals = patch_scores[b, idx]  # [M]
+                vals = patch_scores[b, idx]
 
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
 
-                if s_max < global_avg[b]:
+                if s_max < global_avg[b].item():
                     print("discard")
                     continue
 
@@ -403,17 +362,18 @@ class QuadTreeNavigator:
                     continue
 
                 s_avg = vals.mean().item()
+
                 split_score = (s_max - s_avg) / (s_avg + self.eps)
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
                     print("split")
+
                 else:
                     print("stop")
                     selected[b].append(pid)
 
         return selected, visited
-
 
     @torch.no_grad()
     def nodes_to_tokens(
