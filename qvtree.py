@@ -8,6 +8,7 @@ from collections import deque
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # =============================
@@ -153,7 +154,69 @@ class QuadTreeBuilder:
 
 
 # =============================
-# 3) Navigator
+# 3) Attention Scorer
+# =============================
+class AttentionScorer(nn.Module):
+
+    def __init__(self, eps=1e-6, tau=1.0):
+        super().__init__()
+        self.eps = eps
+        self.tau = tau
+
+    def forward(self, t, v):
+        """
+        t : [B, Lt, D]
+        v : [B, Lv, D]
+        return : [B, Lv]
+        """
+
+        t = F.normalize(t, dim=-1, eps=self.eps)
+        v = F.normalize(v, dim=-1, eps=self.eps)
+
+        # Vision → Text similarity
+        S_vt = v @ t.transpose(-1, -2)              # [B, Lv, Lt]
+        S_vt = torch.nan_to_num(S_vt)
+
+        S_vt = S_vt / self.tau
+        S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
+        A_vt = torch.softmax(S_vt, dim=2)
+
+        # text importance
+        text_score = A_vt.mean(dim=1)               # [B, Lt]
+
+        scores = []
+
+        for b in range(t.shape[0]):
+
+            thresh = text_score[b].mean()
+            rater_mask = text_score[b] >= thresh
+
+            if rater_mask.sum() == 0:
+                t_r = t[b]
+            else:
+                t_r = t[b][rater_mask]
+
+            # Text → Vision
+            S_tv = v[b] @ t_r.T                     # [Lv, Lr]
+            S_tv = S_tv / self.tau
+            S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
+
+            A_tv = torch.softmax(S_tv, dim=0)
+
+            vision_score = A_tv.mean(dim=1)         # [Lv]
+
+            scores.append(vision_score)
+
+        scores = torch.stack(scores)
+
+        # normalize to [0,1]
+        scores = scores / (scores.max(dim=1, keepdim=True).values + self.eps)
+
+        return scores
+
+
+# =============================
+# 4) Navigator
 # =============================
 class QuadTreeNavigator:
     """
@@ -316,12 +379,13 @@ class QVTree(nn.Module):
     """
     End-to-end module:
       input:
-        x         [B, N, D]   vision token features
-        score_map [B, H, W]   precomputed patch score map
+        x [B, N, D]   vision token features
+        t [B, Lt, D]  text tokens
 
-      1) build full quadtree to 1x1 patch leaves
-      2) run navigation on the score map
-      3) return selected node set + selected token set (gathered from x)
+      1) compute patch score map using AttentionScorer
+      2) build quadtree
+      3) run navigation on the score map
+      4) return selected node set + selected token set
     """
 
     def __init__(
@@ -334,37 +398,54 @@ class QVTree(nn.Module):
         eps: float = 1e-6,
     ):
         super().__init__()
-        # Keep the original init signature as much as possible for compatibility.
-        # D, Dq, use_proj_if_needed are unused in this version but preserved.
+
         self.builder = QuadTreeBuilder(require_square_grid=True)
+
         self.navigator = QuadTreeNavigator(
             split_threshold=split_threshold,
             softmax_temperature=softmax_temperature,
             eps=eps,
         )
+
+        # get attention score map
+        self.scorer = AttentionScorer()
         self.eps = float(eps)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, score_map: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, Any]:
         """
         Args:
-            x         : [B, N, D]   vision token features
-            score_map : [B, H, W]   patch-level score map (one scalar per patch)
-
-        Returns:
-            dict with the same output structure as the original version as much as possible.
+            x : [B, N, D]   vision tokens
+            t : [B, Lt, D]  text tokens
         """
+
         if x.dim() != 3:
             raise ValueError(f"x must be [B,N,D], got shape {tuple(x.shape)}")
-        if score_map.dim() != 3:
-            raise ValueError(f"score_map must be [B,H,W], got shape {tuple(score_map.shape)}")
 
         B, N, D = x.shape
-        Bm, H, W = score_map.shape
-        if B != Bm:
-            raise ValueError(f"Batch size mismatch: x has B={B}, score_map has B={Bm}")
-        if N != H * W:
-            raise ValueError(f"x has N={N}, but score_map has H*W={H*W}")
+
+        # --------------------------------------------------
+        # 1️⃣ compute patch scores using AttentionScorer
+        # --------------------------------------------------
+
+        patch_scores = self.scorer(t, x)  # [B, N]
+
+        # infer grid
+        grid = int(math.sqrt(N))
+        if grid * grid != N:
+            raise ValueError(f"Vision tokens must form square grid, got N={N}")
+
+        H = grid
+        W = grid
+
+        score_map = patch_scores.view(B, H, W)
+
+        # Debug store
+        self._debug_patch_scores = patch_scores
+
+        # --------------------------------------------------
+        # build quadtree
+        # --------------------------------------------------
 
         built = self.builder.build(x)
         H_tree, W_tree, nodes = built["H"], built["W"], built["nodes"]
@@ -375,26 +456,32 @@ class QVTree(nn.Module):
                 f"tree inferred {(H_tree, W_tree)} but score_map is {(H, W)}"
             )
 
-        # Flatten patch score map to [B, N]
+        # flatten score map
         patch_scores = score_map.view(B, H * W)
 
-        # Debug store
-        self._debug_patch_scores = patch_scores
+        # --------------------------------------------------
+        # tree navigation
+        # --------------------------------------------------
 
-        # Tree navigation
         selected_node_ids, visited_node_ids = self.navigator.select_nodes(
             nodes=nodes,
             patch_scores=patch_scores,
             W=W,
         )
 
-        # Region info
+        # --------------------------------------------------
+        # region info
+        # --------------------------------------------------
+
         selected_regions = [
             [nodes[nid].region for nid in row]
             for row in selected_node_ids
         ]
 
-        # Convert nodes -> token indices / token features
+        # --------------------------------------------------
+        # convert nodes → tokens
+        # --------------------------------------------------
+
         token_out = self.navigator.nodes_to_tokens(
             nodes=nodes,
             H=H,
