@@ -4,12 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import math
+from collections import deque
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from collections import deque
-
 
 
 # =============================
@@ -44,138 +42,10 @@ class Node:
     region: Region
     parent: Optional[int]
     children: Optional[Tuple[int, int, int, int]]  # (tl, tr, bl, br)
-    feat: torch.Tensor  # [B, D] pooled feature
 
 
 # =============================
-# 2) Scoring (pluggable)
-# =============================
-
-class BaseScorer(nn.Module):
-    """Interface: score(q, f) -> [B]."""
-    def forward(self, q: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-
-
-class CosineScorer(nn.Module):
-    """
-    Cosine similarity scorer.
-    Assumes q and f are already aligned: q.shape[-1] == f.shape[-1].
-    No projection. If mismatched, raise error.
-    """
-    def __init__(self, eps: float = 1e-6):
-        super().__init__()
-        self.eps = float(eps)
-
-    def forward(self, q: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
-        """
-        q: [B, D]
-        f: [B, D]
-        return: [B]
-        """
-        if q.shape[-1] != f.shape[-1]:
-            raise ValueError(f"Expected aligned dims, but got q:{q.shape[-1]} and f:{f.shape[-1]}")
-
-        q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
-        f = f / (f.norm(dim=-1, keepdim=True) + self.eps)
-        return (q * f).sum(dim=-1)
-
-
-class DotProductScorer(nn.Module):
-    """
-    Dot-product similarity scorer.
-    Assumes q and f are already aligned: q.shape[-1] == f.shape[-1].
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, q: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
-        """
-        q: [B, D]
-        f: [B, D]
-        return: [B]
-        """
-        if q.shape[-1] != f.shape[-1]:
-            raise ValueError(
-                f"Expected aligned dims, but got q:{q.shape[-1]} and f:{f.shape[-1]}"
-            )
-
-        return (q * f).sum(dim=-1)
-
-
-class AttentionScorer(nn.Module):
-
-    def __init__(self, eps=1e-6, tau=2.0):
-        super().__init__()
-        self.eps = eps
-        self.tau = tau
-
-    def forward(self, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """
-        t : [B, Lt, D]   text tokens
-        v : [B, Lv, D]   vision tokens
-
-        return : [B, Lv]   attention scores of all vision tokens
-        """
-
-        t = F.normalize(t, dim=-1, eps=self.eps)
-        v = F.normalize(v, dim=-1, eps=self.eps)
-
-        t = torch.nan_to_num(t)
-        v = torch.nan_to_num(v)
-
-        # vision -> text similarity
-        S_vt = v @ t.transpose(-1, -2)   # [B, Lv, Lt]
-        S_vt = torch.nan_to_num(S_vt)
-
-        # stable softmax over text
-        S_vt = S_vt / self.tau
-        S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
-        A_vt = torch.softmax(S_vt, dim=2)
-        A_vt = torch.nan_to_num(A_vt)
-
-        # average text attention scores
-        text_score = A_vt.mean(dim=1)    # [B, Lt]
-        mean_score = text_score.mean(dim=1, keepdim=True)
-
-        scores = []
-        for b in range(t.shape[0]):
-            rater_mask = text_score[b] >= mean_score[b]
-
-            # fallback: keep at least one rater
-            if rater_mask.sum() == 0:
-                t_r = t[b]
-            else:
-                t_r = t[b][rater_mask]   # [Lr, D]
-
-            # raters -> vision similarity
-            S_tv = v[b] @ t_r.T          # [Lv, Lr]
-            S_tv = torch.nan_to_num(S_tv)
-
-            # stable softmax over vision
-            S_tv = S_tv / self.tau
-            S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
-            A_tv = torch.softmax(S_tv, dim=0)
-            A_tv = torch.nan_to_num(A_tv)
-
-            # average vision attention scores
-            vision_score = A_tv.mean(dim=1)   # [Lv]
-            vision_score = torch.nan_to_num(vision_score)
-
-            scores.append(vision_score)
-
-        scores = torch.stack(scores)  # [B, Lv]
-
-        # normalize to [0,1]
-        max_vals = scores.max(dim=1, keepdim=True).values
-        scores = scores / (max_vals + self.eps)
-
-        return scores
-
-
-# =============================
-# 3) Full quadtree builder
+# 2) Full quadtree builder
 # =============================
 class QuadTreeBuilder:
     """
@@ -193,48 +63,13 @@ class QuadTreeBuilder:
 
     @staticmethod
     def infer_hw(N: int, require_square_grid: bool = True) -> Tuple[int, int]:
-        """N -> H and W"""
+        """Infer H and W from N."""
         if require_square_grid:
             H = int(math.isqrt(N))
             if H * H != N:
                 raise ValueError(f"N={N} is not a perfect square, cannot infer H=W.")
             return H, H
         raise NotImplementedError("Non-square grid not supported in this version.")
-
-    @staticmethod
-    def tokens_to_grid(x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        """x: [B,N,D] -> [B,H,W,D]"""
-        B, N, D = x.shape
-        assert N == H * W, f"N must equal H*W, got N={N}, H*W={H*W}"
-        return x.view(B, H, W, D)
-
-    @staticmethod
-    def build_prefix_sum(grid: torch.Tensor) -> torch.Tensor:
-        """
-        grid: [B,H,W,D] -> prefix: [B,H+1,W+1,D]
-        allows O(1) region sum.
-        """
-        B, H, W, D = grid.shape
-        prefix = torch.zeros((B, H + 1, W + 1, D), device=grid.device, dtype=grid.dtype)
-        prefix[:, 1:, 1:, :] = grid
-        prefix = prefix.cumsum(dim=1).cumsum(dim=2)
-        return prefix
-
-    @staticmethod
-    def region_sum(prefix: torch.Tensor, reg: Region) -> torch.Tensor:
-        """Sum over region -> [B,D]"""
-        r0, r1, c0, c1 = reg.r0, reg.r1, reg.c0, reg.c1
-        return (
-            prefix[:, r1, c1, :]
-            - prefix[:, r0, c1, :]
-            - prefix[:, r1, c0, :]
-            + prefix[:, r0, c0, :]
-        )
-
-    @classmethod
-    def region_mean(cls, prefix: torch.Tensor, reg: Region) -> torch.Tensor:
-        """Average Pooling: mean over region -> [B,D]"""
-        return cls.region_sum(prefix, reg) / float(reg.area)
 
     @staticmethod
     def can_split(reg: Region) -> bool:
@@ -245,10 +80,11 @@ class QuadTreeBuilder:
     def split4(reg: Region) -> Optional[Tuple[Region, Region, Region, Region]]:
         """
         Integer midpoint split into 4 children (uneven sizes allowed for odd dimensions).
-        Returns (tl,tr,bl,br) or None if cannot split.
+        Returns (tl, tr, bl, br) or None if cannot split.
         """
         if reg.h < 2 or reg.w < 2:
             return None
+
         rm = (reg.r0 + reg.r1) // 2
         cm = (reg.c0 + reg.c1) // 2
 
@@ -266,27 +102,24 @@ class QuadTreeBuilder:
         B, N, D = x.shape
         H, W = self.infer_hw(N, self.require_square_grid)
 
-        grid = self.tokens_to_grid(x, H, W)            # [B,H,W,D]
-        prefix = self.build_prefix_sum(grid)           # [B,H+1,W+1,D]
-
         nodes: List[Node] = []
         next_id = 0
 
         # root
         root_reg = Region(0, H, 0, W)
-        root_feat = self.region_mean(prefix, root_reg)  # [B,D]
-        nodes.append(Node(
-            node_id=next_id,
-            level=0,
-            region=root_reg,
-            parent=None,
-            children=None,
-            feat=root_feat,
-        ))
+        nodes.append(
+            Node(
+                node_id=next_id,
+                level=0,
+                region=root_reg,
+                parent=None,
+                children=None,
+            )
+        )
         next_id += 1
 
         # BFS to build FULL tree
-        queue = deque([0])  # Optimization: O(n) -> O(1)
+        queue = deque([0])
         while queue:
             pid = queue.popleft()
             preg = nodes[pid].region
@@ -300,17 +133,17 @@ class QuadTreeBuilder:
 
             child_ids = []
             for reg in sub:
-                feat = self.region_mean(prefix, reg)
                 cid = next_id
                 next_id += 1
-                nodes.append(Node(
-                    node_id=cid,
-                    level=nodes[pid].level + 1,
-                    region=reg,
-                    parent=pid,
-                    children=None,
-                    feat=feat,
-                ))
+                nodes.append(
+                    Node(
+                        node_id=cid,
+                        level=nodes[pid].level + 1,
+                        region=reg,
+                        parent=pid,
+                        children=None,
+                    )
+                )
                 child_ids.append(cid)
 
             nodes[pid].children = (child_ids[0], child_ids[1], child_ids[2], child_ids[3])
@@ -320,27 +153,30 @@ class QuadTreeBuilder:
 
 
 # =============================
-# 4) Navigator
+# 3) Navigator
 # =============================
 class QuadTreeNavigator:
     """
-    Implement Algorithm 1: multi-branch synchronous zoom-in:
+    Tree logic based on a precomputed patch score map.
 
-      Q <- {root}
-      S <- empty
-      while Q not empty:
-        pop p
-        K <- { c in children(p) | s(c,q) > s(p,q) }
-        if K empty: S <- S U {p}
-        else: Q <- Q U K
-      return S
+    For each node R:
+      1) compute node softmax-pooled score over its patches
+      2) discard node if softmax_score < global_image_average
+      3) otherwise compute split score:
+            (softmax_score - local_average_score) / (local_average_score + eps)
+         if split_score > split_threshold and node is splittable:
+            split and continue on children
+         else:
+            keep this node as a selected final node
 
-    Output S is a variable-size set of nodes per sample.
+    Navigation is performed independently for each sample in the batch.
     """
 
-    def __init__(self, scorer: BaseScorer):
+    def __init__(self, split_threshold: float = 0.2, softmax_temperature: float = 1.0, eps: float = 1e-6):
         super().__init__()
-        self.scorer = scorer
+        self.split_threshold = float(split_threshold)
+        self.softmax_temperature = float(softmax_temperature)
+        self.eps = float(eps)
 
     @staticmethod
     def region_to_token_indices(reg: Region, W: int, device: torch.device) -> torch.Tensor:
@@ -350,51 +186,72 @@ class QuadTreeNavigator:
         rr, cc = torch.meshgrid(rows, cols, indexing="ij")
         return (rr * W + cc).reshape(-1)
 
-    # there is a problem about ".item()"
+    def _softmax_pool(self, vals: torch.Tensor) -> torch.Tensor:
+        """
+        vals: [M]
+        return: scalar tensor
+        """
+        # temperature fixed to 1 by default, but kept configurable
+        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
+        return torch.sum(weights * vals)
+
     @torch.no_grad()
     def select_nodes(
-            self,
-            nodes: List[Node],
-            patch_scores: torch.Tensor,
-            W: int
-    ):
+        self,
+        nodes: List[Node],
+        patch_scores: torch.Tensor,
+        W: int,
+    ) -> Tuple[List[List[int]], List[List[int]]]:
+        """
+        Args:
+            nodes: quadtree nodes
+            patch_scores: [B, N], flattened patch score map
+            W: grid width
 
-        B = patch_scores.shape[0]
+        Returns:
+            selected: final selected node ids per sample
+            visited: visited node ids per sample
+        """
+        B, N = patch_scores.shape
 
-        selected = [[] for _ in range(B)]
-        visited = [[] for _ in range(B)]
+        global_avg = patch_scores.mean(dim=1)  # [B]
+
+        selected: List[List[int]] = [[] for _ in range(B)]
+        visited: List[List[int]] = [[] for _ in range(B)]
 
         for b in range(B):
-            Q = deque([0])  # root
+            Q = deque([0])  # root node id
+
             while Q:
                 pid = Q.popleft()
                 visited[b].append(pid)
 
-                preg = nodes[pid].region
-                idx = self.region_to_token_indices(preg, W, patch_scores.device)  # parent node token ids
+                reg = nodes[pid].region
+                idx = self.region_to_token_indices(reg, W, patch_scores.device)
+                vals = patch_scores[b, idx]  # [M]
 
-                sp = float(patch_scores[b, idx].mean().item())  # parent score (avg)
-                ch = nodes[pid].children
+                # 1) discard decision: compare node softmax score against global image avg
+                s_soft = self._softmax_pool(vals)
+                if s_soft < global_avg[b]:
+                    # discard this node completely
+                    continue
 
-                if ch is None:
+                # 2) split decision
+                children = nodes[pid].children
+                if children is None:
+                    # leaf node cannot split; keep it
                     selected[b].append(pid)
                     continue
 
-                better_children = []
+                s_avg = vals.mean()
+                split_score = (s_soft - s_avg) / (s_avg + self.eps)
 
-                for cid in ch:
-                    creg = nodes[cid].region
-                    idx = self.region_to_token_indices(creg, W, patch_scores.device)  # child node token ids
-
-                    sc = float(patch_scores[b, idx].mean().item())  # child score (avg)
-
-                    if sc > sp:
-                        better_children.append(cid)
-
-                if len(better_children) == 0:
-                    selected[b].append(pid)
+                if split_score > self.split_threshold:
+                    # refine: pop parent, push children
+                    Q.extend(children)
                 else:
-                    Q.extend(better_children)
+                    # stop here and keep current node
+                    selected[b].append(pid)
 
         return selected, visited
 
@@ -408,7 +265,8 @@ class QuadTreeNavigator:
         x: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
-        Convert selected nodes S into selected patch tokens.
+        Convert selected nodes into selected patch tokens.
+
         Returns:
           - selected_token_indices: list of 1D tensors (variable length)
           - if x provided: selected_feats_padded [B,Mmax,D] and selected_mask [B,Mmax]
@@ -452,59 +310,97 @@ class QuadTreeNavigator:
 
 
 # =============================
-# 5) Plug-and-play wrapper
+# 4) Plug-and-play wrapper
 # =============================
 class QVTree(nn.Module):
     """
     End-to-end module:
-      input: x [B,N,D], q [B,Dq]
-      1) build full quadtree to 1x1
-      2) run Algorithm 1 navigation to select node set S
-      3) return node-set + token-set (gathered from x)
+      input:
+        x         [B, N, D]   vision token features
+        score_map [B, H, W]   precomputed patch score map
+
+      1) build full quadtree to 1x1 patch leaves
+      2) run navigation on the score map
+      3) return selected node set + selected token set (gathered from x)
     """
 
-    def __init__(self, D: int, Dq: Optional[int] = None, use_proj_if_needed: bool = True):
+    def __init__(
+        self,
+        D: int,
+        Dq: Optional[int] = None,
+        use_proj_if_needed: bool = True,
+        split_threshold: float = 0.2,
+        softmax_temperature: float = 1.0,
+        eps: float = 1e-6,
+    ):
         super().__init__()
+        # Keep the original init signature as much as possible for compatibility.
+        # D, Dq, use_proj_if_needed are unused in this version but preserved.
         self.builder = QuadTreeBuilder(require_square_grid=True)
-        self.scorer = AttentionScorer()
-        self.navigator = QuadTreeNavigator(self.scorer)
+        self.navigator = QuadTreeNavigator(
+            split_threshold=split_threshold,
+            softmax_temperature=softmax_temperature,
+            eps=eps,
+        )
+        self.eps = float(eps)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor, score_map: torch.Tensor) -> Dict[str, Any]:
         """
-        x : [B, N, D]   vision tokens
-        t : [B, Lt, D]  text tokens
+        Args:
+            x         : [B, N, D]   vision token features
+            score_map : [B, H, W]   patch-level score map (one scalar per patch)
+
+        Returns:
+            dict with the same output structure as the original version as much as possible.
         """
+        if x.dim() != 3:
+            raise ValueError(f"x must be [B,N,D], got shape {tuple(x.shape)}")
+        if score_map.dim() != 3:
+            raise ValueError(f"score_map must be [B,H,W], got shape {tuple(score_map.shape)}")
+
+        B, N, D = x.shape
+        Bm, H, W = score_map.shape
+        if B != Bm:
+            raise ValueError(f"Batch size mismatch: x has B={B}, score_map has B={Bm}")
+        if N != H * W:
+            raise ValueError(f"x has N={N}, but score_map has H*W={H*W}")
 
         built = self.builder.build(x)
-        H, W, nodes = built["H"], built["W"], built["nodes"]
+        H_tree, W_tree, nodes = built["H"], built["W"], built["nodes"]
 
-        # ---------- 1. compute patch importance once ----------
-        patch_scores = self.navigator.scorer(t, x)  # [B, N]
+        if H_tree != H or W_tree != W:
+            raise ValueError(
+                f"Patch-grid mismatch between x and score_map: "
+                f"tree inferred {(H_tree, W_tree)} but score_map is {(H, W)}"
+            )
 
-        # debug store
+        # Flatten patch score map to [B, N]
+        patch_scores = score_map.view(B, H * W)
+
+        # Debug store
         self._debug_patch_scores = patch_scores
 
-        # ---------- 2. tree navigation ----------
+        # Tree navigation
         selected_node_ids, visited_node_ids = self.navigator.select_nodes(
-            nodes,
-            patch_scores,
-            W
+            nodes=nodes,
+            patch_scores=patch_scores,
+            W=W,
         )
 
-        # ---------- 3. region info ----------
+        # Region info
         selected_regions = [
             [nodes[nid].region for nid in row]
             for row in selected_node_ids
         ]
 
-        # ---------- 4. convert nodes -> tokens ----------
+        # Convert nodes -> token indices / token features
         token_out = self.navigator.nodes_to_tokens(
-            nodes,
-            H,
-            W,
-            selected_node_ids,
-            x=x
+            nodes=nodes,
+            H=H,
+            W=W,
+            selected_node_ids=selected_node_ids,
+            x=x,
         )
 
         return {
@@ -512,7 +408,7 @@ class QVTree(nn.Module):
             "W": W,
             "nodes": nodes,
             "num_nodes": len(nodes),
-            "patch_scores": patch_scores,  # optional debug
+            "patch_scores": patch_scores,
             "selected_node_ids": selected_node_ids,
             "selected_regions": selected_regions,
             "visited_node_ids": visited_node_ids,
