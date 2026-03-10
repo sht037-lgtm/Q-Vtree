@@ -258,6 +258,46 @@ class QuadTreeNavigator:
         weights = torch.softmax(vals / self.softmax_temperature, dim=0)
         return torch.sum(weights * vals)
 
+    def compute_node_mean_scores(
+            nodes: List[Node],
+            patch_scores: torch.Tensor,
+            W: int,
+    ) -> torch.Tensor:
+        """
+        Compute mean score for every node.
+
+        Args
+        ----
+        nodes: quadtree nodes
+        patch_scores: [B, N]
+        W: grid width
+
+        Returns
+        -------
+        node_scores: [B, num_nodes]
+        """
+
+        B, N = patch_scores.shape
+        device = patch_scores.device
+        num_nodes = len(nodes)
+
+        node_scores = torch.zeros(B, num_nodes, device=device)
+
+        for nid, node in enumerate(nodes):
+            reg = node.region
+
+            rows = torch.arange(reg.r0, reg.r1, device=device)
+            cols = torch.arange(reg.c0, reg.c1, device=device)
+
+            rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+            idx = (rr * W + cc).reshape(-1)
+
+            vals = patch_scores[:, idx]  # [B, M]
+            node_scores[:, nid] = vals.mean(dim=1)
+
+        return node_scores
+
+
     @torch.no_grad()
     def select_nodes(
         self,
@@ -293,6 +333,7 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]  # [M]
 
+                """
                 # 1) discard decision: compare node softmax score against global image avg
                 s_soft = self._softmax_pool(vals)
                 if s_soft < global_avg[b]:
@@ -318,8 +359,34 @@ class QuadTreeNavigator:
                     # stop here and keep current node
                     print("stop")
                     selected[b].append(pid)
+                """
+
+                # ---------- discard decision ----------
+                s_max = vals.max()
+
+                if s_max < global_avg[b]:
+                    print("discard")
+                    continue
+
+                # ---------- split decision ----------
+                children = nodes[pid].children
+                if children is None:
+                    selected[b].append(pid)
+                    continue
+
+                s_avg = vals.mean()
+
+                split_score = (s_max - s_avg) / (s_avg + self.eps)
+
+                if split_score > self.split_threshold:
+                    Q.extend(children)
+                    print("split")
+                else:
+                    print("stop")
+                    selected[b].append(pid)
 
         return selected, visited
+
 
     @torch.no_grad()
     def nodes_to_tokens(
