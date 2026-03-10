@@ -166,7 +166,11 @@ class AttentionScorer(nn.Module):
             scores.append(vision_score)
 
         scores = torch.stack(scores)  # [B, Lv]
-        scores = scores * scores.shape[1]  # scale by Lv
+
+        # normalize to [0,1]
+        max_vals = scores.max(dim=1, keepdim=True).values
+        scores = scores / (max_vals + self.eps)
+
         return scores
 
 
