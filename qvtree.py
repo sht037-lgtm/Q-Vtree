@@ -235,7 +235,7 @@ class QuadTreeNavigator:
     Navigation is performed independently for each sample in the batch.
     """
 
-    def __init__(self, split_threshold: float = 0.2, softmax_temperature: float = 1.0, eps: float = 1e-6):
+    def __init__(self, split_threshold: float = 0.1, softmax_temperature: float = 1.0, eps: float = 1e-6):
         super().__init__()
         self.split_threshold = float(split_threshold)
         self.softmax_temperature = float(softmax_temperature)
@@ -305,7 +305,7 @@ class QuadTreeNavigator:
                     # leaf node cannot split; keep it
                     selected[b].append(pid)
                     continue
-
+                """
                 s_avg = vals.mean()
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
 
@@ -314,6 +314,16 @@ class QuadTreeNavigator:
                     Q.extend(children)
                 else:
                     # stop here and keep current node
+                    selected[b].append(pid)                
+                """
+                s_max = vals.max()
+                s_avg = vals.mean()
+
+                split_score = s_max - s_avg
+
+                if split_score > self.split_threshold:
+                    Q.extend(children)
+                else:
                     selected[b].append(pid)
 
         return selected, visited
