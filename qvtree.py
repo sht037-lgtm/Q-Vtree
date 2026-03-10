@@ -335,7 +335,6 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]  # [M]
 
-                """
                 # 1) discard decision: compare node softmax score against global image avg
                 s_soft = self._softmax_pool(vals)
                 if s_soft < global_avg[b]:
@@ -359,35 +358,6 @@ class QuadTreeNavigator:
                     print("split")
                 else:
                     # stop here and keep current node
-                    print("stop")
-                    selected[b].append(pid)
-                """
-
-                # ---------- discard decision ----------
-                s_max = vals.max().item()
-
-                if s_max < global_avg[b]:
-                    print("discard")
-                    continue
-
-                # ---------- split decision ----------
-                children = nodes[pid].children
-                if not children:
-                    selected[b].append(pid)
-                    continue
-
-                s_avg = vals.mean().item()
-                split_score = (s_max - s_avg) / (s_avg + self.eps)
-
-                print("max:", s_max)
-                print("mean:", s_avg)
-                print("diff:", s_max - s_avg)
-                print("threshold:", self.split_threshold)
-
-                if split_score > self.split_threshold:
-                    Q.extend(children)
-                    print("split")
-                else:
                     print("stop")
                     selected[b].append(pid)
 
