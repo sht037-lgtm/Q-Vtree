@@ -329,7 +329,8 @@ class QuadTreeNavigator:
 
         B, N = patch_scores.shape
 
-        global_avg = patch_scores.mean(dim=1)
+        # global_avg = patch_scores.mean(dim=1)
+        global_thr = torch.quantile(patch_scores, 0.7, dim=1)
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -351,7 +352,7 @@ class QuadTreeNavigator:
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
 
-                if s_max < global_avg[b].item():
+                if s_max < global_thr[b].item():
                     print("discard")
                     continue
 
