@@ -364,7 +364,7 @@ class QuadTreeNavigator:
                 # ---------- discard decision ----------
                 s_max = vals.max()
 
-                if s_max < global_avg[b]:
+                if s_max.item() < global_avg[b].item():
                     print("discard")
                     continue
 
