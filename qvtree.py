@@ -158,7 +158,7 @@ class QuadTreeBuilder:
 # =============================
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, tau=0.5):
+    def __init__(self, eps=1e-6, tau=2):
         super().__init__()
         self.eps = eps
         self.tau = tau
