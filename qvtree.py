@@ -316,6 +316,7 @@ class QuadTreeNavigator:
                     print("split")
                 else:
                     # stop here and keep current node
+                    print("stop")
                     selected[b].append(pid)
 
         return selected, visited
