@@ -260,109 +260,129 @@ class QuadTreeNavigator:
         weights = torch.softmax(vals / self.softmax_temperature, dim=0)
         return torch.sum(weights * vals)
 
-    def compute_node_mean_scores(
-            nodes: List[Node],
-            patch_scores: torch.Tensor,
-            W: int,
-    ) -> torch.Tensor:
+    def compute_tree_mean_scores(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
         """
-        Compute mean score for every node.
-
-        Args
-        ----
-        nodes: quadtree nodes
         patch_scores: [B, N]
-        W: grid width
 
-        Returns
-        -------
-        node_scores: [B, num_nodes]
+        return:
+            node_mean_scores: [B, num_nodes]
         """
 
         B, N = patch_scores.shape
-        device = patch_scores.device
         num_nodes = len(nodes)
 
-        node_scores = torch.zeros(B, num_nodes, device=device)
+        node_scores = torch.zeros(B, num_nodes, device=patch_scores.device)
 
         for nid, node in enumerate(nodes):
             reg = node.region
-
-            rows = torch.arange(reg.r0, reg.r1, device=device)
-            cols = torch.arange(reg.c0, reg.c1, device=device)
-
-            rr, cc = torch.meshgrid(rows, cols, indexing="ij")
-            idx = (rr * W + cc).reshape(-1)
+            idx = self.region_to_token_indices(reg, W, patch_scores.device)
 
             vals = patch_scores[:, idx]  # [B, M]
+
             node_scores[:, nid] = vals.mean(dim=1)
 
         return node_scores
 
 
+    def compute_tree_softmax_scores(
+            self,
+            nodes,
+            patch_scores,
+    ):
+
+        B, N = patch_scores.shape
+        num_nodes = len(nodes)
+
+        node_scores = torch.zeros(B, num_nodes, device=patch_scores.device)
+
+        # leaf nodes
+        for nid, node in enumerate(nodes):
+            if node.children is None:
+                idx = node.patch_index
+                node_scores[:, nid] = patch_scores[:, idx]
+
+        # bottom-up aggregation
+        for nid in reversed(range(num_nodes)):
+
+            children = nodes[nid].children
+            if not children:
+                continue
+
+            child_scores = node_scores[:, children]  # [B,4]
+
+            weights = torch.softmax(
+                child_scores / self.softmax_temperature,
+                dim=1
+            )
+
+            node_scores[:, nid] = (weights * child_scores).sum(dim=1)
+
+        return node_scores
+
     @torch.no_grad()
     def select_nodes(
-        self,
-        nodes: List[Node],
-        patch_scores: torch.Tensor,
-        W: int,
-    ) -> Tuple[List[List[int]], List[List[int]]]:
-        """
-        Args:
-            nodes: quadtree nodes
-            patch_scores: [B, N], flattened patch score map
-            W: grid width
+            self,
+            nodes: List[Node],
+            patch_scores: torch.Tensor,
+            W: int,
+    ):
 
-        Returns:
-            selected: final selected node ids per sample
-            visited: visited node ids per sample
-        """
         B, N = patch_scores.shape
 
-        global_avg = patch_scores.mean(dim=1)  # [B]
+        # compute node scores (mean and softmax)
+        node_mean = self.compute_tree_mean_scores(
+            nodes,
+            patch_scores,
+            W,
+        )
 
-        selected: List[List[int]] = [[] for _ in range(B)]
-        visited: List[List[int]] = [[] for _ in range(B)]
+        node_soft = self.compute_tree_softmax_scores(
+            nodes,
+            patch_scores,
+        )
+
+        global_avg = patch_scores.mean(dim=1)
+
+        selected = [[] for _ in range(B)]
+        visited = [[] for _ in range(B)]
 
         for b in range(B):
-            Q = deque([0])  # root node id
+
+            Q = deque([0])
 
             while Q:
+
                 pid = Q.popleft()
                 visited[b].append(pid)
 
-                reg = nodes[pid].region
-                idx = self.region_to_token_indices(reg, W, patch_scores.device)
-                vals = patch_scores[b, idx]  # [M]
+                s_soft = node_soft[b, pid].item()
 
-                """
-                # 1) discard decision: compare node softmax score against global image avg
-                s_soft = self._softmax_pool(vals)
-                if s_soft < global_avg[b]:
-                    # discard this node completely
+                # discard
+                if s_soft < global_avg[b].item():
                     print("discard")
                     continue
 
-                # 2) split decision
                 children = nodes[pid].children
-                if children is None:
-                    # leaf node cannot split; keep it
+                if not children:
                     selected[b].append(pid)
                     continue
 
-                s_avg = vals.mean()
+                s_avg = node_mean[b, pid].item()
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
 
+                print("softmax:", s_soft)
+                print("average:", s_avg)
+                print("split score:", split_score)
+
                 if split_score > self.split_threshold:
-                    # refine: pop parent, push children
                     Q.extend(children)
                     print("split")
+
                 else:
-                    # stop here and keep current node
                     print("stop")
                     selected[b].append(pid)
-                """
 
+                """
                 # ---------- discard decision ----------
                 s_max = vals.max().item()
 
@@ -379,17 +399,13 @@ class QuadTreeNavigator:
                 s_avg = vals.mean().item()
                 split_score = (s_max - s_avg) / (s_avg + self.eps)
 
-                print("max:", s_max)
-                print("mean:", s_avg)
-                print("diff:", s_max - s_avg)
-                print("threshold:", self.split_threshold)
-
                 if split_score > self.split_threshold:
                     Q.extend(children)
                     print("split")
                 else:
                     print("stop")
                     selected[b].append(pid)
+                """
 
         return selected, visited
 
@@ -469,7 +485,7 @@ class QVTree(nn.Module):
         D: int,
         Dq: Optional[int] = None,
         use_proj_if_needed: bool = True,
-        split_threshold: float = 0.2,
+        split_threshold: float = 0.1,
         softmax_temperature: float = 1.0,
         eps: float = 1e-6,
     ):
