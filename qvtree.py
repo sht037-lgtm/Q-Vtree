@@ -209,8 +209,10 @@ class AttentionScorer(nn.Module):
 
         scores = torch.stack(scores)
 
-        # normalize to [0,1]
-        scores = scores / (scores.max(dim=1, keepdim=True).values + self.eps)
+        # min-max normalize
+        min_vals = scores.min(dim=1, keepdim=True).values
+        max_vals = scores.max(dim=1, keepdim=True).values
+        scores = (scores - min_vals) / (max_vals - min_vals + self.eps)
 
         return scores
 
@@ -235,7 +237,7 @@ class QuadTreeNavigator:
     Navigation is performed independently for each sample in the batch.
     """
 
-    def __init__(self, split_threshold: float = 0, softmax_temperature: float = 1.0, eps: float = 1e-6):
+    def __init__(self, split_threshold: float, softmax_temperature: float, eps: float):
         super().__init__()
         self.split_threshold = float(split_threshold)
         self.softmax_temperature = float(softmax_temperature)
@@ -467,7 +469,7 @@ class QVTree(nn.Module):
         D: int,
         Dq: Optional[int] = None,
         use_proj_if_needed: bool = True,
-        split_threshold: float = 0.2,
+        split_threshold: float = 0.1,
         softmax_temperature: float = 1.0,
         eps: float = 1e-6,
     ):
