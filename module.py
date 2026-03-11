@@ -1,4 +1,4 @@
-# qvtree.py
+# module.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -158,10 +158,10 @@ class QuadTreeBuilder:
 # =============================
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, tau=0.5):
+    def __init__(self, eps=1e-6, temp=2):
         super().__init__()
         self.eps = eps
-        self.tau = tau
+        self.temp = temp
 
     def forward(self, t, v):
         """
@@ -177,7 +177,7 @@ class AttentionScorer(nn.Module):
         S_vt = v @ t.transpose(-1, -2)              # [B, Lv, Lt]
         S_vt = torch.nan_to_num(S_vt)
 
-        S_vt = S_vt / self.tau
+        S_vt = S_vt / self.temp
         S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
         A_vt = torch.softmax(S_vt, dim=2)
 
@@ -198,7 +198,7 @@ class AttentionScorer(nn.Module):
 
             # Text → Vision
             S_tv = v[b] @ t_r.T                     # [Lv, Lr]
-            S_tv = S_tv / self.tau
+            S_tv = S_tv / self.temp
             S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
 
             A_tv = torch.softmax(S_tv, dim=0)

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from qvtree import QVTree
+from module import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,  # override
     Qwen2_5_VLForConditionalGeneration,
