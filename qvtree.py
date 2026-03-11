@@ -283,7 +283,6 @@ class QuadTreeNavigator:
 
         return node_scores
 
-
     def compute_tree_softmax_scores(
             self,
             nodes,
