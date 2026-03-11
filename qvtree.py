@@ -260,64 +260,6 @@ class QuadTreeNavigator:
         weights = torch.softmax(vals / self.softmax_temperature, dim=0)
         return torch.sum(weights * vals)
 
-    def compute_tree_mean_scores(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
-        """
-        patch_scores: [B, N]
-
-        return:
-            node_mean_scores: [B, num_nodes]
-        """
-
-        B, N = patch_scores.shape
-        num_nodes = len(nodes)
-
-        node_scores = torch.zeros(B, num_nodes, device=patch_scores.device)
-
-        for nid, node in enumerate(nodes):
-            reg = node.region
-            idx = self.region_to_token_indices(reg, W, patch_scores.device)
-
-            vals = patch_scores[:, idx]  # [B, M]
-
-            node_scores[:, nid] = vals.mean(dim=1)
-
-        return node_scores
-
-    def compute_tree_softmax_scores(
-            self,
-            nodes,
-            patch_scores,
-    ):
-
-        B, N = patch_scores.shape
-        num_nodes = len(nodes)
-
-        node_scores = torch.zeros(B, num_nodes, device=patch_scores.device)
-
-        # leaf nodes
-        for nid, node in enumerate(nodes):
-            if node.children is None:
-                idx = node.patch_index
-                node_scores[:, nid] = patch_scores[:, idx]
-
-        # bottom-up aggregation
-        for nid in reversed(range(num_nodes)):
-
-            children = nodes[nid].children
-            if not children:
-                continue
-
-            child_scores = node_scores[:, children]  # [B,4]
-
-            weights = torch.softmax(
-                child_scores / self.softmax_temperature,
-                dim=1
-            )
-
-            node_scores[:, nid] = (weights * child_scores).sum(dim=1)
-
-        return node_scores
-
     @torch.no_grad()
     def select_nodes(
             self,
@@ -332,7 +274,7 @@ class QuadTreeNavigator:
 
         # global softmax pooling
         weights = torch.softmax(patch_scores, dim=1)
-        global_thr = (weights * patch_scores).sum(dim=1)
+        global_soft = (weights * patch_scores).sum(dim=1)
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -355,7 +297,7 @@ class QuadTreeNavigator:
                 s_max = vals.max().item()
                 s_soft = self._softmax_pool(vals).item()
 
-                if s_soft < global_thr[b].item():
+                if s_soft < global_soft[b].item():
                     continue
 
                 # ---------- split decision ----------
