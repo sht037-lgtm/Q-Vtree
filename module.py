@@ -307,7 +307,7 @@ class QuadTreeNavigator:
                     selected[b].append(pid)
                     continue
 
-                split_score = (s_soft - s_avg) / (s_avg + self.eps)
+                split_score = s_soft - s_avg
                 print(split_score)
 
                 if split_score > self.split_threshold:
