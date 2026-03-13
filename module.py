@@ -308,6 +308,7 @@ class QuadTreeNavigator:
                     continue
 
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
+                print(split_score)
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
