@@ -257,7 +257,17 @@ class QuadTreeNavigator:
         return: scalar tensor
         """
         # temperature fixed to 1 by default, but kept configurable
-        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
+        x = vals / self.softmax_temperature
+        if torch.isnan(x).any():
+            print("softmax input has NaN")
+        if torch.isinf(x).any():
+            print("softmax input has Inf")
+
+        weights = torch.softmax(x, dim=0)
+        if torch.isnan(weights).any():
+            print("softmax output has NaN")
+        if torch.isinf(weights).any():
+            print("softmax output has Inf")
         return torch.sum(weights * vals)
 
     @torch.no_grad()
@@ -307,7 +317,7 @@ class QuadTreeNavigator:
                     selected[b].append(pid)
                     continue
 
-                split_score = s_soft - s_avg
+                split_score = (s_soft - s_avg) / (s_avg + self.eps)
                 print(split_score)
 
                 if split_score > self.split_threshold:
