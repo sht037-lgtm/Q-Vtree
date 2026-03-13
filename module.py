@@ -293,28 +293,25 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
 
-                # ---------- discard decision ----------
-                s_max = vals.max().item()
-                s_soft = self._softmax_pool(vals).item()
+                # ---------- define scores ----------
+                s_soft = self._softmax_pool(vals)
+                s_avg = vals.mean()
 
-                if s_soft < global_soft[b].item():
+                # ---------- discard ----------
+                if s_soft < global_soft[b]:
                     continue
 
-                # ---------- split decision ----------
+                # ---------- split ----------
                 children = nodes[pid].children
                 if not children:
                     selected[b].append(pid)
                     continue
 
-                s_avg = vals.mean().item()
-
-                split_score = (s_max - s_avg) / (s_avg + self.eps)
+                split_score = (s_soft - s_avg) / (s_avg + self.eps)
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
-
                 else:
-                    print("stop")
                     selected[b].append(pid)
 
         return selected, visited
