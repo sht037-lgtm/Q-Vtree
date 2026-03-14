@@ -26,7 +26,7 @@ def download_vstar_dataset(
     return save_dir
 
 def download_hrbench_dataset(
-    save_dir: str = "./datasets/hr_bench",
+    save_dir: str = "./hr_bench",
     repo_id: str = "DreamMr/HR-Bench",
 ) -> str:
     if os.path.exists(save_dir) and len(os.listdir(save_dir)) > 0:
