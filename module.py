@@ -329,7 +329,8 @@ class QuadTreeNavigator:
 
                 # ---------- discard ----------
                 # if s_soft < global_soft[b]:
-                if s_soft < global_mean[b]:
+                # if s_soft < global_mean[b]:
+                if s_avg < global_mean[b]:
                     print("discard")
                     continue
 
