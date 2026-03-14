@@ -318,7 +318,7 @@ class QuadTreeNavigator:
                 
                 # ---------- discard ----------
                 if s_soft < global_soft[b]:
-                    print("discard")
+                    # print("discard")
                     continue
 
                 # ---------- split ----------
@@ -328,14 +328,14 @@ class QuadTreeNavigator:
                     continue
 
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
-                print(f'split score: {split_score}')
+                # print(f'split score: {split_score}')
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
                 else:
                     selected[b].append(pid)
 
-        print("patch_scores NaN:", torch.isnan(patch_scores).any())
+        # print("patch_scores NaN:", torch.isnan(patch_scores).any())
         return selected, visited
 
     @torch.no_grad()
