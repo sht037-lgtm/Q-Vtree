@@ -126,9 +126,13 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 keep = torch.zeros(tokens.size(0), device=tokens.device, dtype=tokens.dtype)
                 keep[patch_ids] = 1.0
 
-                tokens_masked = tokens * keep.unsqueeze(-1)
+                alpha = 0.5  # selected boost to (1+alpha)x
+                beta = 0.2  # unselected suppress to (1-beta)x
 
-                new_image_tokens_list.append(tokens_masked)
+                scale = 1.0 + alpha * keep - beta * (1.0 - keep)
+                tokens_modulated = tokens * scale.unsqueeze(-1)
+
+                new_image_tokens_list.append(tokens_modulated)
 
             # debug save
             self._debug_selected_idx = selected_idx_per_image
