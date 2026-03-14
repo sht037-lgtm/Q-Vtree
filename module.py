@@ -53,24 +53,24 @@ class QuadTreeBuilder:
     Build a FULL quadtree down to 1x1 patch leaves.
 
     Input:
-      x: [B, N, D], where N = H*W, and (assumed) H=W (square patch grid).
+      x: [B, N, D], where N = H*W.
 
     Output:
       {"H": H, "W": W, "nodes": List[Node]}
     """
 
-    def __init__(self, require_square_grid: bool = True):
-        self.require_square_grid = bool(require_square_grid)
+    def __init__(self):
+        pass
 
     @staticmethod
-    def infer_hw(N: int, require_square_grid: bool = True) -> Tuple[int, int]:
-        """Infer H and W from N."""
-        if require_square_grid:
-            H = int(math.isqrt(N))
-            if H * H != N:
-                raise ValueError(f"N={N} is not a perfect square, cannot infer H=W.")
-            return H, H
-        raise NotImplementedError("Non-square grid not supported in this version.")
+    def validate_hw(N: int, H: int, W: int) -> Tuple[int, int]:
+        H = int(H)
+        W = int(W)
+        if H <= 0 or W <= 0:
+            raise ValueError(f"H and W must be positive, got H={H}, W={W}")
+        if H * W != N:
+            raise ValueError(f"Invalid grid size: H*W={H*W}, but N={N}")
+        return H, W
 
     @staticmethod
     def can_split(reg: Region) -> bool:
@@ -81,7 +81,7 @@ class QuadTreeBuilder:
     def split4(reg: Region) -> Optional[Tuple[Region, Region, Region, Region]]:
         """
         Integer midpoint split into 4 children (uneven sizes allowed for odd dimensions).
-        Returns (tl, tr, bl, br) or None if cannot split.
+        Returns (tl,tr,bl,br) or None if cannot split.
         """
         if reg.h < 2 or reg.w < 2:
             return None
@@ -99,9 +99,9 @@ class QuadTreeBuilder:
         return tl, tr, bl, br
 
     @torch.no_grad()
-    def build(self, x: torch.Tensor) -> Dict[str, Any]:
+    def build(self, x: torch.Tensor, H: int, W: int) -> Dict[str, Any]:
         B, N, D = x.shape
-        H, W = self.infer_hw(N, self.require_square_grid)
+        H, W = self.validate_hw(N, H, W)
 
         nodes: List[Node] = []
         next_id = 0
@@ -156,7 +156,6 @@ class QuadTreeBuilder:
 # =============================
 # 3) Attention Scorer
 # =============================
-
 class AttentionScorer(nn.Module):
 
     def __init__(self, eps=1e-6, temp=2):
@@ -225,6 +224,7 @@ class AttentionScorer(nn.Module):
 
         return scores
 
+
 # =============================
 # 4) Navigator
 # =============================
@@ -234,7 +234,7 @@ class QuadTreeNavigator:
 
     For each node R:
       1) compute node softmax-pooled score over its patches
-      2) discard node if softmax_score < global_image_average
+      2) discard node if softmax_score < global_image_softmax_pooled_score
       3) otherwise compute split score:
             (softmax_score - local_average_score) / (local_average_score + eps)
          if split_score > split_threshold and node is splittable:
@@ -264,7 +264,6 @@ class QuadTreeNavigator:
         vals: [M]
         return: scalar tensor
         """
-        # temperature fixed to 1 by default, but kept configurable
         x = vals / self.softmax_temperature
         if torch.isnan(x).any():
             print("softmax input has NaN")
@@ -276,34 +275,29 @@ class QuadTreeNavigator:
             print("softmax output has NaN")
         if torch.isinf(weights).any():
             print("softmax output has Inf")
+
         return torch.sum(weights * vals)
 
     @torch.no_grad()
     def select_nodes(
-            self,
-            nodes: List[Node],
-            patch_scores: torch.Tensor,
-            W: int,
+        self,
+        nodes: List[Node],
+        patch_scores: torch.Tensor,
+        W: int,
     ):
-
         B, N = patch_scores.shape
-
-        # global_avg = patch_scores.mean(dim=1)
 
         # global softmax pooling
         weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
         global_soft = (weights * patch_scores).sum(dim=1)
-        global_mean = patch_scores.mean(dim=1)
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
 
         for b in range(B):
-
             Q = deque([0])
 
             while Q:
-
                 pid = Q.popleft()
                 visited[b].append(pid)
 
@@ -315,10 +309,9 @@ class QuadTreeNavigator:
                 # ---------- define scores ----------
                 s_soft = self._softmax_pool(vals)
                 s_avg = vals.mean()
-                
+
                 # ---------- discard ----------
                 if s_soft < global_soft[b]:
-                    # print("discard")
                     continue
 
                 # ---------- split ----------
@@ -328,14 +321,12 @@ class QuadTreeNavigator:
                     continue
 
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
-                # print(f'split score: {split_score}')
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
                 else:
                     selected[b].append(pid)
 
-        # print("patch_scores NaN:", torch.isnan(patch_scores).any())
         return selected, visited
 
     @torch.no_grad()
@@ -393,14 +384,16 @@ class QuadTreeNavigator:
 
 
 # =============================
-# 4) Plug-and-play wrapper
+# 5) Plug-and-play wrapper
 # =============================
 class QVTree(nn.Module):
     """
     End-to-end module:
       input:
-        x [B, N, D]   vision token features
-        t [B, Lt, D]  text tokens
+        x : [B, N, D]   vision token features
+        t : [B, Lt, D]  text tokens
+        H : int         patch grid height
+        W : int         patch grid width
 
       1) compute patch score map using AttentionScorer
       2) build quadtree
@@ -419,7 +412,7 @@ class QVTree(nn.Module):
     ):
         super().__init__()
 
-        self.builder = QuadTreeBuilder(require_square_grid=True)
+        self.builder = QuadTreeBuilder()
 
         self.navigator = QuadTreeNavigator(
             split_threshold=split_threshold,
@@ -432,32 +425,31 @@ class QVTree(nn.Module):
         self.eps = float(eps)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, H: int, W: int) -> Dict[str, Any]:
         """
         Args:
             x : [B, N, D]   vision tokens
             t : [B, Lt, D]  text tokens
+            H : int         patch grid height
+            W : int         patch grid width
         """
 
         if x.dim() != 3:
             raise ValueError(f"x must be [B,N,D], got shape {tuple(x.shape)}")
 
         B, N, D = x.shape
+        H = int(H)
+        W = int(W)
+
+        if H <= 0 or W <= 0:
+            raise ValueError(f"H and W must be positive, got H={H}, W={W}")
+        if H * W != N:
+            raise ValueError(f"Invalid grid size: H*W={H*W}, but N={N}")
 
         # --------------------------------------------------
         # compute patch scores using AttentionScorer
         # --------------------------------------------------
-
         patch_scores = self.scorer(t, x)  # [B, N]
-
-        # infer grid
-        grid = int(math.sqrt(N))
-        if grid * grid != N:
-            raise ValueError(f"Vision tokens must form square grid, got N={N}")
-
-        H = grid
-        W = grid
-
         score_map = patch_scores.view(B, H, W)
 
         # Debug store
@@ -466,8 +458,7 @@ class QVTree(nn.Module):
         # --------------------------------------------------
         # build quadtree
         # --------------------------------------------------
-
-        built = self.builder.build(x)
+        built = self.builder.build(x, H, W)
         H_tree, W_tree, nodes = built["H"], built["W"], built["nodes"]
 
         if H_tree != H or W_tree != W:
@@ -482,7 +473,6 @@ class QVTree(nn.Module):
         # --------------------------------------------------
         # tree navigation
         # --------------------------------------------------
-
         selected_node_ids, visited_node_ids = self.navigator.select_nodes(
             nodes=nodes,
             patch_scores=patch_scores,
@@ -492,7 +482,6 @@ class QVTree(nn.Module):
         # --------------------------------------------------
         # region info
         # --------------------------------------------------
-
         selected_regions = [
             [nodes[nid].region for nid in row]
             for row in selected_node_ids
@@ -501,7 +490,6 @@ class QVTree(nn.Module):
         # --------------------------------------------------
         # convert nodes → tokens
         # --------------------------------------------------
-
         token_out = self.navigator.nodes_to_tokens(
             nodes=nodes,
             H=H,
