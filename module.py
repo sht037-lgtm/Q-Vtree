@@ -156,88 +156,14 @@ class QuadTreeBuilder:
 # =============================
 # 3) Attention Scorer
 # =============================
-"""
-class AttentionScorer(nn.Module):
-
-    def __init__(self, eps=1e-6, temp=2):
-        super().__init__()
-        self.eps = eps
-        self.temp = temp
-
-    def forward(self, t, v):
-
-        # ---------- debug ----------
-        # print("vision NaN:", torch.isnan(v).any())
-        # print("text NaN:", torch.isnan(t).any())
-        # print("vision Inf:", torch.isinf(v).any())
-
-        dtype = v.dtype
-
-        # ---------- clean + use fp32 ----------
-        t = torch.nan_to_num(t).float()
-        v = torch.nan_to_num(v).float()
-
-        # ---------- normalize ----------
-        t = F.normalize(t, dim=-1, eps=self.eps)
-        v = F.normalize(v, dim=-1, eps=self.eps)
-
-        # ---------- Vision → Text ----------
-        S_vt = v @ t.transpose(-1, -2)  # [B, Lv, Lt]
-
-        S_vt = S_vt / self.temp
-        S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
-        S_vt = torch.nan_to_num(S_vt)
-
-        A_vt = torch.softmax(S_vt, dim=2)
-
-        # ---------- text importance ----------
-        text_score = A_vt.mean(dim=1)  # [B, Lt]
-
-        scores = []
-
-        for b in range(t.shape[0]):
-
-            thresh = text_score[b].mean()
-            rater_mask = text_score[b] >= thresh
-
-            if rater_mask.sum() == 0:
-                t_r = t[b]
-            else:
-                t_r = t[b][rater_mask]
-
-            # ---------- Text → Vision ----------
-            S_tv = v[b] @ t_r.T  # [Lv, Lr]
-
-            S_tv = S_tv / self.temp
-            S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
-            S_tv = torch.nan_to_num(S_tv)
-
-            A_tv = torch.softmax(S_tv, dim=0)
-
-            vision_score = A_tv.mean(dim=1)  # [Lv]
-
-            scores.append(vision_score)
-
-        scores = torch.stack(scores)
-
-        # ---------- min-max normalize ----------
-        min_vals = scores.min(dim=1, keepdim=True).values
-        max_vals = scores.max(dim=1, keepdim=True).values
-
-        scores = (scores - min_vals) / (max_vals - min_vals + self.eps)
-
-        # ---------- cast back ----------
-        scores = scores.to(dtype)
-
-        return scores
-"""
 
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, temp=2):
+    def __init__(self, eps=1e-6, temp=2, fusion_lambda=0.7):
         super().__init__()
         self.eps = eps
         self.temp = temp
+        self.fusion_lambda = fusion_lambda
 
     def forward(self, t, v):
         """
@@ -267,7 +193,7 @@ class AttentionScorer(nn.Module):
 
         # ---------- modified: use softmax pooling instead of mean pooling ----------
         weights_vt = torch.softmax(A_vt / self.temp, dim=1)
-        text_score = (weights_vt * A_vt).sum(dim=1)  # [B, Lt]
+        text_score = (weights_vt * A_vt).sum(dim=1)   # [B, Lt]
         text_score = text_score / (text_score.sum(dim=1, keepdim=True) + self.eps)
 
         scores = []
@@ -282,15 +208,30 @@ class AttentionScorer(nn.Module):
 
             A_tv = torch.softmax(S_tv, dim=0)       # [Lv, Lt]
 
-            # soft token-weighted aggregation
             token_w = text_score[b]                 # [Lt]
-            vision_score = (A_tv * token_w.unsqueeze(0)).sum(dim=1)   # [Lv]
+
+            # ---------- modified: fuse raw similarity and attention score ----------
+            sim_score = (S_tv * token_w.unsqueeze(0)).sum(dim=1)      # [Lv]
+            attn_score = (A_tv * token_w.unsqueeze(0)).sum(dim=1)     # [Lv]
+
+            sim_min = sim_score.min()
+            sim_max = sim_score.max()
+            sim_score = (sim_score - sim_min) / (sim_max - sim_min + self.eps)
+
+            attn_min = attn_score.min()
+            attn_max = attn_score.max()
+            attn_score = (attn_score - attn_min) / (attn_max - attn_min + self.eps)
+
+            vision_score = (
+                self.fusion_lambda * sim_score
+                + (1 - self.fusion_lambda) * attn_score
+            )
 
             scores.append(vision_score)
 
         scores = torch.stack(scores)                # [B, Lv]
 
-        # ---------- min-max normalize ----------
+        # ---------- final min-max normalize ----------
         min_vals = scores.min(dim=1, keepdim=True).values
         max_vals = scores.max(dim=1, keepdim=True).values
         scores = (scores - min_vals) / (max_vals - min_vals + self.eps)
