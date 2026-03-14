@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from module import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,  # override
@@ -82,7 +81,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             # run tree for every image
             for i, tokens in enumerate(image_tokens_list):
-                # tokens: [Ni, D]
+                # vision tokens: [Ni, D]
                 x = tokens.unsqueeze(0)  # [1, Ni, D]
 
                 # text tokens
