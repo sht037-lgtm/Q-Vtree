@@ -234,11 +234,10 @@ class AttentionScorer(nn.Module):
 
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, temp=2, smooth_alpha=0.3):
+    def __init__(self, eps=1e-6, temp=2):
         super().__init__()
         self.eps = eps
         self.temp = temp
-        self.smooth_alpha = smooth_alpha
 
     def forward(self, t, v):
         """
@@ -291,14 +290,6 @@ class AttentionScorer(nn.Module):
 
         scores = torch.stack(scores)                # [B, Lv]
 
-        # ---------- modified: residual smoothing for local consistency ----------
-        H = W = int(Lv ** 0.5)
-        if H * W == Lv:
-            score_map = scores.view(B, 1, H, W)
-            smooth_map = F.avg_pool2d(score_map, kernel_size=3, stride=1, padding=1)
-            score_map = (1 - self.smooth_alpha) * score_map + self.smooth_alpha * smooth_map
-            scores = score_map.view(B, Lv)
-
         # ---------- min-max normalize ----------
         min_vals = scores.min(dim=1, keepdim=True).values
         max_vals = scores.max(dim=1, keepdim=True).values
@@ -308,7 +299,6 @@ class AttentionScorer(nn.Module):
         scores = scores.to(dtype)
 
         return scores
-
 
 # =============================
 # 4) Navigator
