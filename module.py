@@ -411,7 +411,7 @@ class QuadTreeNavigator:
 
                     keep_children = [
                         cid for cid, w in zip(children, child_weights)
-                        if w.item() >= 0.15  # hyperparameter
+                        if w.item() >= 0.25  # hyperparameter
                     ]
 
                     if len(keep_children) == 0:
