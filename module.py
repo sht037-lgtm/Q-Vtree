@@ -200,16 +200,16 @@ class AttentionScorer(nn.Module):
         for b in range(B):
 
             # ---------- Text -> Vision ----------
-            S_tv = v[b] @ t[b].T
+            S_tv = v[b] @ t[b].T                    # [Lv, Lt]
             S_tv = S_tv / self.temp
+            S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
             S_tv = torch.nan_to_num(S_tv)
 
-            token_w = text_score[b]
-            vision_score = (S_tv * token_w.unsqueeze(0)).sum(dim=1)
+            A_tv = torch.softmax(S_tv, dim=0)       # [Lv, Lt]
 
-            vmin = vision_score.min()
-            vmax = vision_score.max()
-            vision_score = (vision_score - vmin) / (vmax - vmin + self.eps)
+            # soft token-weighted aggregation
+            token_w = text_score[b]                 # [Lt]
+            vision_score = (A_tv * token_w.unsqueeze(0)).sum(dim=1)   # [Lv]
 
             scores.append(vision_score)
 
