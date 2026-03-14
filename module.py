@@ -170,19 +170,32 @@ class AttentionScorer(nn.Module):
         return : [B, Lv]
         """
 
+        # ---------- debug ----------
+        # print("vision NaN:", torch.isnan(v).any())
+        # print("text NaN:", torch.isnan(t).any())
+        # print("vision Inf:", torch.isinf(v).any())
+
+        dtype = v.dtype
+
+        # ---------- clean + use fp32 ----------
+        t = torch.nan_to_num(t).float()
+        v = torch.nan_to_num(v).float()
+
+        # ---------- normalize ----------
         t = F.normalize(t, dim=-1, eps=self.eps)
         v = F.normalize(v, dim=-1, eps=self.eps)
 
-        # Vision → Text similarity
-        S_vt = v @ t.transpose(-1, -2)              # [B, Lv, Lt]
-        S_vt = torch.nan_to_num(S_vt)
+        # ---------- Vision → Text ----------
+        S_vt = v @ t.transpose(-1, -2)  # [B, Lv, Lt]
 
         S_vt = S_vt / self.temp
         S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
+        S_vt = torch.nan_to_num(S_vt)
+
         A_vt = torch.softmax(S_vt, dim=2)
 
-        # text importance
-        text_score = A_vt.mean(dim=1)               # [B, Lt]
+        # ---------- text importance ----------
+        text_score = A_vt.mean(dim=1)  # [B, Lt]
 
         scores = []
 
@@ -196,23 +209,29 @@ class AttentionScorer(nn.Module):
             else:
                 t_r = t[b][rater_mask]
 
-            # Text → Vision
-            S_tv = v[b] @ t_r.T                     # [Lv, Lr]
+            # ---------- Text → Vision ----------
+            S_tv = v[b] @ t_r.T  # [Lv, Lr]
+
             S_tv = S_tv / self.temp
             S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
+            S_tv = torch.nan_to_num(S_tv)
 
             A_tv = torch.softmax(S_tv, dim=0)
 
-            vision_score = A_tv.mean(dim=1)         # [Lv]
+            vision_score = A_tv.mean(dim=1)  # [Lv]
 
             scores.append(vision_score)
 
         scores = torch.stack(scores)
 
-        # min-max normalize
+        # ---------- min-max normalize ----------
         min_vals = scores.min(dim=1, keepdim=True).values
         max_vals = scores.max(dim=1, keepdim=True).values
+
         scores = (scores - min_vals) / (max_vals - min_vals + self.eps)
+
+        # ---------- cast back ----------
+        scores = scores.to(dtype)
 
         return scores
 
@@ -257,7 +276,17 @@ class QuadTreeNavigator:
         return: scalar tensor
         """
         # temperature fixed to 1 by default, but kept configurable
-        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
+        x = vals / self.softmax_temperature
+        if torch.isnan(x).any():
+            print("softmax input has NaN")
+        if torch.isinf(x).any():
+            print("softmax input has Inf")
+
+        weights = torch.softmax(x, dim=0)
+        if torch.isnan(weights).any():
+            print("softmax output has NaN")
+        if torch.isinf(weights).any():
+            print("softmax output has Inf")
         return torch.sum(weights * vals)
 
     @torch.no_grad()
@@ -273,8 +302,9 @@ class QuadTreeNavigator:
         # global_avg = patch_scores.mean(dim=1)
 
         # global softmax pooling
-        weights = torch.softmax(patch_scores, dim=1)
+        weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
         global_soft = (weights * patch_scores).sum(dim=1)
+        global_mean = patch_scores.mean(dim=1)
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -293,30 +323,30 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
 
-                # ---------- discard decision ----------
-                s_max = vals.max().item()
-                s_soft = self._softmax_pool(vals).item()
-
-                if s_soft < global_soft[b].item():
+                # ---------- define scores ----------
+                s_soft = self._softmax_pool(vals)
+                s_avg = vals.mean()
+                
+                # ---------- discard ----------
+                if s_soft < global_soft[b]:
+                    print("discard")
                     continue
 
-                # ---------- split decision ----------
+                # ---------- split ----------
                 children = nodes[pid].children
                 if not children:
                     selected[b].append(pid)
                     continue
 
-                s_avg = vals.mean().item()
-
-                split_score = (s_max - s_avg) / (s_avg + self.eps)
+                split_score = (s_soft - s_avg) / (s_avg + self.eps)
+                print(f'split score: {split_score}')
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
-
                 else:
-                    print("stop")
                     selected[b].append(pid)
 
+        print("patch_scores NaN:", torch.isnan(patch_scores).any())
         return selected, visited
 
     @torch.no_grad()
@@ -395,7 +425,7 @@ class QVTree(nn.Module):
         Dq: Optional[int] = None,
         use_proj_if_needed: bool = True,
         split_threshold: float = 0.1,
-        softmax_temperature: float = 1.0,
+        softmax_temperature: float = 0.25,
         eps: float = 1e-6,
     ):
         super().__init__()
