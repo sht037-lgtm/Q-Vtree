@@ -170,6 +170,10 @@ class AttentionScorer(nn.Module):
         return : [B, Lv]
         """
 
+        print("vision NaN:", torch.isnan(v).any())
+        print("text NaN:", torch.isnan(t).any())
+        print("vision Inf:", torch.isinf(v).any())
+
         t = F.normalize(t, dim=-1, eps=self.eps)
         v = F.normalize(v, dim=-1, eps=self.eps)
 
@@ -318,13 +322,13 @@ class QuadTreeNavigator:
                     continue
 
                 split_score = (s_soft - s_avg) / (s_avg + self.eps)
-                print(split_score)
+                print(f'split score: {split_score}')
 
                 if split_score > self.split_threshold:
                     Q.extend(children)
                 else:
                     selected[b].append(pid)
-                    
+
         print("patch_scores NaN:", torch.isnan(patch_scores).any())
         return selected, visited
 
