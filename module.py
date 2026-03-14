@@ -304,6 +304,7 @@ class QuadTreeNavigator:
         # global softmax pooling
         weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
         global_soft = (weights * patch_scores).sum(dim=1)
+        global_mean = patch_scores.mean(dim=1)
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -327,7 +328,8 @@ class QuadTreeNavigator:
                 s_avg = vals.mean()
 
                 # ---------- discard ----------
-                if s_soft < global_soft[b]:
+                # if s_soft < global_soft[b]:
+                if s_soft < global_mean[b]:
                     print("discard")
                     continue
 
