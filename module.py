@@ -159,11 +159,10 @@ class QuadTreeBuilder:
 
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, temp=2, fusion_lambda=0.7):
+    def __init__(self, eps=1e-6, temp=2):
         super().__init__()
         self.eps = eps
         self.temp = temp
-        self.fusion_lambda = fusion_lambda
 
     def forward(self, t, v):
         """
@@ -193,7 +192,7 @@ class AttentionScorer(nn.Module):
 
         # ---------- modified: use softmax pooling instead of mean pooling ----------
         weights_vt = torch.softmax(A_vt / self.temp, dim=1)
-        text_score = (weights_vt * A_vt).sum(dim=1)   # [B, Lt]
+        text_score = (weights_vt * A_vt).sum(dim=1)  # [B, Lt]
         text_score = text_score / (text_score.sum(dim=1, keepdim=True) + self.eps)
 
         scores = []
@@ -208,30 +207,15 @@ class AttentionScorer(nn.Module):
 
             A_tv = torch.softmax(S_tv, dim=0)       # [Lv, Lt]
 
+            # soft token-weighted aggregation
             token_w = text_score[b]                 # [Lt]
-
-            # ---------- modified: fuse raw similarity and attention score ----------
-            sim_score = (S_tv * token_w.unsqueeze(0)).sum(dim=1)      # [Lv]
-            attn_score = (A_tv * token_w.unsqueeze(0)).sum(dim=1)     # [Lv]
-
-            sim_min = sim_score.min()
-            sim_max = sim_score.max()
-            sim_score = (sim_score - sim_min) / (sim_max - sim_min + self.eps)
-
-            attn_min = attn_score.min()
-            attn_max = attn_score.max()
-            attn_score = (attn_score - attn_min) / (attn_max - attn_min + self.eps)
-
-            vision_score = (
-                self.fusion_lambda * sim_score
-                + (1 - self.fusion_lambda) * attn_score
-            )
+            vision_score = (A_tv * token_w.unsqueeze(0)).sum(dim=1)   # [Lv]
 
             scores.append(vision_score)
 
         scores = torch.stack(scores)                # [B, Lv]
 
-        # ---------- final min-max normalize ----------
+        # ---------- min-max normalize ----------
         min_vals = scores.min(dim=1, keepdim=True).values
         max_vals = scores.max(dim=1, keepdim=True).values
         scores = (scores - min_vals) / (max_vals - min_vals + self.eps)
