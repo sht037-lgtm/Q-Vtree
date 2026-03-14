@@ -1,12 +1,5 @@
 import os
 from huggingface_hub import snapshot_download
-import shutil
-import zipfile
-
-
-"""
-ATTENTION: Please log into your huggingface first.
-"""
 
 
 def download_vstar_dataset(
@@ -32,5 +25,25 @@ def download_vstar_dataset(
     print("[INFO] VStar download complete.")
     return save_dir
 
+def download_hrbench_dataset(
+    save_dir: str = "./datasets/hr_bench",
+    repo_id: str = "DreamMr/HR-Bench",
+) -> str:
+    if os.path.exists(save_dir) and len(os.listdir(save_dir)) > 0:
+        print(f"[INFO] HR-Bench already exists at {save_dir}")
+        return save_dir
+
+    print(f"[INFO] Downloading HR-Bench from: {repo_id}")
+
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=save_dir,
+        resume_download=True,
+    )
+
+    print("[INFO] HR-Bench download complete.")
+    return save_dir
+
 if __name__ == '__main__':
-    download_vstar_dataset()
+    download_hrbench_dataset()
