@@ -289,7 +289,6 @@ class QuadTreeNavigator:
             print("softmax output has Inf")
         return torch.sum(weights * vals)
 
-    """
     @torch.no_grad()
     def select_nodes(
             self,
@@ -348,80 +347,6 @@ class QuadTreeNavigator:
                     selected[b].append(pid)
 
         print("patch_scores NaN:", torch.isnan(patch_scores).any())
-        return selected, visited
-    """
-
-    @torch.no_grad()
-    def select_nodes(
-            self,
-            nodes: List[Node],
-            patch_scores: torch.Tensor,
-            W: int,
-    ):
-        B, N = patch_scores.shape
-
-        selected = [[] for _ in range(B)]
-        visited = [[] for _ in range(B)]
-
-        for b in range(B):
-
-            Q = deque([0])
-
-            while Q:
-
-                pid = Q.popleft()
-                visited[b].append(pid)
-
-                # ---------- current node region ----------
-                reg = nodes[pid].region
-                idx = self.region_to_token_indices(reg, W, patch_scores.device)
-                vals = patch_scores[b, idx]
-
-                # ---------- current node scores ----------
-                s_soft = self._softmax_pool(vals).item()
-                s_avg = vals.mean().item()
-
-                children = nodes[pid].children
-                if not children:
-                    selected[b].append(pid)
-                    continue
-
-                split_score = (s_soft - s_avg) / (s_avg + self.eps)
-
-                # ---------- split decision ----------
-                if split_score > self.split_threshold:
-
-                    child_scores = []
-
-                    for cid in children:
-                        child_reg = nodes[cid].region
-                        child_idx = self.region_to_token_indices(
-                            child_reg, W, patch_scores.device
-                        )
-                        child_vals = patch_scores[b, child_idx]
-                        child_soft = self._softmax_pool(child_vals)
-                        child_scores.append(child_soft)
-
-                    child_scores = torch.stack(child_scores)  # [4]
-
-                    child_weights = torch.softmax(
-                        child_scores / self.softmax_temperature,
-                        dim=0
-                    )
-
-                    keep_children = [
-                        cid for cid, w in zip(children, child_weights)
-                        if w.item() >= 0.25  # hyperparameter
-                    ]
-
-                    if len(keep_children) == 0:
-                        selected[b].append(pid)
-                    else:
-                        Q.extend(keep_children)
-
-                else:
-                    selected[b].append(pid)
-
         return selected, visited
 
     @torch.no_grad()
