@@ -234,7 +234,7 @@ class AttentionScorer(nn.Module):
 
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, temp=2):
+    def __init__(self, eps=1e-6, temp=1):
         super().__init__()
         self.eps = eps
         self.temp = temp
