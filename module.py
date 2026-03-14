@@ -165,11 +165,6 @@ class AttentionScorer(nn.Module):
         self.temp = temp
 
     def forward(self, t, v):
-        """
-        t : [B, Lt, D]
-        v : [B, Lv, D]
-        return : [B, Lv]
-        """
 
         # ---------- debug ----------
         # print("vision NaN:", torch.isnan(v).any())
