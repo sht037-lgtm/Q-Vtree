@@ -171,9 +171,9 @@ class AttentionScorer(nn.Module):
         """
 
         # ---------- debug ----------
-        print("vision NaN:", torch.isnan(v).any())
-        print("text NaN:", torch.isnan(t).any())
-        print("vision Inf:", torch.isinf(v).any())
+        # print("vision NaN:", torch.isnan(v).any())
+        # print("text NaN:", torch.isnan(t).any())
+        # print("vision Inf:", torch.isinf(v).any())
 
         dtype = v.dtype
 
