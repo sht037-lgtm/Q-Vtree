@@ -234,10 +234,11 @@ class AttentionScorer(nn.Module):
 
 class AttentionScorer(nn.Module):
 
-    def __init__(self, eps=1e-6, temp=1):
+    def __init__(self, eps=1e-6, temp=2, smooth_alpha=0.3):
         super().__init__()
         self.eps = eps
         self.temp = temp
+        self.smooth_alpha = smooth_alpha
 
     def forward(self, t, v):
         """
@@ -247,6 +248,7 @@ class AttentionScorer(nn.Module):
         """
 
         dtype = v.dtype
+        B, Lv, _ = v.shape
 
         # ---------- clean + use fp32 ----------
         t = torch.nan_to_num(t).float()
@@ -264,13 +266,14 @@ class AttentionScorer(nn.Module):
 
         A_vt = torch.softmax(S_vt, dim=2)           # [B, Lv, Lt]
 
-        # text importance from vision-to-text alignment
-        text_score = A_vt.mean(dim=1)               # [B, Lt]
+        # ---------- modified: use softmax pooling instead of mean pooling ----------
+        weights_vt = torch.softmax(A_vt / self.temp, dim=1)
+        text_score = (weights_vt * A_vt).sum(dim=1)  # [B, Lt]
         text_score = text_score / (text_score.sum(dim=1, keepdim=True) + self.eps)
 
         scores = []
 
-        for b in range(t.shape[0]):
+        for b in range(B):
 
             # ---------- Text -> Vision ----------
             S_tv = v[b] @ t[b].T                    # [Lv, Lt]
@@ -287,6 +290,14 @@ class AttentionScorer(nn.Module):
             scores.append(vision_score)
 
         scores = torch.stack(scores)                # [B, Lv]
+
+        # ---------- modified: residual smoothing for local consistency ----------
+        H = W = int(Lv ** 0.5)
+        if H * W == Lv:
+            score_map = scores.view(B, 1, H, W)
+            smooth_map = F.avg_pool2d(score_map, kernel_size=3, stride=1, padding=1)
+            score_map = (1 - self.smooth_alpha) * score_map + self.smooth_alpha * smooth_map
+            scores = score_map.view(B, Lv)
 
         # ---------- min-max normalize ----------
         min_vals = scores.min(dim=1, keepdim=True).values
