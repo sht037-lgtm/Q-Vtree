@@ -328,6 +328,7 @@ class QuadTreeNavigator:
 
                 # ---------- discard ----------
                 if s_soft < global_soft[b]:
+                    print("discard")
                     continue
 
                 # ---------- split ----------
