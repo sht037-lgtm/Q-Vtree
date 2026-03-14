@@ -88,8 +88,22 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 # text tokens
                 ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
 
+                # infer downsampled grid
+                grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
+                grid_h = grid_h_raw // 2
+                grid_w = grid_w_raw // 2
+
+                if grid_h * grid_w != tokens.size(0):
+                    raise ValueError(
+                        f"Downsampled grid mismatch: "
+                        f"raw=({grid_h_raw}, {grid_w_raw}), "
+                        f"down=({grid_h}, {grid_w}), "
+                        f"H*W={grid_h * grid_w}, "
+                        f"tokens={tokens.size(0)}"
+                    )
+
                 # run tree
-                out = self.qvtree(x, ti)
+                out = self.qvtree(x, ti, H=grid_h, W=grid_w)
 
                 sel_nodes = out["selected_node_ids"][0]
                 selected_idx_per_image.append(sel_nodes)
