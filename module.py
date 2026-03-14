@@ -283,7 +283,7 @@ class QuadTreeNavigator:
         # global_avg = patch_scores.mean(dim=1)
 
         # global softmax pooling
-        weights = torch.softmax(patch_scores, dim=1)
+        weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
         global_soft = (weights * patch_scores).sum(dim=1)
 
         selected = [[] for _ in range(B)]
@@ -324,7 +324,8 @@ class QuadTreeNavigator:
                     Q.extend(children)
                 else:
                     selected[b].append(pid)
-
+                    
+        print("patch_scores NaN:", torch.isnan(patch_scores).any())
         return selected, visited
 
     @torch.no_grad()
