@@ -95,6 +95,8 @@ def run_vstar_inference(
     Returns:
         output_path: saved jsonl prediction path
     """
+    print("[DEBUG] model class =", model.__class__.__name__)
+
     if model_type not in ["base_qwen", "tree_qwen"]:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -233,6 +235,8 @@ def run_hrbench_inference(
     Returns:
         output_path: saved jsonl prediction path
     """
+    print("[DEBUG] model class =", model.__class__.__name__)
+
     if split not in ["4k", "8k"]:
         raise ValueError("split must be either '4k' or '8k'")
 
