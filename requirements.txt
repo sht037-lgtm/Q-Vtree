@@ -5,3 +5,4 @@ huggingface_hub
 pandas
 Pillow
 tqdm
+qwen-vl-utils[decord]==0.0.8
