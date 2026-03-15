@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
-import math
 from collections import deque
 
 import torch
@@ -37,20 +36,26 @@ class Region:
 
 @dataclass
 class Node:
-    """A node in the quadtree."""
+    """A node in the recursive partition tree."""
     node_id: int
     level: int
     region: Region
     parent: Optional[int]
-    children: Optional[Tuple[int, int, int, int]]  # (tl, tr, bl, br)
+    children: Optional[Tuple[int, ...]]  # 4-way or 2-way depending on region shape
 
 
 # =============================
-# 2) Full quadtree builder
+# 2) Full tree builder
 # =============================
 class QuadTreeBuilder:
     """
-    Build a FULL quadtree down to 1x1 patch leaves.
+    Build a FULL recursive partition tree down to 1x1 patch leaves.
+
+    Partition rule:
+      - h >= 2 and w >= 2: split into 4 children
+      - h >= 2 and w == 1: split vertically into 2 children
+      - h == 1 and w >= 2: split horizontally into 2 children
+      - h == 1 and w == 1: leaf
 
     Input:
       x: [B, N, D], where N = H*W.
@@ -75,28 +80,59 @@ class QuadTreeBuilder:
     @staticmethod
     def can_split(reg: Region) -> bool:
         """Leaf is 1x1 patch."""
-        return reg.h >= 2 and reg.w >= 2
+        return not (reg.h == 1 and reg.w == 1)
 
     @staticmethod
-    def split4(reg: Region) -> Optional[Tuple[Region, Region, Region, Region]]:
+    def split_region(reg: Region) -> Optional[Tuple[Region, ...]]:
         """
-        Integer midpoint split into 4 children (uneven sizes allowed for odd dimensions).
-        Returns (tl,tr,bl,br) or None if cannot split.
+        Adaptive recursive partition:
+
+          - h >= 2 and w >= 2: four-way split
+          - h >= 2 and w == 1: vertical two-way split
+          - h == 1 and w >= 2: horizontal two-way split
+          - h == 1 and w == 1: leaf
+
+        Returns:
+          tuple of child regions, or None if leaf.
         """
-        if reg.h < 2 or reg.w < 2:
+        h, w = reg.h, reg.w
+
+        if h == 1 and w == 1:
             return None
 
-        rm = (reg.r0 + reg.r1) // 2
-        cm = (reg.c0 + reg.c1) // 2
+        # 4-way split
+        if h >= 2 and w >= 2:
+            rm = (reg.r0 + reg.r1) // 2
+            cm = (reg.c0 + reg.c1) // 2
 
-        if rm == reg.r0 or rm == reg.r1 or cm == reg.c0 or cm == reg.c1:
-            return None
+            if rm == reg.r0 or rm == reg.r1 or cm == reg.c0 or cm == reg.c1:
+                return None
 
-        tl = Region(reg.r0, rm, reg.c0, cm)
-        tr = Region(reg.r0, rm, cm, reg.c1)
-        bl = Region(rm, reg.r1, reg.c0, cm)
-        br = Region(rm, reg.r1, cm, reg.c1)
-        return tl, tr, bl, br
+            tl = Region(reg.r0, rm, reg.c0, cm)
+            tr = Region(reg.r0, rm, cm, reg.c1)
+            bl = Region(rm, reg.r1, reg.c0, cm)
+            br = Region(rm, reg.r1, cm, reg.c1)
+            return tl, tr, bl, br
+
+        # vertical 2-way split
+        if h >= 2 and w == 1:
+            rm = (reg.r0 + reg.r1) // 2
+            if rm == reg.r0 or rm == reg.r1:
+                return None
+            top = Region(reg.r0, rm, reg.c0, reg.c1)
+            bottom = Region(rm, reg.r1, reg.c0, reg.c1)
+            return top, bottom
+
+        # horizontal 2-way split
+        if h == 1 and w >= 2:
+            cm = (reg.c0 + reg.c1) // 2
+            if cm == reg.c0 or cm == reg.c1:
+                return None
+            left = Region(reg.r0, reg.r1, reg.c0, cm)
+            right = Region(reg.r0, reg.r1, cm, reg.c1)
+            return left, right
+
+        return None
 
     @torch.no_grad()
     def build(self, x: torch.Tensor, H: int, W: int) -> Dict[str, Any]:
@@ -128,7 +164,7 @@ class QuadTreeBuilder:
             if not self.can_split(preg):
                 continue
 
-            sub = self.split4(preg)
+            sub = self.split_region(preg)
             if sub is None:
                 continue
 
@@ -147,7 +183,7 @@ class QuadTreeBuilder:
                 )
                 child_ids.append(cid)
 
-            nodes[pid].children = (child_ids[0], child_ids[1], child_ids[2], child_ids[3])
+            nodes[pid].children = tuple(child_ids)
             queue.extend(child_ids)
 
         return {"H": H, "W": W, "nodes": nodes}
@@ -396,7 +432,7 @@ class QVTree(nn.Module):
         W : int         patch grid width
 
       1) compute patch score map using AttentionScorer
-      2) build quadtree
+      2) build recursive partition tree
       3) run navigation on the score map
       4) return selected node set + selected token set
     """
@@ -456,7 +492,7 @@ class QVTree(nn.Module):
         self._debug_patch_scores = patch_scores
 
         # --------------------------------------------------
-        # build quadtree
+        # build tree
         # --------------------------------------------------
         built = self.builder.build(x, H, W)
         H_tree, W_tree, nodes = built["H"], built["W"], built["nodes"]
