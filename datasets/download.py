@@ -46,4 +46,5 @@ def download_hrbench_dataset(
     return save_dir
 
 if __name__ == '__main__':
+    download_vstar_dataset()
     download_hrbench_dataset()

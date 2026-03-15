@@ -58,16 +58,52 @@ def evaluate_mcq_predictions(pred_file: str) -> float:
 # =========================================================
 # ---------------------- V-Star ---------------------------
 # =========================================================
+import os
+import json
+from tqdm import tqdm
+from PIL import Image
+import torch
+from qwen_vl_utils import process_vision_info
+
+
 def run_vstar_inference(
     model,
     processor,
     dataset_dir: str = "datasets/vstar_bench",
     anno_file: str = "test_questions.jsonl",
-    output_file: str = "vstar_predictions.jsonl",
+    output_file: str | None = None,
     max_samples: int | None = None,
     max_new_tokens: int = 16,
+    model_type: str = "base_qwen",   # "base_qwen" or "tree_qwen"
+    run_name: str | None = None,     # optional custom tag for output naming
 ):
+    """
+    Run inference on V-Star.
+
+    Args:
+        model: loaded model
+        processor: corresponding processor
+        dataset_dir: dataset root
+        anno_file: annotation jsonl
+        output_file: optional explicit output filename
+        max_samples: optional subset size
+        max_new_tokens: generation length
+        model_type: type tag for experiment tracking
+                    supported: "base_qwen", "tree_qwen"
+        run_name: optional custom run tag, e.g. "tree_alpha05_beta02"
+
+    Returns:
+        output_path: saved jsonl prediction path
+    """
+    if model_type not in ["base_qwen", "tree_qwen"]:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
     anno_path = os.path.join(dataset_dir, anno_file)
+
+    if output_file is None:
+        tag = run_name if run_name is not None else model_type
+        output_file = f"vstar_predictions_{tag}.jsonl"
+
     output_path = os.path.join(dataset_dir, output_file)
 
     with open(anno_path, "r", encoding="utf-8") as f:
@@ -79,7 +115,7 @@ def run_vstar_inference(
     device = next(model.parameters()).device
 
     with open(output_path, "w", encoding="utf-8") as fout:
-        for sample in tqdm(samples, desc="Running V-Star inference"):
+        for sample in tqdm(samples, desc=f"Running V-Star inference [{model_type}]"):
             img_path = os.path.join(dataset_dir, sample["image"])
             question = sample["text"]
 
@@ -133,7 +169,7 @@ def run_vstar_inference(
             except Exception as e:
                 pred_text = ""
                 pred_option = ""
-                print(f"[ERROR] question_id={sample.get('question_id')}: {e}")
+                print(f"[ERROR][{model_type}] question_id={sample.get('question_id')}: {e}")
 
             result = {
                 "question_id": sample["question_id"],
@@ -143,6 +179,8 @@ def run_vstar_inference(
                 "label": sample["label"],
                 "prediction_text": pred_text,
                 "prediction_option": pred_option,
+                "model_type": model_type,
+                "run_name": run_name if run_name is not None else model_type,
             }
 
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -158,6 +196,14 @@ def evaluate_vstar_predictions(pred_file: str) -> float:
 # =========================================================
 # --------------------- HR-Bench --------------------------
 # =========================================================
+import os
+import json
+import pandas as pd
+from tqdm import tqdm
+import torch
+from qwen_vl_utils import process_vision_info
+
+
 def run_hrbench_inference(
     model,
     processor,
@@ -166,13 +212,38 @@ def run_hrbench_inference(
     output_file: str | None = None,
     max_samples: int | None = None,
     max_new_tokens: int = 16,
+    model_type: str = "base_qwen",   # "base_qwen" or "tree_qwen"
+    run_name: str | None = None,     # optional custom tag
 ):
-    assert split in ["4k", "8k"], "split must be either '4k' or '8k'"
+    """
+    Run inference on HR-Bench.
+
+    Args:
+        model: loaded model
+        processor: corresponding processor
+        split: "4k" or "8k"
+        dataset_dir: dataset root
+        output_file: optional explicit output filename
+        max_samples: optional subset size
+        max_new_tokens: generation length
+        model_type: type tag for experiment tracking
+                    supported: "base_qwen", "tree_qwen"
+        run_name: optional custom run tag, e.g. "tree_alpha05_beta02"
+
+    Returns:
+        output_path: saved jsonl prediction path
+    """
+    if split not in ["4k", "8k"]:
+        raise ValueError("split must be either '4k' or '8k'")
+
+    if model_type not in ["base_qwen", "tree_qwen"]:
+        raise ValueError(f"Unsupported model_type: {model_type}")
 
     tsv_path = os.path.join(dataset_dir, f"hr_bench_{split}.tsv")
 
     if output_file is None:
-        output_file = f"hr_bench_{split}_predictions.jsonl"
+        tag = run_name if run_name is not None else model_type
+        output_file = f"hr_bench_{split}_predictions_{tag}.jsonl"
 
     output_path = os.path.join(dataset_dir, output_file)
 
@@ -183,7 +254,7 @@ def run_hrbench_inference(
     device = next(model.parameters()).device
 
     with open(output_path, "w", encoding="utf-8") as fout:
-        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Running HR-Bench {split}"):
+        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Running HR-Bench {split} [{model_type}]"):
             try:
                 image = decode_base64_image(row["image"])
 
@@ -243,7 +314,7 @@ def run_hrbench_inference(
             except Exception as e:
                 pred_text = ""
                 pred_option = ""
-                print(f"[ERROR] index={row.get('index', 'unknown')}: {e}")
+                print(f"[ERROR][{model_type}] index={row.get('index', 'unknown')}: {e}")
 
             result = {
                 "index": int(row["index"]),
@@ -258,6 +329,8 @@ def run_hrbench_inference(
                 "label": row["answer"],
                 "prediction_text": pred_text,
                 "prediction_option": pred_option,
+                "model_type": model_type,
+                "run_name": run_name if run_name is not None else model_type,
             }
 
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
