@@ -116,10 +116,21 @@ def run_vstar_inference(
 
     device = next(model.parameters()).device
 
+    # ===== selection statistics =====
+    all_select_ratios = []
+    all_num_selected = []
+    all_num_total = []
+    category_select_ratios = {}
+
     with open(output_path, "w", encoding="utf-8") as fout:
         for sample in tqdm(samples, desc=f"Running V-Star inference [{model_type}]"):
             img_path = os.path.join(dataset_dir, sample["image"])
             question = sample["text"]
+
+            # default stats for this sample
+            sample_num_selected = None
+            sample_num_total = None
+            sample_select_ratio = None
 
             try:
                 image = Image.open(img_path).convert("RGB")
@@ -161,6 +172,22 @@ def run_vstar_inference(
                         max_new_tokens=max_new_tokens,
                     )
 
+                # ===== read selection stats from tree model =====
+                if hasattr(model, "model") and hasattr(model.model, "_debug_num_selected_tokens"):
+                    if model.model._debug_num_selected_tokens is not None and len(model.model._debug_num_selected_tokens) > 0:
+                        sample_num_selected = int(model.model._debug_num_selected_tokens[0])
+                        sample_num_total = int(model.model._debug_num_total_tokens[0])
+                        sample_select_ratio = float(model.model._debug_select_ratios[0])
+
+                        all_num_selected.append(sample_num_selected)
+                        all_num_total.append(sample_num_total)
+                        all_select_ratios.append(sample_select_ratio)
+
+                        cat = sample["category"]
+                        if cat not in category_select_ratios:
+                            category_select_ratios[cat] = []
+                        category_select_ratios[cat].append(sample_select_ratio)
+
                 pred_text = processor.batch_decode(
                     outputs[:, inputs["input_ids"].shape[1]:],
                     skip_special_tokens=True,
@@ -171,6 +198,9 @@ def run_vstar_inference(
             except Exception as e:
                 pred_text = ""
                 pred_option = ""
+                sample_num_selected = None
+                sample_num_total = None
+                sample_select_ratio = None
                 print(f"[ERROR][{model_type}] question_id={sample.get('question_id')}: {e}")
 
             result = {
@@ -183,9 +213,27 @@ def run_vstar_inference(
                 "prediction_option": pred_option,
                 "model_type": model_type,
                 "run_name": run_name if run_name is not None else model_type,
+                "num_selected_tokens": sample_num_selected,
+                "num_total_tokens": sample_num_total,
+                "select_ratio": sample_select_ratio,
             }
 
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    # ===== print summary stats =====
+    if len(all_select_ratios) > 0:
+        mean_ratio = sum(all_select_ratios) / len(all_select_ratios)
+        mean_selected = sum(all_num_selected) / len(all_num_selected)
+        mean_total = sum(all_num_total) / len(all_num_total)
+
+        print(f"[STATS] mean selected tokens = {mean_selected:.2f}")
+        print(f"[STATS] mean total tokens    = {mean_total:.2f}")
+        print(f"[STATS] mean select ratio    = {mean_ratio:.4f}")
+
+        print("[STATS] select ratio by category:")
+        for cat, vals in sorted(category_select_ratios.items()):
+            cat_mean = sum(vals) / len(vals)
+            print(f"  - {cat}: {cat_mean:.4f} (n={len(vals)})")
 
     print(f"[INFO] Saved predictions to: {output_path}")
     return output_path
@@ -257,8 +305,19 @@ def run_hrbench_inference(
 
     device = next(model.parameters()).device
 
+    # ===== selection statistics =====
+    all_select_ratios = []
+    all_num_selected = []
+    all_num_total = []
+    category_select_ratios = {}
+    cycle_category_select_ratios = {}
+
     with open(output_path, "w", encoding="utf-8") as fout:
         for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Running HR-Bench {split} [{model_type}]"):
+            sample_num_selected = None
+            sample_num_total = None
+            sample_select_ratio = None
+
             try:
                 image = decode_base64_image(row["image"])
 
@@ -308,6 +367,27 @@ def run_hrbench_inference(
                         max_new_tokens=max_new_tokens,
                     )
 
+                # ===== read selection stats from tree model =====
+                if hasattr(model, "model") and hasattr(model.model, "_debug_num_selected_tokens"):
+                    if model.model._debug_num_selected_tokens is not None and len(model.model._debug_num_selected_tokens) > 0:
+                        sample_num_selected = int(model.model._debug_num_selected_tokens[0])
+                        sample_num_total = int(model.model._debug_num_total_tokens[0])
+                        sample_select_ratio = float(model.model._debug_select_ratios[0])
+
+                        all_num_selected.append(sample_num_selected)
+                        all_num_total.append(sample_num_total)
+                        all_select_ratios.append(sample_select_ratio)
+
+                        cat = row["category"]
+                        if cat not in category_select_ratios:
+                            category_select_ratios[cat] = []
+                        category_select_ratios[cat].append(sample_select_ratio)
+
+                        cyc = row["cycle_category"]
+                        if cyc not in cycle_category_select_ratios:
+                            cycle_category_select_ratios[cyc] = []
+                        cycle_category_select_ratios[cyc].append(sample_select_ratio)
+
                 pred_text = processor.batch_decode(
                     outputs[:, inputs["input_ids"].shape[1]:],
                     skip_special_tokens=True,
@@ -318,6 +398,9 @@ def run_hrbench_inference(
             except Exception as e:
                 pred_text = ""
                 pred_option = ""
+                sample_num_selected = None
+                sample_num_total = None
+                sample_select_ratio = None
                 print(f"[ERROR][{model_type}] index={row.get('index', 'unknown')}: {e}")
 
             result = {
@@ -335,9 +418,32 @@ def run_hrbench_inference(
                 "prediction_option": pred_option,
                 "model_type": model_type,
                 "run_name": run_name if run_name is not None else model_type,
+                "num_selected_tokens": sample_num_selected,
+                "num_total_tokens": sample_num_total,
+                "select_ratio": sample_select_ratio,
             }
 
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    # ===== print summary stats =====
+    if len(all_select_ratios) > 0:
+        mean_ratio = sum(all_select_ratios) / len(all_select_ratios)
+        mean_selected = sum(all_num_selected) / len(all_num_selected)
+        mean_total = sum(all_num_total) / len(all_num_total)
+
+        print(f"[STATS] mean selected tokens = {mean_selected:.2f}")
+        print(f"[STATS] mean total tokens    = {mean_total:.2f}")
+        print(f"[STATS] mean select ratio    = {mean_ratio:.4f}")
+
+        print("[STATS] select ratio by category:")
+        for cat, vals in sorted(category_select_ratios.items()):
+            cat_mean = sum(vals) / len(vals)
+            print(f"  - {cat}: {cat_mean:.4f} (n={len(vals)})")
+
+        print("[STATS] select ratio by cycle_category:")
+        for cyc, vals in sorted(cycle_category_select_ratios.items()):
+            cyc_mean = sum(vals) / len(vals)
+            print(f"  - {cyc}: {cyc_mean:.4f} (n={len(vals)})")
 
     print(f"[INFO] Saved predictions to: {output_path}")
     return output_path
