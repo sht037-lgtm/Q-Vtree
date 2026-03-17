@@ -188,6 +188,13 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             if full_position_ids is not None:
                 position_ids = full_position_ids[:, :, keep_positions]
 
+            if cache_position is not None:
+                cache_position = torch.arange(
+                    keep_positions.numel(),
+                    device=keep_positions.device,
+                    dtype=cache_position.dtype,
+                )
+
             # -------------------------------
             # scatter selected vision tokens
             # -------------------------------
@@ -230,6 +237,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
         if position_ids is None:
             raise RuntimeError("position_ids should not be None after pruning")
+
+        print("input_ids:", None if input_ids is None else input_ids.shape)
+        print("inputs_embeds:", None if inputs_embeds is None else inputs_embeds.shape)
+        print("attention_mask:", None if attention_mask is None else attention_mask.shape)
+        print("position_ids:", None if position_ids is None else position_ids.shape)
+        print("cache_position:", None if cache_position is None else cache_position.shape)
 
         # =============================
         # LLM
