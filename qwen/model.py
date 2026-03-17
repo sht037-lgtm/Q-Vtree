@@ -7,6 +7,20 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 
+def prune_kv_cache(past_key_values, keep_positions):
+    if past_key_values is None:
+        return None
+
+    new_past = []
+    for k, v in past_key_values:
+        # k/v: [B, heads, seq_len, dim]
+        k = k[:, :, keep_positions, :]
+        v = v[:, :, keep_positions, :]
+        new_past.append((k, v))
+
+    return new_past
+
+
 class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
     def __init__(self, config):
         super().__init__(config)
@@ -57,7 +71,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         # Vision Part
         # =============================
-        if pixel_values is not None:
+        if pixel_values is not None and past_key_values is None:
 
             self._debug_patch_ids = []
             self._debug_num_selected_tokens = []
@@ -171,6 +185,41 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             keep_positions = torch.sort(keep_positions).values
 
+            # concat selected tokens
+            selected_image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
+                inputs_embeds.device,
+                inputs_embeds.dtype,
+            )
+            selected_image_embeds = torch.nan_to_num(selected_image_embeds)
+
+            # -------------------------------
+            # build keep indices
+            # -------------------------------
+
+            VISION_TOKEN_ID = 151655
+
+            vision_mask = (input_ids == VISION_TOKEN_ID)
+            vision_positions = vision_mask.nonzero(as_tuple=False)[:, 1]
+            text_positions = (~vision_mask).nonzero(as_tuple=False)[:, 1]
+
+            selected_patch_ids = torch.cat(self._debug_patch_ids)
+
+            selected_vision_positions = vision_positions[selected_patch_ids]
+
+            keep_positions = torch.cat([
+                text_positions,
+                selected_vision_positions
+            ])
+
+            keep_positions = torch.sort(keep_positions).values
+
+            # -------------------------------
+            # 先保存 full position_ids
+            # -------------------------------
+            full_position_ids = None
+            if position_ids is not None:
+                full_position_ids = position_ids
+
             # -------------------------------
             # prune sequence
             # -------------------------------
@@ -188,6 +237,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             if full_position_ids is not None:
                 position_ids = full_position_ids[:, :, keep_positions]
 
+            # -------------------------------
+            # 关键：修 cache_position
+            # -------------------------------
             if cache_position is not None:
                 cache_position = torch.arange(
                     keep_positions.numel(),
@@ -196,9 +248,14 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 )
 
             # -------------------------------
+            # 关键：裁剪 KV cache
+            # -------------------------------
+            if past_key_values is not None:
+                past_key_values = prune_kv_cache(past_key_values, keep_positions)
+
+            # -------------------------------
             # scatter selected vision tokens
             # -------------------------------
-
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
