@@ -152,9 +152,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             # =============================
             if mm_token_type_ids is not None:
 
-                image_positions = (mm_token_type_ids == 1).nonzero(as_tuple=False)[:, 1]
+                image_positions = (mm_token_type_ids == 1).nonzero(as_tuple=False)
 
-                keep_positions = image_positions[:num_selected_total]
+                keep_positions = image_positions[:num_selected_total, 1]
 
                 keep_mask = torch.zeros_like(mm_token_type_ids, dtype=torch.bool)
 
