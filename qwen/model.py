@@ -56,22 +56,19 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         if pixel_values is not None:
 
-            # init debug containers
             self._debug_patch_ids = []
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
 
-            # 1. Get patch tokens（List[Tensor(Ni, D)]）(After downsample)
             image_tokens_list = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 return_dict=True
             ).pooler_output
 
-            # 2. Compute TEXT tokens using embedding (NO LLM)
             with torch.no_grad():
-                text_embed = inputs_embeds  # [B, L, D]
+                text_embed = inputs_embeds
 
                 if mm_token_type_ids is not None:
                     text_mask = (mm_token_type_ids == 0)
@@ -88,29 +85,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             selected_idx_per_image = []
             new_image_tokens_list = []
 
-            # run tree for every image
             for i, tokens in enumerate(image_tokens_list):
-                # vision tokens: [Ni, D]
-                x = tokens.unsqueeze(0)  # [1, Ni, D]
 
-                # text tokens
-                ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
+                x = tokens.unsqueeze(0)
+                ti = text_tokens.to(tokens.device, tokens.dtype)
 
-                # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
                 grid_h = grid_h_raw // 2
                 grid_w = grid_w_raw // 2
 
-                if grid_h * grid_w != tokens.size(0):
-                    raise ValueError(
-                        f"Downsampled grid mismatch: "
-                        f"raw=({grid_h_raw}, {grid_w_raw}), "
-                        f"down=({grid_h}, {grid_w}), "
-                        f"H*W={grid_h * grid_w}, "
-                        f"tokens={tokens.size(0)}"
-                    )
-
-                # run tree
                 out = self.qvtree(x, ti, H=grid_h, W=grid_w)
 
                 sel_nodes = out["selected_node_ids"][0]
@@ -120,7 +103,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 grid_h = out["H"]
                 grid_w = out["W"]
 
-                # node ids -> patch ids
                 token_out = self.qvtree.navigator.nodes_to_tokens(
                     nodes,
                     H=grid_h,
@@ -131,18 +113,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 patch_ids = token_out["selected_token_indices"][0]
 
-                # fallback 1: if empty patch, keep all
                 if patch_ids.numel() == 0:
                     patch_ids = torch.arange(tokens.size(0), device=tokens.device)
 
-                # fallback 2: boundary inspection
                 patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
                 patch_ids = torch.unique(patch_ids)
 
                 patch_offset = tokens.size(0) - grid_h * grid_w
                 patch_ids = patch_ids + patch_offset
 
-                # debug store
                 self._debug_patch_ids.append(patch_ids)
 
                 num_selected = int(patch_ids.numel())
@@ -153,21 +132,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(select_ratio)
 
-                keep = torch.zeros(tokens.size(0), device=tokens.device, dtype=tokens.dtype)
-                keep[patch_ids] = 1.0
+                selected_tokens = tokens[patch_ids]
+                new_image_tokens_list.append(selected_tokens)
 
-                alpha = 0.5  # selected boost to (1+alpha)x
-                beta = 0.2   # unselected suppress to (1-beta)x
-
-                scale = 1.0 + alpha * keep - beta * (1.0 - keep)
-                tokens_modulated = tokens * scale.unsqueeze(-1)
-
-                new_image_tokens_list.append(tokens_modulated)
-
-            # debug save
             self._debug_selected_idx = selected_idx_per_image
 
-            # 5. Concat back. List[Tensor(Ni, D)] -> Tensor(sum_i Ni, D)
             image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
                 inputs_embeds.device,
                 inputs_embeds.dtype,
@@ -175,6 +144,30 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             image_embeds = torch.nan_to_num(image_embeds)
             inputs_embeds = torch.nan_to_num(inputs_embeds)
+
+            num_selected_total = image_embeds.shape[0]
+
+            # =============================
+            # reduce placeholder count
+            # =============================
+            if mm_token_type_ids is not None:
+
+                image_positions = (mm_token_type_ids == 1).nonzero(as_tuple=False)[:, 1]
+
+                keep_positions = image_positions[:num_selected_total]
+
+                keep_mask = torch.zeros_like(mm_token_type_ids, dtype=torch.bool)
+
+                keep_mask[:, keep_positions] = True
+                keep_mask[:, mm_token_type_ids == 0] = True
+
+                input_ids = input_ids[:, keep_mask[0]]
+                inputs_embeds = inputs_embeds[:, keep_mask[0]]
+
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, keep_mask[0]]
+
+                mm_token_type_ids = mm_token_type_ids[:, keep_mask[0]]
 
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
