@@ -154,13 +154,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_select_ratios.append(select_ratio)
 
                 # =============================
-                # alpha-beta soft masking (FIXED)
+                # alpha-beta soft masking
                 # =============================
-
-                alpha = 1.0
-
-                ratio = len(patch_ids) / tokens.size(0)
-                beta = 0.5 * (1 - ratio) + 0.2  # adaptive
+                alpha = 5.0  # selected
+                beta = 0.5  # unselected
 
                 keep = torch.full(
                     (tokens.size(0),),
@@ -171,10 +168,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 keep[patch_ids] = alpha
 
-                # normalization（关键）
-                scale = keep.mean()
-
-                tokens_modulated = tokens * keep.unsqueeze(-1) / scale
+                tokens_modulated = tokens * keep.unsqueeze(-1)
                 tokens_modulated = torch.nan_to_num(tokens_modulated)
 
                 new_image_tokens_list.append(tokens_modulated)
