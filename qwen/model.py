@@ -208,8 +208,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         # position ids
         # =============================
-        print("position_ids before compute:",
-              None if position_ids is None else position_ids.shape)
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(
@@ -223,8 +221,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 mm_token_type_ids=mm_token_type_ids,
             )
 
-        print("position_ids after compute:", position_ids.shape)
-        
+        vision_mask = (input_ids == 151655)
+        print("vision tokens:", vision_mask.sum())
+
+
         # =============================
         # LLM
         # =============================
