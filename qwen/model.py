@@ -1,9 +1,8 @@
 import torch
-from module import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLModel,  # override
+    Qwen2_5_VLModel,
     Qwen2_5_VLForConditionalGeneration,
-    Qwen2_5_VLModelOutputWithPast
+    Qwen2_5_VLModelOutputWithPast,
 )
 
 
@@ -20,7 +19,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         self._debug_num_total_tokens = None
         self._debug_select_ratios = None
 
-        # Qwen2.5-VL special tokens in input_ids
+        # observed from your processor output
         self.vision_start_id = 151652
         self.vision_token_id = 151655
         self.vision_end_id = 151653
@@ -30,8 +29,25 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         Return positions of <vision_token> in the sequence.
         Assumes batch size = 1.
         """
-        assert input_ids.size(0) == 1, "Current implementation assumes batch size = 1."
+        assert input_ids is not None and input_ids.size(0) == 1, "Current implementation assumes batch size = 1."
         return (input_ids[0] == self.vision_token_id).nonzero(as_tuple=False).squeeze(-1)
+
+    def _slice_position_ids(self, position_ids: torch.Tensor, keep_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Slice position_ids on sequence dim while preserving original layout.
+        Handles both [3, B, L] and [B, 3, L].
+        """
+        if position_ids.dim() != 3:
+            raise ValueError(f"Unexpected position_ids shape: {tuple(position_ids.shape)}")
+
+        if position_ids.size(0) == 3:
+            # [3, B, L]
+            return position_ids[:, :, keep_indices]
+        elif position_ids.size(1) == 3:
+            # [B, 3, L]
+            return position_ids[:, :, keep_indices]
+        else:
+            raise ValueError(f"Cannot parse position_ids shape: {tuple(position_ids.shape)}")
 
     def forward(
         self,
@@ -64,15 +80,17 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # save original sequence for full-position computation
+        # save originals for full position-id computation
         original_input_ids = input_ids
         original_inputs_embeds = inputs_embeds
         original_attention_mask = attention_mask
+        original_mm_token_type_ids = mm_token_type_ids
 
         # =============================
         # Vision Part
         # =============================
         if pixel_values is not None:
+            assert input_ids is not None and input_ids.size(0) == 1, "Current implementation assumes batch size = 1."
 
             # init debug containers
             self._debug_patch_ids = []
@@ -80,42 +98,50 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
 
-            # 1. Get patch tokens (List[Tensor(Ni, D)]) after downsample
+            # 1) full position ids on ORIGINAL full sequence, before any pruning
+            if position_ids is None:
+                full_position_ids = self.compute_3d_position_ids(
+                    input_ids=original_input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    inputs_embeds=original_inputs_embeds,
+                    attention_mask=original_attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=original_mm_token_type_ids,
+                )
+            else:
+                full_position_ids = position_ids
+
+            # 2) get all vision tokens from vision tower
             image_tokens_list = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 return_dict=True
             ).pooler_output
 
-            # 2. Build text tokens from the original sequence
-            # exclude only <vision_token>; keep everything else
+            # 3) build text tokens from ORIGINAL sequence, excluding only <vision_token>
             with torch.no_grad():
-                text_embed = inputs_embeds  # [B, L, D]
-                text_mask = (input_ids != self.vision_token_id)
+                text_embed = original_inputs_embeds  # [1, L, D]
+                text_mask = (original_input_ids != self.vision_token_id)
                 text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
-                text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
+                text_tokens = text_tokens.to(original_inputs_embeds.device, original_inputs_embeds.dtype)
 
             selected_idx_per_image = []
             new_image_tokens_list = []
             selected_placeholder_positions_all = []
 
-            # full vision token positions in original input_ids
-            vision_positions_full = self._get_vision_token_positions(input_ids)
+            # all original <vision_token> positions in sequence
+            vision_positions_full = self._get_vision_token_positions(original_input_ids)
 
-            # current implementation assumes single image per sample
-            # if you later use multiple images, you should split vision_positions_full by image span
-            if len(image_tokens_list) != 1:
-                raise NotImplementedError("Current implementation supports single-image samples only.")
+            # we need to split these positions by image, following image_tokens_list order
+            cursor = 0
 
-            # run tree for every image
             for i, tokens in enumerate(image_tokens_list):
-                # vision tokens: [Ni, D]
+                # tokens: [Ni, D]
                 x = tokens.unsqueeze(0)  # [1, Ni, D]
+                ti = text_tokens.to(tokens.device, tokens.dtype)
 
-                # text tokens
-                ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
-
-                # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
                 grid_h = grid_h_raw // 2
                 grid_w = grid_w_raw // 2
@@ -129,6 +155,17 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         f"tokens={tokens.size(0)}"
                     )
 
+                # placeholder positions for this image in ORIGINAL full sequence
+                num_tokens_i = tokens.size(0)
+                positions_i = vision_positions_full[cursor: cursor + num_tokens_i]
+                cursor += num_tokens_i
+
+                if positions_i.numel() != num_tokens_i:
+                    raise ValueError(
+                        f"Placeholder/token mismatch for image {i}: "
+                        f"placeholder count={positions_i.numel()}, token count={num_tokens_i}"
+                    )
+
                 # run tree
                 out = self.qvtree(x, ti, H=grid_h, W=grid_w)
 
@@ -139,7 +176,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 grid_h = out["H"]
                 grid_w = out["W"]
 
-                # node ids -> patch ids
                 token_out = self.qvtree.navigator.nodes_to_tokens(
                     nodes,
                     H=grid_h,
@@ -158,13 +194,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
                 patch_ids = torch.unique(patch_ids)
 
-                # if there is a patch offset, shift patch ids accordingly
                 patch_offset = tokens.size(0) - grid_h * grid_w
                 patch_ids = patch_ids + patch_offset
                 patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
                 patch_ids = torch.unique(patch_ids)
 
-                # debug store
+                # debug
                 self._debug_patch_ids.append(patch_ids)
 
                 num_selected = int(patch_ids.numel())
@@ -179,92 +214,55 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 selected_tokens = tokens[patch_ids]
                 new_image_tokens_list.append(selected_tokens)
 
-                # selected placeholder positions in the ORIGINAL sequence
-                # this is the key step for preserving original positional indices
-                if vision_positions_full.numel() != tokens.size(0):
-                    raise ValueError(
-                        f"Placeholder/token mismatch before pruning: "
-                        f"vision placeholders = {vision_positions_full.numel()}, "
-                        f"vision tokens = {tokens.size(0)}"
-                    )
-
-                selected_placeholder_positions = vision_positions_full[patch_ids]
+                # map selected patch ids -> ORIGINAL placeholder positions
+                selected_placeholder_positions = positions_i[patch_ids]
                 selected_placeholder_positions_all.append(selected_placeholder_positions)
 
-            # debug save
             self._debug_selected_idx = selected_idx_per_image
 
-            # concatenate selected visual tokens
+            if cursor != vision_positions_full.numel():
+                raise ValueError(
+                    f"Not all vision placeholders were consumed: consumed={cursor}, total={vision_positions_full.numel()}"
+                )
+
+            # concat selected image tokens
             image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
-                inputs_embeds.device,
-                inputs_embeds.dtype,
+                original_inputs_embeds.device,
+                original_inputs_embeds.dtype,
             )
-
             image_embeds = torch.nan_to_num(image_embeds)
-            inputs_embeds = torch.nan_to_num(inputs_embeds)
 
-            # concatenate selected placeholder positions in original sequence
+            # concat selected placeholder positions in ORIGINAL full sequence
             selected_placeholder_positions_all = torch.cat(selected_placeholder_positions_all, dim=0)
             selected_placeholder_positions_all = torch.unique(selected_placeholder_positions_all, sorted=True)
 
-            # =============================
-            # Build keep indices on the ORIGINAL sequence
-            # Keep:
-            #   - all non-<vision_token> tokens
-            #   - only selected <vision_token> positions
-            # =============================
-            seq_len = input_ids.size(1)
-            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=input_ids.device)
+            # 4) build keep mask on ORIGINAL full sequence
+            seq_len = original_input_ids.size(1)
+            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=original_input_ids.device)
 
-            # first remove all vision tokens
+            # remove all <vision_token> first
             keep_mask[vision_positions_full] = False
-            # then add back selected ones
+            # add back selected <vision_token> positions
             keep_mask[selected_placeholder_positions_all] = True
 
             keep_indices = keep_mask.nonzero(as_tuple=False).squeeze(-1)
 
-            # prune input_ids / inputs_embeds / attention_mask
-            input_ids = input_ids[:, keep_indices]
-            inputs_embeds = inputs_embeds[:, keep_indices]
+            # 5) prune sequence tensors
+            input_ids = original_input_ids[:, keep_indices]
+            inputs_embeds = original_inputs_embeds[:, keep_indices]
 
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, keep_indices]
+            if original_attention_mask is not None:
+                attention_mask = original_attention_mask[:, keep_indices]
+            else:
+                attention_mask = None
 
-            if mm_token_type_ids is not None:
-                mm_token_type_ids = mm_token_type_ids[:, keep_indices]
+            if original_mm_token_type_ids is not None:
+                mm_token_type_ids = original_mm_token_type_ids[:, keep_indices]
 
-            # =============================
-            # Compute full position_ids first, then prune them with keep_indices
-            # This preserves original positional indices for selected vision tokens.
-            # =============================
-            if position_ids is None:
-                full_position_ids = self.compute_3d_position_ids(
-                    input_ids=original_input_ids,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    second_per_grid_ts=second_per_grid_ts,
-                    inputs_embeds=original_inputs_embeds,
-                    attention_mask=original_attention_mask,
-                    past_key_values=past_key_values,
-                    mm_token_type_ids=mm_token_type_ids,  # usually None in your setup
-                )
+            # 6) prune position_ids using SAME keep_indices
+            position_ids = self._slice_position_ids(full_position_ids, keep_indices)
 
-                # normalize shape to [B, 3, L]
-                if full_position_ids.dim() != 3:
-                    raise ValueError(f"Unexpected full_position_ids shape: {full_position_ids.shape}")
-
-                if full_position_ids.size(0) == 3:
-                    full_position_ids = full_position_ids.permute(1, 0, 2).contiguous()
-                elif full_position_ids.size(1) == 3:
-                    pass
-                else:
-                    raise ValueError(f"Cannot parse full_position_ids shape: {full_position_ids.shape}")
-
-                position_ids = full_position_ids[:, :, keep_indices]
-
-            # =============================
-            # Scatter selected visual tokens into reduced placeholders
-            # =============================
+            # 7) scatter selected image_embeds into reduced placeholders
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
@@ -274,7 +272,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             inputs_embeds = torch.nan_to_num(inputs_embeds)
 
-            # cache_position also needs to follow new sequence length during prefill
+            # keep cache_position consistent with reduced sequence during prefill
             if cache_position is not None and cache_position.numel() != inputs_embeds.size(1):
                 cache_position = torch.arange(
                     inputs_embeds.size(1),
@@ -346,15 +344,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         )
         return output if return_dict else output.to_tuple()
 
+
 class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
 
-        # Save original backbone weights
         old_state_dict = self.model.state_dict()
-
-        # Replace backbone
         self.model = Qwen2_5_VLModelWithTree(config)
-
-        # Load the original weight
         self.model.load_state_dict(old_state_dict, strict=False)
