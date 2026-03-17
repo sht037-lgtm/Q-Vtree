@@ -164,22 +164,65 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             # debug save
             self._debug_selected_idx = selected_idx_per_image
 
-            # 5. Concat back. List[Tensor(Ni, D)] -> Tensor(sum_i Ni, D)
-            image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
+            # concat selected tokens
+            selected_image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
                 inputs_embeds.device,
                 inputs_embeds.dtype,
             )
 
-            image_embeds = torch.nan_to_num(image_embeds)
-            inputs_embeds = torch.nan_to_num(inputs_embeds)
+            selected_image_embeds = torch.nan_to_num(selected_image_embeds)
+
+            # -------------------------------
+            # build keep indices
+            # -------------------------------
+
+            VISION_TOKEN_ID = 151655
+
+            vision_mask = (input_ids == VISION_TOKEN_ID)
+            vision_positions = vision_mask.nonzero(as_tuple=False)[:, 1]
+
+            text_positions = (~vision_mask).nonzero(as_tuple=False)[:, 1]
+
+            # flatten patch ids (single image case)
+            selected_patch_ids = torch.cat(self._debug_patch_ids)
+
+            selected_vision_positions = vision_positions[selected_patch_ids]
+
+            keep_positions = torch.cat([
+                text_positions,
+                selected_vision_positions
+            ])
+
+            keep_positions = torch.sort(keep_positions).values
+
+            # -------------------------------
+            # prune sequence
+            # -------------------------------
+
+            input_ids = input_ids[:, keep_positions]
+
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, keep_positions]
+
+            inputs_embeds = inputs_embeds[:, keep_positions]
+
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = mm_token_type_ids[:, keep_positions]
+
+            if position_ids is not None:
+                position_ids = position_ids[:, :, keep_positions]
+
+            # -------------------------------
+            # scatter selected vision tokens
+            # -------------------------------
 
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
-                image_features=image_embeds,
+                image_features=selected_image_embeds,
             )
 
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, selected_image_embeds)
             inputs_embeds = torch.nan_to_num(inputs_embeds)
 
         # =============================
