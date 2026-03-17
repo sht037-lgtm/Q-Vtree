@@ -7,20 +7,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 
-def prune_kv_cache(past_key_values, keep_positions):
-    if past_key_values is None:
-        return None
-
-    new_past = []
-    for k, v in past_key_values:
-        # k/v: [B, heads, seq_len, dim]
-        k = k[:, :, keep_positions, :]
-        v = v[:, :, keep_positions, :]
-        new_past.append((k, v))
-
-    return new_past
-
-
 class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
     def __init__(self, config):
         super().__init__(config)
@@ -65,27 +51,27 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # 保存 full position ids
-        full_position_ids = position_ids
-
         # =============================
         # Vision Part
         # =============================
         if pixel_values is not None:
 
+            # init debug containers
             self._debug_patch_ids = []
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
 
+            # 1. Get patch tokens（List[Tensor(Ni, D)]）(After downsample)
             image_tokens_list = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 return_dict=True
             ).pooler_output
 
+            # 2. Compute TEXT tokens using embedding (NO LLM)
             with torch.no_grad():
-                text_embed = inputs_embeds
+                text_embed = inputs_embeds  # [B, L, D]
 
                 if mm_token_type_ids is not None:
                     text_mask = (mm_token_type_ids == 0)
@@ -102,15 +88,29 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             selected_idx_per_image = []
             new_image_tokens_list = []
 
+            # run tree for every image
             for i, tokens in enumerate(image_tokens_list):
+                # vision tokens: [Ni, D]
+                x = tokens.unsqueeze(0)  # [1, Ni, D]
 
-                x = tokens.unsqueeze(0)
-                ti = text_tokens.to(tokens.device, tokens.dtype)
+                # text tokens
+                ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
 
+                # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
                 grid_h = grid_h_raw // 2
                 grid_w = grid_w_raw // 2
 
+                if grid_h * grid_w != tokens.size(0):
+                    raise ValueError(
+                        f"Downsampled grid mismatch: "
+                        f"raw=({grid_h_raw}, {grid_w_raw}), "
+                        f"down=({grid_h}, {grid_w}), "
+                        f"H*W={grid_h * grid_w}, "
+                        f"tokens={tokens.size(0)}"
+                    )
+
+                # run tree
                 out = self.qvtree(x, ti, H=grid_h, W=grid_w)
 
                 sel_nodes = out["selected_node_ids"][0]
@@ -120,6 +120,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 grid_h = out["H"]
                 grid_w = out["W"]
 
+                # node ids -> patch ids
                 token_out = self.qvtree.navigator.nodes_to_tokens(
                     nodes,
                     H=grid_h,
@@ -130,100 +131,71 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 patch_ids = token_out["selected_token_indices"][0]
 
+                # fallback 1: if empty patch, keep all
                 if patch_ids.numel() == 0:
                     patch_ids = torch.arange(tokens.size(0), device=tokens.device)
 
+                # fallback 2: boundary inspection
                 patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
                 patch_ids = torch.unique(patch_ids)
 
                 patch_offset = tokens.size(0) - grid_h * grid_w
                 patch_ids = patch_ids + patch_offset
-                patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
 
+                # debug store
                 self._debug_patch_ids.append(patch_ids)
 
                 num_selected = int(patch_ids.numel())
                 num_total = int(tokens.size(0))
-                select_ratio = num_selected / num_total
+                select_ratio = num_selected / num_total if num_total > 0 else 0.0
 
                 self._debug_num_selected_tokens.append(num_selected)
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(select_ratio)
 
-                # 关键修改：只保留 selected tokens
-                selected_tokens = tokens[patch_ids]
-                selected_tokens = torch.nan_to_num(selected_tokens)
+                # =============================
+                # alpha-beta soft masking
+                # =============================
+                alpha = 2.0  # selected
+                beta = 0.5  # unselected
 
-                new_image_tokens_list.append(selected_tokens)
+                keep = torch.full(
+                    (tokens.size(0),),
+                    beta,
+                    device=tokens.device,
+                    dtype=tokens.dtype,
+                )
 
+                keep[patch_ids] = alpha
+
+                tokens_modulated = tokens * keep.unsqueeze(-1)
+                tokens_modulated = torch.nan_to_num(tokens_modulated)
+
+                new_image_tokens_list.append(tokens_modulated)
+
+            # debug save
             self._debug_selected_idx = selected_idx_per_image
 
-            selected_image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
+            # 5. Concat back. List[Tensor(Ni, D)] -> Tensor(sum_i Ni, D)
+            image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
                 inputs_embeds.device,
                 inputs_embeds.dtype,
             )
 
-            # -------------------------------
-            # placeholder reduction
-            # -------------------------------
-
-            VISION_TOKEN_ID = 151655
-
-            vision_mask = (input_ids == VISION_TOKEN_ID)
-
-            vision_positions = vision_mask.nonzero(as_tuple=False)[:, 1]
-            text_positions = (~vision_mask).nonzero(as_tuple=False)[:, 1]
-
-            selected_patch_ids = torch.cat(self._debug_patch_ids)
-
-            selected_vision_positions = vision_positions[selected_patch_ids]
-
-            keep_positions = torch.cat([
-                text_positions,
-                selected_vision_positions
-            ])
-
-            keep_positions = torch.sort(keep_positions).values
-
-            # -------------------------------
-            # prune sequence
-            # -------------------------------
-
-            input_ids = input_ids[:, keep_positions]
-
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, keep_positions]
-
-            inputs_embeds = inputs_embeds[:, keep_positions]
-
-            if mm_token_type_ids is not None:
-                mm_token_type_ids = mm_token_type_ids[:, keep_positions]
-
-            if full_position_ids is not None:
-                position_ids = full_position_ids[:, :, keep_positions]
-
-            if cache_position is not None:
-                cache_position = torch.arange(
-                    keep_positions.numel(),
-                    device=keep_positions.device,
-                    dtype=cache_position.dtype,
-                )
-
-            # -------------------------------
-            # scatter selected vision tokens
-            # -------------------------------
+            image_embeds = torch.nan_to_num(image_embeds)
+            inputs_embeds = torch.nan_to_num(inputs_embeds)
 
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
-                image_features=selected_image_embeds,
+                image_features=image_embeds,
             )
 
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, selected_image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             inputs_embeds = torch.nan_to_num(inputs_embeds)
 
         # =============================
-        # Video part
+        # Video part (no change)
         # =============================
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(
@@ -248,20 +220,21 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         # position ids
         # =============================
-
         if position_ids is None:
-            raise RuntimeError("position_ids should not be None after pruning")
-
-        print("input_ids:", None if input_ids is None else input_ids.shape)
-        print("inputs_embeds:", None if inputs_embeds is None else inputs_embeds.shape)
-        print("attention_mask:", None if attention_mask is None else attention_mask.shape)
-        print("position_ids:", None if position_ids is None else position_ids.shape)
-        print("cache_position:", None if cache_position is None else cache_position.shape)
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
 
         # =============================
         # LLM
         # =============================
-
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -283,7 +256,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
-
         return output if return_dict else output.to_tuple()
 
 class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGeneration):
