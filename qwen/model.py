@@ -51,27 +51,27 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
+        # 保存 full position ids
+        full_position_ids = position_ids
+
         # =============================
         # Vision Part
         # =============================
         if pixel_values is not None:
 
-            # init debug containers
             self._debug_patch_ids = []
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
 
-            # 1. Get patch tokens（List[Tensor(Ni, D)]）(After downsample)
             image_tokens_list = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 return_dict=True
             ).pooler_output
 
-            # 2. Compute TEXT tokens using embedding (NO LLM)
             with torch.no_grad():
-                text_embed = inputs_embeds  # [B, L, D]
+                text_embed = inputs_embeds
 
                 if mm_token_type_ids is not None:
                     text_mask = (mm_token_type_ids == 0)
@@ -88,29 +88,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             selected_idx_per_image = []
             new_image_tokens_list = []
 
-            # run tree for every image
             for i, tokens in enumerate(image_tokens_list):
-                # vision tokens: [Ni, D]
-                x = tokens.unsqueeze(0)  # [1, Ni, D]
 
-                # text tokens
-                ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
+                x = tokens.unsqueeze(0)
+                ti = text_tokens.to(tokens.device, tokens.dtype)
 
-                # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
                 grid_h = grid_h_raw // 2
                 grid_w = grid_w_raw // 2
 
-                if grid_h * grid_w != tokens.size(0):
-                    raise ValueError(
-                        f"Downsampled grid mismatch: "
-                        f"raw=({grid_h_raw}, {grid_w_raw}), "
-                        f"down=({grid_h}, {grid_w}), "
-                        f"H*W={grid_h * grid_w}, "
-                        f"tokens={tokens.size(0)}"
-                    )
-
-                # run tree
                 out = self.qvtree(x, ti, H=grid_h, W=grid_w)
 
                 sel_nodes = out["selected_node_ids"][0]
@@ -120,7 +106,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 grid_h = out["H"]
                 grid_w = out["W"]
 
-                # node ids -> patch ids
                 token_out = self.qvtree.navigator.nodes_to_tokens(
                     nodes,
                     H=grid_h,
@@ -131,59 +116,50 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 patch_ids = token_out["selected_token_indices"][0]
 
-                # fallback 1: if empty patch, keep all
                 if patch_ids.numel() == 0:
                     patch_ids = torch.arange(tokens.size(0), device=tokens.device)
 
-                # fallback 2: boundary inspection
                 patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
                 patch_ids = torch.unique(patch_ids)
 
                 patch_offset = tokens.size(0) - grid_h * grid_w
                 patch_ids = patch_ids + patch_offset
+                patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
 
-                # debug store
                 self._debug_patch_ids.append(patch_ids)
 
                 num_selected = int(patch_ids.numel())
                 num_total = int(tokens.size(0))
-                select_ratio = num_selected / num_total if num_total > 0 else 0.0
+                select_ratio = num_selected / num_total
 
                 self._debug_num_selected_tokens.append(num_selected)
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(select_ratio)
 
-                keep = torch.zeros(tokens.size(0), device=tokens.device)
-                keep[patch_ids] = 1.0
+                # 关键修改：只保留 selected tokens
+                selected_tokens = tokens[patch_ids]
+                selected_tokens = torch.nan_to_num(selected_tokens)
 
-                tokens_modulated = tokens * keep.unsqueeze(-1)
-                tokens_modulated = torch.nan_to_num(tokens_modulated)
+                new_image_tokens_list.append(selected_tokens)
 
-                new_image_tokens_list.append(tokens_modulated)
-
-            # debug save
             self._debug_selected_idx = selected_idx_per_image
 
-            # concat selected tokens
             selected_image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
                 inputs_embeds.device,
                 inputs_embeds.dtype,
             )
 
-            selected_image_embeds = torch.nan_to_num(selected_image_embeds)
-
             # -------------------------------
-            # build keep indices
+            # placeholder reduction
             # -------------------------------
 
             VISION_TOKEN_ID = 151655
 
             vision_mask = (input_ids == VISION_TOKEN_ID)
-            vision_positions = vision_mask.nonzero(as_tuple=False)[:, 1]
 
+            vision_positions = vision_mask.nonzero(as_tuple=False)[:, 1]
             text_positions = (~vision_mask).nonzero(as_tuple=False)[:, 1]
 
-            # flatten patch ids (single image case)
             selected_patch_ids = torch.cat(self._debug_patch_ids)
 
             selected_vision_positions = vision_positions[selected_patch_ids]
@@ -209,8 +185,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             if mm_token_type_ids is not None:
                 mm_token_type_ids = mm_token_type_ids[:, keep_positions]
 
-            if position_ids is not None:
-                position_ids = position_ids[:, :, keep_positions]
+            if full_position_ids is not None:
+                position_ids = full_position_ids[:, :, keep_positions]
 
             # -------------------------------
             # scatter selected vision tokens
@@ -226,7 +202,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             inputs_embeds = torch.nan_to_num(inputs_embeds)
 
         # =============================
-        # Video part (no change)
+        # Video part
         # =============================
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(
@@ -253,24 +229,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
 
         if position_ids is None:
-            position_ids = self.compute_3d_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
-            )
-
-        vision_mask = (input_ids == 151655)
-        print("vision tokens:", vision_mask.sum())
-
+            raise RuntimeError("position_ids should not be None after pruning")
 
         # =============================
         # LLM
         # =============================
+
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -292,6 +256,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
+
         return output if return_dict else output.to_tuple()
 
 class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGeneration):
