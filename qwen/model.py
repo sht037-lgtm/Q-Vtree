@@ -67,24 +67,22 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return_dict=True
             ).pooler_output
 
+            # =============================
+            # text tokens (no LLM)
+            # =============================
             with torch.no_grad():
+
                 text_embed = inputs_embeds
 
-                if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0)
-                else:
-                    text_mask = torch.ones(
-                        (text_embed.shape[0], text_embed.shape[1]),
-                        dtype=torch.bool,
-                        device=text_embed.device,
-                    )
-
-                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
+                text_tokens = text_embed.view(1, -1, text_embed.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
             selected_idx_per_image = []
             new_image_tokens_list = []
 
+            # =============================
+            # run tree per image
+            # =============================
             for i, tokens in enumerate(image_tokens_list):
 
                 x = tokens.unsqueeze(0)
@@ -122,6 +120,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 patch_offset = tokens.size(0) - grid_h * grid_w
                 patch_ids = patch_ids + patch_offset
 
+                # =============================
+                # debug stats
+                # =============================
                 self._debug_patch_ids.append(patch_ids)
 
                 num_selected = int(patch_ids.numel())
@@ -137,6 +138,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             self._debug_selected_idx = selected_idx_per_image
 
+            # =============================
+            # concat selected tokens
+            # =============================
             image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
                 inputs_embeds.device,
                 inputs_embeds.dtype,
@@ -148,27 +152,39 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             num_selected_total = image_embeds.shape[0]
 
             # =============================
-            # reduce placeholder count
+            # reduce vision placeholders
             # =============================
-            if mm_token_type_ids is not None:
 
-                image_positions = (mm_token_type_ids == 1).nonzero(as_tuple=False)
+            vision_token_id = 151655
+            vision_start_id = 151652
+            vision_end_id = 151653
 
-                keep_positions = image_positions[:num_selected_total, 1]
+            input_ids_list = input_ids[0].tolist()
 
-                keep_mask = torch.zeros_like(mm_token_type_ids, dtype=torch.bool)
+            start_idx = input_ids_list.index(vision_start_id)
+            end_idx = input_ids_list.index(vision_end_id)
 
-                keep_mask[:, keep_positions] = True
-                keep_mask[:, mm_token_type_ids == 0] = True
+            # safety floor
+            num_selected_total = max(num_selected_total, 32)
 
-                input_ids = input_ids[:, keep_mask[0]]
-                inputs_embeds = inputs_embeds[:, keep_mask[0]]
+            new_input_ids = (
+                    input_ids_list[: start_idx + 1]
+                    + [vision_token_id] * num_selected_total
+                    + input_ids_list[end_idx:]
+            )
 
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, keep_mask[0]]
+            input_ids = torch.tensor(
+                [new_input_ids],
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
 
-                mm_token_type_ids = mm_token_type_ids[:, keep_mask[0]]
+            if attention_mask is not None:
+                attention_mask = torch.ones_like(input_ids)
 
+            # =============================
+            # scatter vision tokens
+            # =============================
             image_mask, _ = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
@@ -177,7 +193,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             inputs_embeds = torch.nan_to_num(inputs_embeds)
-
         # =============================
         # Video part (no change)
         # =============================
