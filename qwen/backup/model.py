@@ -153,8 +153,20 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(select_ratio)
 
-                keep = torch.zeros(tokens.size(0), device=tokens.device)
-                keep[patch_ids] = 1.0
+                # =============================
+                # alpha-beta soft masking
+                # =============================
+                alpha = 2.0  # selected
+                beta = 0.5  # unselected
+
+                keep = torch.full(
+                    (tokens.size(0),),
+                    beta,
+                    device=tokens.device,
+                    dtype=tokens.dtype,
+                )
+
+                keep[patch_ids] = alpha
 
                 tokens_modulated = tokens * keep.unsqueeze(-1)
                 tokens_modulated = torch.nan_to_num(tokens_modulated)
