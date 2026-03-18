@@ -509,13 +509,13 @@ def run_vstar_with_crop(
     print(f"\nFINAL ACC: {correct}/{total} = {correct/total:.4f}")
 
 def run_hrbench_with_crop(
-    infer,
+    infer,   # CropInferenceWrapper（不改它）
     split: str = "4k",
     dataset_dir: str = "datasets/hr_bench",
     output_file: str | None = None,
     max_samples: int | None = None,
 ):
-    import os, json
+    import os, json, tempfile
     import pandas as pd
     from tqdm import tqdm
 
@@ -540,7 +540,7 @@ def run_hrbench_with_crop(
         for i, row in tqdm(df.iterrows(), total=len(df), desc=f"HRBench {split} + Crop"):
 
             try:
-                # ===== decode image =====
+                # ===== decode base64 → PIL =====
                 image = decode_base64_image(row["image"])
 
                 # ===== build question =====
@@ -553,11 +553,14 @@ def run_hrbench_with_crop(
                     f"Answer with the option's letter from the given choices directly."
                 )
 
-                # ===== 🔥 核心：用 crop wrapper =====
-                pred_text = infer(
-                    image=image,          # 注意：这里直接传 PIL，不用 path
-                    question=question_text
-                )
+                # ===== 🔥 核心：转成临时文件喂 wrapper =====
+                with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
+                    image.save(tmp.name)
+
+                    pred_text = infer(
+                        image_path=tmp.name,
+                        question=question_text
+                    )
 
                 pred_option = extract_option_letter(pred_text)
 
@@ -571,7 +574,7 @@ def run_hrbench_with_crop(
             if pred_option == gt:
                 correct += 1
 
-            # ===== 保存 =====
+            # ===== 保存结果 =====
             result = {
                 "index": int(row["index"]),
                 "split": split,

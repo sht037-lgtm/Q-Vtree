@@ -20,13 +20,15 @@ class CropInferenceWrapper:
         self.device = next(base_model.parameters()).device
 
     @torch.inference_mode()
-    def __call__(self, image=None, image_path=None, question=""):
+    def __call__(self, image_path, question, max_new_tokens=16):
+        """
+        输入：image + text
+        输出：模型回答
+        """
 
-        if image is None:
-            if image_path is None:
-                raise ValueError("Either image or image_path must be provided")
-            image = Image.open(image_path).convert("RGB")
-
+        # =====================================
+        # Step 1: 用 tree_model 跑一遍拿 patch_ids
+        # =====================================
         messages = [{
             "role": "user",
             "content": [
