@@ -203,6 +203,7 @@ def get_crop_images(
     new_h = int(h * scale)
 
     crop = crop.resize((new_w, new_h), Image.BICUBIC)
+    print(f"crop size: {w} * {h}")
 
     return img, crop
 
@@ -215,7 +216,7 @@ def build_crop_messages(img, crop, question):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": img},
+                # {"type": "image", "image": img},
                 {"type": "image", "image": crop},
                 {
                     "type": "text",
