@@ -207,10 +207,6 @@ def get_crop_images(
 # 构造Qwen messages
 # =========================
 def build_crop_messages(img, crop, question):
-    """
-    Return Qwen multi-image messages
-    """
-
     return [
         {
             "role": "user",
@@ -219,7 +215,11 @@ def build_crop_messages(img, crop, question):
                 {"type": "image", "image": crop},
                 {
                     "type": "text",
-                    "text": question + "\nFocus on the second image.",
+                    "text": (
+                        question
+                        + "\n\nThe second image shows a zoomed-in view of the important region. "
+                        "Use both images to answer."
+                    ),
                 },
             ],
         }
