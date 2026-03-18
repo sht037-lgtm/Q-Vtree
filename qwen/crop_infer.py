@@ -169,36 +169,40 @@ def get_crop_images(
     grid_h,
     grid_w,
     patch_size=28,
-    crop_size=336,
     pad=1,
 ):
-    """
-    Args:
-        img_path: 原图路径
-        patch_ids: selected patches
-        grid_h, grid_w: downsampled grid
-        crop_size: crop resize size
-
-    Returns:
-        global_img (PIL)
-        crop_img (PIL)
-    """
-
-    # load
     img = Image.open(img_path).convert("RGB")
+    W, H = img.size
 
-    # resize to patch-aligned resolution
-    img_resized = img.resize((grid_w * patch_size, grid_h * patch_size))
-
-    # get box
+    # 1. 在 grid 上得到 box（单位：patch grid）
     x0, y0, x1, y1 = patches_to_box(
         patch_ids, grid_h, grid_w, patch_size, pad
     )
 
-    crop = img_resized.crop((x0, y0, x1, y1))
+    # 2. 转成原图坐标
+    scale_x = W / (grid_w * patch_size)
+    scale_y = H / (grid_h * patch_size)
 
-    # resize crop（关键！）
-    crop = crop.resize((crop_size, crop_size))
+    x0 = int(x0 * scale_x)
+    y0 = int(y0 * scale_y)
+    x1 = int(x1 * scale_x)
+    y1 = int(y1 * scale_y)
+
+    # clamp
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W, x1), min(H, y1)
+
+    # 3. 在原图上 crop（关键！）
+    crop = img.crop((x0, y0, x1, y1))
+
+    # 4. 按比例放大（而不是固定336）
+    w, h = crop.size
+    scale = min(W / w, H / h)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    crop = crop.resize((new_w, new_h), Image.BICUBIC)
 
     return img, crop
 
