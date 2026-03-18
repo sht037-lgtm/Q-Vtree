@@ -195,7 +195,7 @@ def get_crop_images(
     # 3. 在原图上 crop（关键！）
     crop = img.crop((x0, y0, x1, y1))
 
-    # 4. 按比例放大（而不是固定336）
+    # 4. 按比例放大
     w, h = crop.size
     scale = min(W / w, H / h)
 
