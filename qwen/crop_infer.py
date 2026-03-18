@@ -211,16 +211,14 @@ def build_crop_messages(img, crop, question):
         {
             "role": "user",
             "content": [
-                # {"type": "image", "image": img},
+                {"type": "image", "image": img},
                 {"type": "image", "image": crop},
                 {
                     "type": "text",
                     "text": (
                         question
-                        # + "\n\nThe second image shows a zoomed-in view of the important region. "
-                        # "Use both images to answer."
-                        + "\n\nThe image shows a zoomed-in region from the original scene. "
-                          "Answer based on the visible details."
+                        + "\n\nThe second image shows a zoomed-in view of the important region. "
+                        "Use both images to answer."
                     ),
                 },
             ],
