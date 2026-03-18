@@ -156,7 +156,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 # =============================
                 # alpha-beta soft masking
                 # =============================
-                alpha = 2.0  # selected
+                alpha = 5.0  # selected
                 beta = 0.5  # unselected
 
                 keep = torch.full(
