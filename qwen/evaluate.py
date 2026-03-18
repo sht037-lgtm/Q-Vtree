@@ -10,6 +10,9 @@ from PIL import Image
 from tqdm import tqdm
 from qwen_vl_utils import process_vision_info
 
+import os, json, re
+from tqdm import tqdm
+
 
 # =========================================================
 # -------------------- Common Utils -----------------------
@@ -451,3 +454,56 @@ def run_hrbench_inference(
 
 def evaluate_hrbench_predictions(pred_file: str) -> float:
     return evaluate_mcq_predictions(pred_file)
+
+
+def run_vstar_with_crop(
+    infer,
+    dataset_dir="datasets/vstar_bench",
+    anno_file="test_questions.jsonl",
+    max_samples=None,
+):
+
+    def extract_option(text):
+        if text is None:
+            return ""
+        text = text.strip().upper()
+
+        m = re.search(r"\b([A-D])\b", text)
+        if m:
+            return m.group(1)
+        return ""
+
+    anno_path = os.path.join(dataset_dir, anno_file)
+
+    with open(anno_path, "r", encoding="utf-8") as f:
+        samples = [json.loads(line) for line in f]
+
+    if max_samples:
+        samples = samples[:max_samples]
+
+    correct = 0
+    total = len(samples)
+
+    for i, sample in enumerate(tqdm(samples, desc="V-Star + Crop")):
+        try:
+            img_path = os.path.join(dataset_dir, sample["image"])
+            question = sample["text"]
+
+            pred_text = infer(
+                image_path=img_path,
+                question=question
+            )
+
+            pred_option = extract_option(pred_text)
+            gt = sample["label"].strip().upper()
+
+            if pred_option == gt:
+                correct += 1
+
+        except Exception as e:
+            print(f"[ERROR] {i}: {e}")
+
+        if (i + 1) % 20 == 0:
+            print(f"{i+1}/{total} acc={correct/(i+1):.4f}")
+
+    print(f"\nFINAL ACC: {correct}/{total} = {correct/total:.4f}")
