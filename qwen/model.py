@@ -85,12 +85,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
-            print(f"[DEBUG] total seq len: {inputs_embeds.shape[1]}")  # 应该是1509左右
-            print(f"[DEBUG] visual tokens: {(mm_token_type_ids[0] == 1).sum().item()}")  # 740
-            print(f"[DEBUG] text tokens: {(mm_token_type_ids[0] == 0).sum().item()}")  # 769
-            print(f"[DEBUG] img_end position: {(mm_token_type_ids[0] == 1).nonzero(as_tuple=True)[0][-1].item()}")
-            print(f"[DEBUG] question tokens after img_end: {inputs_embeds.shape[1] - (mm_token_type_ids[0] == 1).nonzero(as_tuple=True)[0][-1].item() - 1}")
-
             selected_idx_per_image = []
             new_image_tokens_list = []
 
@@ -101,8 +95,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # text tokens
                 ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
-                print(f"[DEBUG] x shape: {x.shape}")
-                print(f"[DEBUG] ti shape: {ti.shape}")
 
                 # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
