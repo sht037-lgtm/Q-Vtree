@@ -74,17 +74,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 text_embed = inputs_embeds  # [B, L, D]
 
                 if mm_token_type_ids is not None:
-                    # 只取image tokens结束之后的question部分
-                    img_positions = (mm_token_type_ids[0] == 1).nonzero(as_tuple=True)[0]
-                    if img_positions.numel() > 0:
-                        img_end = img_positions[-1].item()
-                        text_tokens = text_embed[0, img_end + 1:].unsqueeze(0)  # [1, Lq, D]
-                        print(f"[DEBUG] question token count: {text_tokens.shape[1]}")
-                    else:
-                        text_mask = (mm_token_type_ids == 0)
-                        text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
+                    text_mask = (mm_token_type_ids == 0)
                 else:
-                    text_tokens = text_embed  # [B, L, D]
+                    text_mask = torch.ones(
+                        (text_embed.shape[0], text_embed.shape[1]),
+                        dtype=torch.bool,
+                        device=text_embed.device,
+                    )
+
+                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
             selected_idx_per_image = []
@@ -97,6 +95,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # text tokens
                 ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
+                print(f"[DEBUG] x shape: {x.shape}")
+                print(f"[DEBUG] ti shape: {ti.shape}")
 
                 # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
