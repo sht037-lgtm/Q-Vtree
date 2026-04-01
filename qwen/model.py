@@ -212,6 +212,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         if pixel_values is not None and attention_mask is not None \
                 and self._debug_patch_ids is not None \
                 and mm_token_type_ids is not None:
+            print(f"[DEBUG] applying attention mask, "
+                  f"visual tokens: {(mm_token_type_ids == 1).sum().item()}, "
+                  f"selected: {sum(p.numel() for p in self._debug_patch_ids)}")
 
             modified_mask = attention_mask.clone()  # [B, L]
 
