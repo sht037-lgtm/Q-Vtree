@@ -54,6 +54,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         # Vision Part
         # =============================
+        print(f"[DEBUG] mm_token_type_ids unique values: {mm_token_type_ids.unique()}")
+        print(f"[DEBUG] mm_token_type_ids[:20]: {mm_token_type_ids[0, :20]}")
+        
         if pixel_values is not None:
 
             # init debug containers
