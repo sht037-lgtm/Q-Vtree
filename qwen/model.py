@@ -296,12 +296,16 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         0, len(visual_positions) - 1
                     )
 
+                    mask_device = modified_mask.device
+                    vp = visual_positions.to(mask_device)
+                    relative_selected = relative_selected.to(mask_device)
+
                     non_selected = torch.ones(
-                        len(visual_positions), dtype=torch.bool,
-                        device=modified_mask.device
+                        len(vp), dtype=torch.bool,
+                        device=mask_device
                     )
                     non_selected[relative_selected] = False
-                    non_selected_positions = visual_positions[non_selected]
+                    non_selected_positions = vp[non_selected]
                     modified_mask[b, non_selected_positions] = 0
 
                 attention_mask = modified_mask
