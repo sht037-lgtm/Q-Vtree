@@ -73,15 +73,31 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             with torch.no_grad():
                 text_embed = inputs_embeds  # [B, L, D]
 
-                # 用input_ids定位image tokens
-                image_token_id = 151655  # Qwen2.5-VL的image token id
-                is_image = (input_ids[0] == image_token_id)  # [L]
+                image_token_id = 151655
+                is_image = (input_ids[0] == image_token_id)
 
                 if is_image.any():
                     img_end = is_image.nonzero(as_tuple=True)[0][-1].item()
-                    text_tokens = text_embed[0, img_end + 1:].unsqueeze(0)  # [1, Lq, D]
+                    # 只取question部分的input_ids
+                    question_input_ids = input_ids[:, img_end + 1:]  # [B, Lq]
+                    question_embeds = self.get_input_embeddings()(question_input_ids)  # [B, Lq, D]
+
+                    # 纯文本forward，只跑question部分
+                    text_outputs = self.language_model(
+                        input_ids=None,
+                        inputs_embeds=question_embeds,
+                        attention_mask=torch.ones(
+                            question_embeds.shape[:2],
+                            device=question_embeds.device,
+                            dtype=torch.long
+                        ),
+                        return_dict=True,
+                        use_cache=False,
+                    )
+                    # 取最后一层hidden states作为text representation
+                    text_tokens = text_outputs.last_hidden_state  # [B, Lq, D]
                 else:
-                    text_tokens = text_embed  # fallback
+                    text_tokens = text_embed
 
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
