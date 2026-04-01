@@ -54,9 +54,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         # Vision Part
         # =============================
-        print(f"[DEBUG] mm_token_type_ids unique values: {mm_token_type_ids.unique()}")
-        print(f"[DEBUG] mm_token_type_ids[:20]: {mm_token_type_ids[0, :20]}")
-        
         if pixel_values is not None:
 
             # init debug containers
@@ -76,16 +73,16 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             with torch.no_grad():
                 text_embed = inputs_embeds  # [B, L, D]
 
-                if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0)
-                else:
-                    text_mask = torch.ones(
-                        (text_embed.shape[0], text_embed.shape[1]),
-                        dtype=torch.bool,
-                        device=text_embed.device,
-                    )
+                # 用input_ids定位image tokens
+                image_token_id = 151655  # Qwen2.5-VL的image token id
+                is_image = (input_ids[0] == image_token_id)  # [L]
 
-                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
+                if is_image.any():
+                    img_end = is_image.nonzero(as_tuple=True)[0][-1].item()
+                    text_tokens = text_embed[0, img_end + 1:].unsqueeze(0)  # [1, Lq, D]
+                else:
+                    text_tokens = text_embed  # fallback
+
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
             selected_idx_per_image = []
