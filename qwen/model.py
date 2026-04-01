@@ -74,29 +74,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 text_embed = inputs_embeds  # [B, L, D]
 
                 if mm_token_type_ids is not None:
-                    # 找image tokens结束的位置，只取之后的question tokens
-                    img_positions = (mm_token_type_ids[0] == 1).nonzero(as_tuple=True)[0]
-                    if img_positions.numel() > 0:
-                        img_end = img_positions[-1].item()
-                        # image之后的text才是真正的question
-                        question_mask = torch.zeros(
-                            text_embed.shape[1], dtype=torch.bool,
-                            device=text_embed.device
-                        )
-                        question_mask[img_end + 1:] = True
-                        text_tokens = text_embed[0][question_mask].unsqueeze(0)  # [1, Lq, D]
-                    else:
-                        # 没有image tokens的fallback
-                        text_mask = (mm_token_type_ids == 0)
-                        text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
+                    text_mask = (mm_token_type_ids == 0)
                 else:
                     text_mask = torch.ones(
                         (text_embed.shape[0], text_embed.shape[1]),
                         dtype=torch.bool,
                         device=text_embed.device,
                     )
-                    text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
 
+                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
 
             selected_idx_per_image = []

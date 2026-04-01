@@ -257,6 +257,11 @@ class AttentionScorer(nn.Module):
         # ---------- cast back ----------
         scores = scores.to(dtype)
 
+        print(f"[DEBUG] text_tokens shape: {t.shape}")
+        print(f"[DEBUG] text_tokens mean norm: {t.norm(dim=-1).mean():.4f}")
+        print(f"[DEBUG] vision_score top5 idx: {scores.topk(5).indices}")
+        print(f"[DEBUG] vision_score stats: min={scores.min():.4f} max={scores.max():.4f} std={scores.std():.4f}")
+
         return scores
 
 
