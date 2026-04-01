@@ -68,10 +68,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         img_positions = is_image.nonzero(as_tuple=True)[0]
         img_end = img_positions[-1].item()
 
-        visual_positions = img_positions.to(inputs_embeds.device)    # [N]
+        attn_device = layer_attn.device
+        visual_positions = img_positions.to(attn_device)
         question_positions = torch.arange(
-            img_end + 1, input_ids.shape[1], device=input_ids.device
-        )                                                            # [Lq]
+            img_end + 1, input_ids.shape[1], device=attn_device
+        )                                                          # [Lq]
 
         if question_positions.numel() == 0:
             return None, None
