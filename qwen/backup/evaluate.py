@@ -454,3 +454,150 @@ def run_hrbench_inference(
 
 def evaluate_hrbench_predictions(pred_file: str) -> float:
     return evaluate_mcq_predictions(pred_file)
+
+
+def run_vstar_with_crop(
+    infer,
+    dataset_dir="datasets/vstar_bench",
+    anno_file="test_questions.jsonl",
+    max_samples=None,
+):
+
+    def extract_option(text):
+        if text is None:
+            return ""
+        text = text.strip().upper()
+
+        m = re.search(r"\b([A-D])\b", text)
+        if m:
+            return m.group(1)
+        return ""
+
+    anno_path = os.path.join(dataset_dir, anno_file)
+
+    with open(anno_path, "r", encoding="utf-8") as f:
+        samples = [json.loads(line) for line in f]
+
+    if max_samples:
+        samples = samples[:max_samples]
+
+    correct = 0
+    total = len(samples)
+
+    for i, sample in enumerate(tqdm(samples, desc="V-Star + Crop")):
+        try:
+            img_path = os.path.join(dataset_dir, sample["image"])
+            question = sample["text"]
+
+            pred_text = infer(
+                image_path=img_path,
+                question=question
+            )
+
+            pred_option = extract_option(pred_text)
+            gt = sample["label"].strip().upper()
+
+            if pred_option == gt:
+                correct += 1
+
+        except Exception as e:
+            print(f"[ERROR] {i}: {e}")
+
+        if (i + 1) % 20 == 0:
+            print(f"{i+1}/{total} acc={correct/(i+1):.4f}")
+
+    print(f"\nFINAL ACC: {correct}/{total} = {correct/total:.4f}")
+
+def run_hrbench_with_crop(
+    infer,   # CropInferenceWrapper（不改它）
+    split: str = "4k",
+    dataset_dir: str = "datasets/hr_bench",
+    output_file: str | None = None,
+    max_samples: int | None = None,
+):
+    import os, json, tempfile
+    import pandas as pd
+    from tqdm import tqdm
+
+    if split not in ["4k", "8k"]:
+        raise ValueError("split must be either '4k' or '8k'")
+
+    tsv_path = os.path.join(dataset_dir, f"hr_bench_{split}.tsv")
+
+    if output_file is None:
+        output_file = f"hr_bench_{split}_predictions_crop.jsonl"
+
+    output_path = os.path.join(dataset_dir, output_file)
+
+    df = pd.read_csv(tsv_path, sep="\t")
+    if max_samples is not None:
+        df = df.iloc[:max_samples]
+
+    correct = 0
+    total = len(df)
+
+    with open(output_path, "w", encoding="utf-8") as fout:
+        for i, row in tqdm(df.iterrows(), total=len(df), desc=f"HRBench {split} + Crop"):
+
+            try:
+                # ===== decode base64 → PIL =====
+                image = decode_base64_image(row["image"])
+
+                # ===== build question =====
+                question_text = (
+                    f"{row['question']}\n"
+                    f"(A) {row['A']}\n"
+                    f"(B) {row['B']}\n"
+                    f"(C) {row['C']}\n"
+                    f"(D) {row['D']}\n"
+                    f"Answer with the option's letter from the given choices directly."
+                )
+
+                # ===== 🔥 核心：转成临时文件喂 wrapper =====
+                with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
+                    image.save(tmp.name)
+
+                    pred_text = infer(
+                        image_path=tmp.name,
+                        question=question_text
+                    )
+
+                pred_option = extract_option_letter(pred_text)
+
+            except Exception as e:
+                pred_text = ""
+                pred_option = ""
+                print(f"[ERROR] index={row.get('index')}: {e}")
+
+            gt = str(row["answer"]).strip().upper()
+
+            if pred_option == gt:
+                correct += 1
+
+            # ===== 保存结果 =====
+            result = {
+                "index": int(row["index"]),
+                "split": split,
+                "question": row["question"],
+                "A": row["A"],
+                "B": row["B"],
+                "C": row["C"],
+                "D": row["D"],
+                "category": row["category"],
+                "cycle_category": row["cycle_category"],
+                "label": gt,
+                "prediction_text": pred_text,
+                "prediction_option": pred_option,
+                "model_type": "crop_qwen",
+            }
+
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+            # ===== 实时acc =====
+            if (i + 1) % 20 == 0:
+                print(f"{i+1}/{total} acc={correct/(i+1):.4f}")
+
+    print(f"\nFINAL ACC: {correct}/{total} = {correct/total:.4f}")
+    print(f"[INFO] Saved predictions to: {output_path}")
+
+    return output_path
