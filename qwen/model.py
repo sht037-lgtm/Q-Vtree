@@ -16,8 +16,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # debug states
         self._debug_selected_idx = None
         self._debug_patch_ids = None
-        self._debug_patch_offsets = None
-        self._debug_grid_sizes = None
         self._debug_num_selected_tokens = None
         self._debug_num_total_tokens = None
         self._debug_select_ratios = None
@@ -60,8 +58,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             # init debug containers
             self._debug_patch_ids = []
-            self._debug_patch_offsets = []
-            self._debug_grid_sizes = []
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
@@ -148,8 +144,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # debug store
                 self._debug_patch_ids.append(patch_ids)
-                self._debug_patch_offsets.append(patch_offset)
-                self._debug_grid_sizes.append((grid_h, grid_w))
 
                 num_selected = int(patch_ids.numel())
                 num_total = int(tokens.size(0))
@@ -159,8 +153,25 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(select_ratio)
 
-                # no masking: pass tokens through unchanged
-                new_image_tokens_list.append(tokens)
+                # =============================
+                # alpha-beta soft masking
+                # =============================
+                alpha = 5.0  # selected
+                beta = 0.5  # unselected
+
+                keep = torch.full(
+                    (tokens.size(0),),
+                    beta,
+                    device=tokens.device,
+                    dtype=tokens.dtype,
+                )
+
+                keep[patch_ids] = alpha
+
+                tokens_modulated = tokens * keep.unsqueeze(-1)
+                tokens_modulated = torch.nan_to_num(tokens_modulated)
+
+                new_image_tokens_list.append(tokens_modulated)
 
             # debug save
             self._debug_selected_idx = selected_idx_per_image
@@ -205,50 +216,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             )
 
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-
-        # =============================
-        # Attention mask: suppress non-selected visual tokens
-        # =============================
-        if pixel_values is not None and attention_mask is not None \
-                and self._debug_patch_ids is not None \
-                and mm_token_type_ids is not None:
-            print(f"[DEBUG] applying attention mask, "
-                  f"visual tokens: {(mm_token_type_ids == 1).sum().item()}, "
-                  f"selected: {sum(p.numel() for p in self._debug_patch_ids)}")
-
-            modified_mask = attention_mask.clone()  # [B, L]
-
-            for b in range(inputs_embeds.shape[0]):
-                # all image token positions in the full sequence
-                visual_positions = (mm_token_type_ids[b] == 1).nonzero(
-                    as_tuple=True
-                )[0]  # [N]
-
-                if b >= len(self._debug_patch_ids):
-                    continue
-
-                patch_ids    = self._debug_patch_ids[b]     # absolute token idx
-                patch_offset = self._debug_patch_offsets[b] # offset into tokens
-                grid_h, grid_w = self._debug_grid_sizes[b]
-
-                # convert absolute patch_ids -> relative indices into visual_positions
-                relative_selected = patch_ids - patch_offset  # [M]
-                relative_selected = relative_selected.clamp(
-                    0, len(visual_positions) - 1
-                )
-
-                # build non-selected mask
-                non_selected = torch.ones(
-                    len(visual_positions), dtype=torch.bool,
-                    device=modified_mask.device
-                )
-                non_selected[relative_selected] = False
-
-                # zero-out non-selected positions in attention_mask
-                non_selected_seq_pos = visual_positions[non_selected]
-                modified_mask[b, non_selected_seq_pos] = 0
-
-            attention_mask = modified_mask
 
         # =============================
         # position ids
