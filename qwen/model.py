@@ -112,8 +112,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     use_cache=False,
                 )
 
-            # extract hidden states from layer 4
-            hidden = first_out.hidden_states[4]  # [B, L, D]
+            # extract hidden states from layer 16
+            hidden = first_out.hidden_states[16]  # [B, L, D]
 
             # locate visual and question token positions
             image_token_id = 151655
