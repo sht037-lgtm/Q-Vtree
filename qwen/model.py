@@ -1,16 +1,10 @@
 import torch
 from module import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLModel,  # override
+    Qwen2_5_VLModel,
     Qwen2_5_VLForConditionalGeneration,
-    Qwen2_5_VLModelOutputWithPast
+    Qwen2_5_VLModelOutputWithPast,
 )
-
-# Qwen2.5-VL image token id
-IMAGE_TOKEN_ID = 151655
-
-# which LLM layer to extract attention from (0-indexed)
-ATTN_LAYER_IDX = 16
 
 
 class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
@@ -19,108 +13,182 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
         self.qvtree = QVTree(D=config.text_config.hidden_size)
 
+        # attention extraction is needed for the query-conditioned score matrix
+        self.config.text_config._attn_implementation = "eager"
+        self.language_model.config._attn_implementation = "eager"
+
+        # use an intermediate layer for more stable grounding signals
+        self.tree_attention_layer = 8
+
         # debug states
         self._debug_selected_idx = None
         self._debug_patch_ids = None
-        self._debug_patch_scores = None
         self._debug_num_selected_tokens = None
         self._debug_num_total_tokens = None
         self._debug_select_ratios = None
+        self._debug_score_matrix = None
+        self._debug_patch_scores = None
+        self._debug_text_scores = None
+        self._debug_rater_mask = None
 
-    def _extract_patch_scores_from_attention(
+    @staticmethod
+    def _extract_score_matrix_from_attn(attn_layer, text_mask, vision_mask):
+        """
+        attn_layer: [H, T, T] or [1, H, T, T]
+        text_mask:  [T] bool
+        vision_mask:[T] bool
+        return:     [Lt, Lv]
+        """
+        if attn_layer.dim() == 4:
+            attn_layer = attn_layer[0]
+        if attn_layer.dim() != 3:
+            raise ValueError(f"Expected attention layer [H,T,T], got {tuple(attn_layer.shape)}")
+
+        attn_mean = attn_layer.mean(dim=0)  # [T, T]
+        P = attn_mean[text_mask][:, vision_mask]  # [Lt, Lv]
+        return torch.nan_to_num(P)
+
+    @staticmethod
+    def _aggregate_patch_scores(score_matrix):
+        """
+        score_matrix: [Lt, Lv]
+        returns:
+          patch_scores: [Lv]
+          text_scores:  [Lt]
+          rater_mask:   [Lt]
+        """
+        if score_matrix.numel() == 0:
+            raise ValueError("Empty score_matrix encountered.")
+
+        text_scores = score_matrix.mean(dim=-1)  # [Lt]
+        threshold = text_scores.mean()
+        rater_mask = text_scores >= threshold
+        if not rater_mask.any():
+            rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
+
+        patch_scores = score_matrix[rater_mask].mean(dim=0)  # [Lv]
+        min_val = patch_scores.min()
+        max_val = patch_scores.max()
+        patch_scores = (patch_scores - min_val) / (max_val - min_val + 1e-6)
+        return torch.nan_to_num(patch_scores), text_scores, rater_mask
+
+    def _build_prefill_inputs_with_images(
         self,
+        *,
+        input_ids,
         inputs_embeds,
+        pixel_values,
+        image_grid_thw,
+    ):
+        image_tokens_list = self.get_image_features(
+            pixel_values,
+            image_grid_thw,
+            return_dict=True,
+        ).pooler_output
+
+        image_embeds = torch.cat(image_tokens_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        image_embeds = torch.nan_to_num(image_embeds)
+        inputs_embeds = torch.nan_to_num(inputs_embeds)
+
+        image_mask, _ = self.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=image_embeds,
+        )
+        merged_inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        merged_inputs_embeds = torch.nan_to_num(merged_inputs_embeds)
+        return merged_inputs_embeds, image_tokens_list
+
+    def _compute_tree_scores_from_attention(
+        self,
+        *,
+        merged_inputs_embeds,
+        image_tokens_list,
+        input_ids,
         attention_mask,
         position_ids,
-        input_ids,
+        past_key_values,
+        mm_token_type_ids,
+        cache_position,
+        output_hidden_states,
+        use_cache,
+        **kwargs,
     ):
-        """
-        First forward pass (no grad, output_attentions=True).
-        Returns:
-          patch_scores: [N] relevance score per visual token
-          visual_positions: [N] sequence positions of visual tokens
-        """
         with torch.no_grad():
-            first_out = self.language_model(
+            pre_outputs = self.language_model(
                 input_ids=None,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
                 position_ids=position_ids,
-                output_attentions=True,
-                output_hidden_states=False,
-                return_dict=True,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=merged_inputs_embeds,
                 use_cache=False,
+                output_attentions=True,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                **kwargs,
             )
 
-        if first_out.attentions is None:
-            raise RuntimeError(
-                "output_attentions=True returned None. "
-                "Load the model with attn_implementation='eager'."
+        attentions = pre_outputs.attentions
+        if attentions is None:
+            raise RuntimeError("Failed to extract attentions. Set attn implementation to eager/sdpa.")
+
+        layer_id = min(self.tree_attention_layer, len(attentions) - 1)
+
+        patch_scores_per_image = []
+        score_matrices = []
+        text_scores_list = []
+        rater_masks = []
+
+        B = merged_inputs_embeds.shape[0]
+        for i in range(B):
+            if mm_token_type_ids is not None:
+                text_mask_i = (mm_token_type_ids[i] == 0)
+                vision_mask_i = (mm_token_type_ids[i] == 1)
+            else:
+                raise ValueError("mm_token_type_ids is required to extract text->vision score matrices.")
+
+            score_matrix = self._extract_score_matrix_from_attn(
+                attentions[layer_id][i],
+                text_mask=text_mask_i,
+                vision_mask=vision_mask_i,
             )
 
-        # locate image and question token positions (batch item 0)
-        is_image = (input_ids[0] == IMAGE_TOKEN_ID)  # [L]
-        if not is_image.any():
-            return None, None
+            patch_scores, text_scores, rater_mask = self._aggregate_patch_scores(score_matrix)
+            expected_lv = image_tokens_list[i].shape[0]
+            if patch_scores.numel() != expected_lv:
+                raise ValueError(
+                    f"Visual token length mismatch for sample {i}: "
+                    f"score matrix gives Lv={patch_scores.numel()}, image tokens have {expected_lv}."
+                )
 
-        img_positions = is_image.nonzero(as_tuple=True)[0]
-        img_end = img_positions[-1].item()
+            patch_scores_per_image.append(patch_scores)
+            score_matrices.append(score_matrix)
+            text_scores_list.append(text_scores)
+            rater_masks.append(rater_mask)
 
-        # keep positions on cpu; move to each layer's device individually
-        visual_positions_cpu = img_positions.cpu()
-        question_positions_cpu = torch.arange(img_end + 1, input_ids.shape[1])
-
-        if question_positions_cpu.numel() == 0:
-            return None, None
-
-        # multi-layer average to reduce attention sink effect
-        layers = [8, 12, 16, 20, 24]
-        attn_q2v_list = []
-        for l in layers:
-            layer_attn = first_out.attentions[l]  # [B, heads, L, L]
-            ld = layer_attn.device                # this layer's device
-            vp = visual_positions_cpu.to(ld)
-            qp = question_positions_cpu.to(ld)
-            attn_q2v_list.append(
-                layer_attn[
-                    0,           # batch item 0
-                    :,           # all heads
-                    qp[:, None], # [Lq, 1]
-                    vp[None, :], # [1,  N]
-                ].mean(dim=[0, 1]).cpu()  # [N] on cpu
-            )
-
-        # average over layers -> [N] on cpu
-        patch_scores = torch.stack(attn_q2v_list).mean(dim=0)
-
-        # min-max normalise to [0, 1]
-        s_min = patch_scores.min()
-        s_max = patch_scores.max()
-        patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
-
-        # return patch_scores on cpu, visual_positions on cpu
-        return patch_scores.cpu(), visual_positions_cpu
+        return patch_scores_per_image, score_matrices, text_scores_list, rater_masks
 
     def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-            pixel_values=None,
-            pixel_values_videos=None,
-            image_grid_thw=None,
-            video_grid_thw=None,
-            rope_deltas=None,
-            mm_token_type_ids=None,
-            cache_position=None,
-            second_per_grid_ts=None,
-            **kwargs,
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        rope_deltas=None,
+        mm_token_type_ids=None,
+        cache_position=None,
+        second_per_grid_ts=None,
+        **kwargs,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -131,214 +199,121 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # =============================
-        # Vision Part
-        # =============================
+        # -------------------------------------------------
+        # Image part: build merged inputs once, extract query-conditioned
+        # score matrix from decoder attention, then run quadtree on the
+        # resulting patch scores. Visual tokens themselves stay unchanged.
+        # -------------------------------------------------
         if pixel_values is not None:
-
-            # init debug containers
             self._debug_patch_ids = []
-            self._debug_patch_scores = []
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
+            self._debug_score_matrix = []
+            self._debug_patch_scores = []
+            self._debug_text_scores = []
+            self._debug_rater_mask = []
 
-            # 1. Get patch tokens (List[Tensor(Ni, D)]) after downsample
-            image_tokens_list = self.get_image_features(
-                pixel_values,
-                image_grid_thw,
-                return_dict=True
-            ).pooler_output
-
-            # 2. Build full inputs_embeds with all visual tokens for
-            #    the first forward pass
-            image_embeds_full = torch.cat(image_tokens_list, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
+            merged_inputs_embeds, image_tokens_list = self._build_prefill_inputs_with_images(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
             )
-            image_embeds_full = torch.nan_to_num(image_embeds_full)
-            inputs_embeds_full = torch.nan_to_num(inputs_embeds.clone())
 
-            image_mask_full, _ = self.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds_full,
-                image_features=image_embeds_full,
-            )
-            inputs_embeds_full = inputs_embeds_full.masked_scatter(
-                image_mask_full, image_embeds_full
-            )
-            inputs_embeds_full = torch.nan_to_num(inputs_embeds_full)
-
-            # 3. Compute position_ids once based on full sequence
             if position_ids is None:
                 position_ids = self.compute_3d_position_ids(
                     input_ids=input_ids,
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
                     second_per_grid_ts=second_per_grid_ts,
-                    inputs_embeds=inputs_embeds_full,
+                    inputs_embeds=merged_inputs_embeds,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward pass: extract attention-based patch scores
-            patch_scores_global, visual_positions = \
-                self._extract_patch_scores_from_attention(
-                    inputs_embeds=inputs_embeds_full,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    input_ids=input_ids,
-                )
+            patch_scores_per_image, score_matrices, text_scores_list, rater_masks = self._compute_tree_scores_from_attention(
+                merged_inputs_embeds=merged_inputs_embeds,
+                image_tokens_list=image_tokens_list,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+                cache_position=cache_position,
+                output_hidden_states=output_hidden_states,
+                use_cache=use_cache,
+                **kwargs,
+            )
 
-            # 5. Per-image quadtree navigation using attention scores
             selected_idx_per_image = []
-            new_image_tokens_list = []
-
             for i, tokens in enumerate(image_tokens_list):
                 x = tokens.unsqueeze(0)  # [1, Ni, D]
 
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
                 grid_h = grid_h_raw // 2
                 grid_w = grid_w_raw // 2
-
                 if grid_h * grid_w != tokens.size(0):
                     raise ValueError(
-                        f"Downsampled grid mismatch: "
-                        f"raw=({grid_h_raw},{grid_w_raw}), "
-                        f"down=({grid_h},{grid_w}), "
-                        f"H*W={grid_h * grid_w}, tokens={tokens.size(0)}"
+                        f"Downsampled grid mismatch: raw=({grid_h_raw}, {grid_w_raw}), "
+                        f"down=({grid_h}, {grid_w}), H*W={grid_h * grid_w}, tokens={tokens.size(0)}"
                     )
 
-                patch_offset = tokens.size(0) - grid_h * grid_w
-
-                # use attention-derived scores (only implemented for i==0 /
-                # single-image; fallback to uniform for additional images)
-                if patch_scores_global is not None and i == 0:
-                    grid_scores = patch_scores_global.unsqueeze(0)  # [1, N]
-                else:
-                    grid_scores = torch.ones(
-                        1, grid_h * grid_w,
-                        device=tokens.device, dtype=tokens.dtype
-                    )
-
-                # build quadtree and navigate
-                built = self.qvtree.builder.build(x, grid_h, grid_w)
-                nodes = built["nodes"]
-
-                selected_node_ids, _ = self.qvtree.navigator.select_nodes(
-                    nodes=nodes,
-                    patch_scores=grid_scores.to(tokens.device),
-                    W=grid_w,
-                )
-                selected_idx_per_image.append(selected_node_ids[0])
-
-                token_out = self.qvtree.navigator.nodes_to_tokens(
-                    nodes=nodes,
+                patch_scores_i = patch_scores_per_image[i].unsqueeze(0).to(tokens.device, tokens.dtype)
+                out = self.qvtree(
+                    x,
                     H=grid_h,
                     W=grid_w,
-                    selected_node_ids=selected_node_ids,
-                    x=x,
+                    patch_scores=patch_scores_i,
+                    score_matrix=score_matrices[i].unsqueeze(0).to(tokens.device, tokens.dtype),
                 )
 
-                patch_ids = token_out["selected_token_indices"][0]
+                sel_nodes = out["selected_node_ids"][0]
+                selected_idx_per_image.append(sel_nodes)
+                patch_ids = out["selected_token_indices"][0]
 
-                # fallback: keep all if empty
                 if patch_ids.numel() == 0:
                     patch_ids = torch.arange(tokens.size(0), device=tokens.device)
-
-                patch_ids = patch_ids.clamp(0, tokens.size(0) - 1)
+                patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
                 patch_ids = torch.unique(patch_ids)
-                patch_ids = patch_ids + patch_offset
 
-                # debug
                 self._debug_patch_ids.append(patch_ids)
-                self._debug_patch_scores.append(
-                    grid_scores.squeeze(0) if patch_scores_global is not None else None
-                )
+                self._debug_score_matrix.append(score_matrices[i])
+                self._debug_patch_scores.append(patch_scores_per_image[i])
+                self._debug_text_scores.append(text_scores_list[i])
+                self._debug_rater_mask.append(rater_masks[i])
+
                 num_selected = int(patch_ids.numel())
                 num_total = int(tokens.size(0))
+                ratio = num_selected / num_total if num_total > 0 else 0.0
                 self._debug_num_selected_tokens.append(num_selected)
                 self._debug_num_total_tokens.append(num_total)
-                self._debug_select_ratios.append(
-                    num_selected / num_total if num_total > 0 else 0.0
-                )
-
-                # tokens pass through unchanged; selection enforced via attn mask
-                new_image_tokens_list.append(tokens)
+                self._debug_select_ratios.append(ratio)
 
             self._debug_selected_idx = selected_idx_per_image
 
-            # 6. Build final inputs_embeds
-            image_embeds = torch.cat(new_image_tokens_list, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
-            image_embeds = torch.nan_to_num(image_embeds)
-            inputs_embeds = torch.nan_to_num(inputs_embeds)
+            # keep original visual tokens unchanged; no alpha/beta scaling
+            inputs_embeds = merged_inputs_embeds
 
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                image_features=image_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-            inputs_embeds = torch.nan_to_num(inputs_embeds)
-
-            # 7. Suppress non-selected visual tokens via attention mask
-            if visual_positions is not None and self._debug_patch_ids:
-                modified_mask = attention_mask.clone()  # [B, L]
-
-                for b in range(inputs_embeds.shape[0]):
-                    if b >= len(self._debug_patch_ids):
-                        continue
-
-                    patch_ids = self._debug_patch_ids[b]
-                    grid_t, grid_h_raw, grid_w_raw = image_grid_thw[b].tolist()
-                    grid_h = grid_h_raw // 2
-                    grid_w = grid_w_raw // 2
-                    patch_offset = image_tokens_list[b].size(0) - grid_h * grid_w
-
-                    relative_selected = (patch_ids - patch_offset).clamp(
-                        0, len(visual_positions) - 1
-                    )
-
-                    mask_device = modified_mask.device
-                    vp = visual_positions.to(mask_device)
-                    relative_selected = relative_selected.to(mask_device)
-
-                    non_selected = torch.ones(
-                        len(vp), dtype=torch.bool,
-                        device=mask_device
-                    )
-                    non_selected[relative_selected] = False
-                    non_selected_positions = vp[non_selected]
-                    modified_mask[b, non_selected_positions] = 0
-
-                attention_mask = modified_mask
-
-        # =============================
-        # Video part (no change)
-        # =============================
+        # -------------------------------------------------
+        # Video part (unchanged)
+        # -------------------------------------------------
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(
                 pixel_values_videos,
                 video_grid_thw,
-                return_dict=True
+                return_dict=True,
             ).pooler_output
 
-            video_embeds = torch.cat(video_embeds, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
-
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids,
                 inputs_embeds=inputs_embeds,
-                video_features=video_embeds
+                video_features=video_embeds,
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        # =============================
-        # position_ids (only if not already computed above)
-        # =============================
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(
                 input_ids=input_ids,
@@ -351,9 +326,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 mm_token_type_ids=mm_token_type_ids,
             )
 
-        # =============================
-        # Second (main) LLM forward
-        # =============================
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -382,11 +354,6 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
     def __init__(self, config):
         super().__init__(config)
 
-        # Save original backbone weights
         old_state_dict = self.model.state_dict()
-
-        # Replace backbone
         self.model = Qwen2_5_VLModelWithTree(config)
-
-        # Load the original weight
         self.model.load_state_dict(old_state_dict, strict=False)
