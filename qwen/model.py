@@ -66,14 +66,16 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         img_positions = is_image.nonzero(as_tuple=True)[0]
         img_end = img_positions[-1].item()
 
+        # keep positions on cpu; move to attn device only for indexing
         attn_device = first_out.attentions[0].device
-        visual_positions = img_positions.to(attn_device)
-        question_positions = torch.arange(
-            img_end + 1, input_ids.shape[1], device=attn_device
-        )                                                          # [Lq]
+        visual_positions_cpu = img_positions.cpu()
+        question_positions_cpu = torch.arange(img_end + 1, input_ids.shape[1])
 
-        if question_positions.numel() == 0:
+        if question_positions_cpu.numel() == 0:
             return None, None
+
+        vp_attn = visual_positions_cpu.to(attn_device)
+        qp_attn = question_positions_cpu.to(attn_device)
 
         # multi-layer average to reduce attention sink effect
         layers = [8, 12, 16, 20, 24]
@@ -82,11 +84,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             layer_attn = first_out.attentions[l]  # [B, heads, L, L]
             attn_q2v_list.append(
                 layer_attn[
-                    0,                              # batch item 0
-                    :,                              # all heads
-                    question_positions[:, None],    # [Lq, 1]
-                    visual_positions[None, :],      # [1,  N]
-                ].mean(dim=[0, 1])                  # [N]
+                    0,                  # batch item 0
+                    :,                  # all heads
+                    qp_attn[:, None],   # [Lq, 1]
+                    vp_attn[None, :],   # [1,  N]
+                ].mean(dim=[0, 1])      # [N]
             )
 
         # average over layers -> [N]
@@ -97,7 +99,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         s_max = patch_scores.max()
         patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
 
-        return patch_scores, visual_positions
+        # return patch_scores on cpu, visual_positions on cpu
+        return patch_scores.cpu(), visual_positions_cpu
 
     def forward(
             self,
@@ -299,12 +302,16 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         0, len(visual_positions) - 1
                     )
 
+                    mask_device = modified_mask.device
+                    vp = visual_positions.to(mask_device)
+                    relative_selected = relative_selected.to(mask_device)
+
                     non_selected = torch.ones(
-                        len(visual_positions), dtype=torch.bool,
-                        device=modified_mask.device
+                        len(vp), dtype=torch.bool,
+                        device=mask_device
                     )
                     non_selected[relative_selected] = False
-                    non_selected_positions = visual_positions[non_selected]
+                    non_selected_positions = vp[non_selected]
                     modified_mask[b, non_selected_positions] = 0
 
                 attention_mask = modified_mask
