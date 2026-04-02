@@ -66,32 +66,31 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         img_positions = is_image.nonzero(as_tuple=True)[0]
         img_end = img_positions[-1].item()
 
-        # keep positions on cpu; move to attn device only for indexing
-        attn_device = first_out.attentions[0].device
+        # keep positions on cpu; move to each layer's device individually
         visual_positions_cpu = img_positions.cpu()
         question_positions_cpu = torch.arange(img_end + 1, input_ids.shape[1])
 
         if question_positions_cpu.numel() == 0:
             return None, None
 
-        vp_attn = visual_positions_cpu.to(attn_device)
-        qp_attn = question_positions_cpu.to(attn_device)
-
         # multi-layer average to reduce attention sink effect
         layers = [8, 12, 16, 20, 24]
         attn_q2v_list = []
         for l in layers:
             layer_attn = first_out.attentions[l]  # [B, heads, L, L]
+            ld = layer_attn.device                # this layer's device
+            vp = visual_positions_cpu.to(ld)
+            qp = question_positions_cpu.to(ld)
             attn_q2v_list.append(
                 layer_attn[
-                    0,                  # batch item 0
-                    :,                  # all heads
-                    qp_attn[:, None],   # [Lq, 1]
-                    vp_attn[None, :],   # [1,  N]
-                ].mean(dim=[0, 1])      # [N]
+                    0,           # batch item 0
+                    :,           # all heads
+                    qp[:, None], # [Lq, 1]
+                    vp[None, :], # [1,  N]
+                ].mean(dim=[0, 1]).cpu()  # [N] on cpu
             )
 
-        # average over layers -> [N]
+        # average over layers -> [N] on cpu
         patch_scores = torch.stack(attn_q2v_list).mean(dim=0)
 
         # min-max normalise to [0, 1]
