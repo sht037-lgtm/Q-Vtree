@@ -58,8 +58,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 "Load the model with attn_implementation='eager'."
             )
 
-        layer_attn = first_out.attentions[ATTN_LAYER_IDX]  # [B, heads, L, L]
-
         # locate image and question token positions (batch item 0)
         is_image = (input_ids[0] == IMAGE_TOKEN_ID)  # [L]
         if not is_image.any():
@@ -68,7 +66,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         img_positions = is_image.nonzero(as_tuple=True)[0]
         img_end = img_positions[-1].item()
 
-        attn_device = layer_attn.device
+        attn_device = first_out.attentions[0].device
         visual_positions = img_positions.to(attn_device)
         question_positions = torch.arange(
             img_end + 1, input_ids.shape[1], device=attn_device
@@ -77,17 +75,22 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         if question_positions.numel() == 0:
             return None, None
 
-        # attention: question tokens -> visual tokens
-        # layer_attn[0]: [heads, L, L]
-        attn_q2v = layer_attn[
-            0,                              # batch item 0
-            :,                              # all heads
-            question_positions[:, None],    # [Lq, 1]
-            visual_positions[None, :],      # [1,  N]
-        ]                                   # [heads, Lq, N]
+        # multi-layer average to reduce attention sink effect
+        layers = [8, 12, 16, 20, 24]
+        attn_q2v_list = []
+        for l in layers:
+            layer_attn = first_out.attentions[l]  # [B, heads, L, L]
+            attn_q2v_list.append(
+                layer_attn[
+                    0,                              # batch item 0
+                    :,                              # all heads
+                    question_positions[:, None],    # [Lq, 1]
+                    visual_positions[None, :],      # [1,  N]
+                ].mean(dim=[0, 1])                  # [N]
+            )
 
-        # average over heads and question tokens -> [N]
-        patch_scores = attn_q2v.mean(dim=[0, 1])
+        # average over layers -> [N]
+        patch_scores = torch.stack(attn_q2v_list).mean(dim=0)
 
         # min-max normalise to [0, 1]
         s_min = patch_scores.min()
@@ -296,16 +299,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         0, len(visual_positions) - 1
                     )
 
-                    mask_device = modified_mask.device
-                    vp = visual_positions.to(mask_device)
-                    relative_selected = relative_selected.to(mask_device)
-
                     non_selected = torch.ones(
-                        len(vp), dtype=torch.bool,
-                        device=mask_device
+                        len(visual_positions), dtype=torch.bool,
+                        device=modified_mask.device
                     )
                     non_selected[relative_selected] = False
-                    non_selected_positions = vp[non_selected]
+                    non_selected_positions = visual_positions[non_selected]
                     modified_mask[b, non_selected_positions] = 0
 
                 attention_mask = modified_mask
