@@ -142,11 +142,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
         B = merged_inputs_embeds.shape[0]
         for i in range(B):
-            if mm_token_type_ids is not None:
-                text_mask_i = (mm_token_type_ids[i] == 0)
-                vision_mask_i = (mm_token_type_ids[i] == 1)
-            else:
-                raise ValueError("mm_token_type_ids is required to extract text->vision score matrices.")
+            # use IMAGE_TOKEN_ID to locate visual tokens (mm_token_type_ids is None)
+            IMAGE_TOKEN_ID = 151655
+            is_image = (input_ids[i] == IMAGE_TOKEN_ID)
+            vision_mask_i = is_image.bool()
+            text_mask_i = ~vision_mask_i
 
             score_matrix = self._extract_score_matrix_from_attn(
                 attentions[layer_id][i],
