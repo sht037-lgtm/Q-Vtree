@@ -113,7 +113,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 )
 
             # extract hidden states from layer 8
-            hidden = first_out.hidden_states[8]  # [B, L, D]
+            hidden = torch.stack([
+                first_out.hidden_states[4],
+                first_out.hidden_states[8],
+                first_out.hidden_states[12],
+            ], dim=0).mean(dim=0)  # [B, L, D]
 
             # locate visual and question token positions
             image_token_id = 151655
