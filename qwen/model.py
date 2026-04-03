@@ -126,29 +126,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             ld = layer_attn.device
             vp = vis_positions.to(ld)
             qp = que_positions.to(ld)
-
             A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
             A_tv = torch.nan_to_num(A_tv)
-
-            # =============================
-            # Per-token attention map visualization
-            # =============================
-            import matplotlib.pyplot as plt
-            _gh = image_grid_thw[0][1].item() // 2
-            _gw = image_grid_thw[0][2].item() // 2
-            _Lq = A_tv.shape[0]
-            fig, axes = plt.subplots(1, _Lq, figsize=(_Lq * 2, 2))
-            if _Lq == 1:
-                axes = [axes]
-            for _idx, _ax in enumerate(axes):
-                _scores = A_tv[_idx].reshape(_gh, _gw).numpy()
-                _ax.imshow(_scores, cmap="jet")
-                _ax.set_title(f"q{_idx}", fontsize=7)
-                _ax.axis("off")
-            plt.tight_layout()
-            plt.show()
-            plt.close()
-            # =============================
 
             # rater selection: question tokens with mean visual attention >= global mean
             r = A_tv.mean(dim=1)                        # [Lq]
