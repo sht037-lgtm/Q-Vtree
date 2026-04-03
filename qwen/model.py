@@ -83,7 +83,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     text_tokens = text_embed
 
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
-                print(f"[DEBUG] text_tokens shape: {text_tokens.shape}")
+                # print(f"[DEBUG] text_tokens shape: {text_tokens.shape}")
 
             selected_idx_per_image = []
             new_image_tokens_list = []
