@@ -70,20 +70,20 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             ).pooler_output
 
             # 2. Compute TEXT tokens using embedding (NO LLM)
+            # only use question tokens after image (not system prompt)
             with torch.no_grad():
                 text_embed = inputs_embeds  # [B, L, D]
 
-                if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0)
+                image_token_id = 151655
+                is_image = (input_ids[0] == image_token_id)
+                if is_image.any():
+                    img_end = is_image.nonzero(as_tuple=True)[0][-1].item()
+                    text_tokens = text_embed[0, img_end + 1:].unsqueeze(0)  # [1, Lq, D]
                 else:
-                    text_mask = torch.ones(
-                        (text_embed.shape[0], text_embed.shape[1]),
-                        dtype=torch.bool,
-                        device=text_embed.device,
-                    )
+                    text_tokens = text_embed
 
-                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
                 text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
+                # print(f"[DEBUG] text_tokens shape: {text_tokens.shape}")
 
             selected_idx_per_image = []
             new_image_tokens_list = []
