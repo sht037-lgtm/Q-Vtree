@@ -129,23 +129,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
             A_tv = torch.nan_to_num(A_tv)
 
-            # debug: 检查attention matrix是否有语义信号
-            print(f"[DEBUG] A_tv shape: {A_tv.shape}")  # [Lq, N]
-            print(f"[DEBUG] A_tv mean: {A_tv.mean():.6f}")
-            print(f"[DEBUG] A_tv std:  {A_tv.std():.6f}")  # std太小说明分布太均匀
-            print(f"[DEBUG] A_tv max:  {A_tv.max():.6f}")
-            print(f"[DEBUG] A_tv min:  {A_tv.min():.6f}")
-
-            # 每个question token对visual tokens的最大attention是多少
-            print(f"[DEBUG] per-token max: {A_tv.max(dim=1).values}")
-
-            # attention最高的patch在哪个位置（是不是都在左上角）
-            top_patch = A_tv.mean(dim=0).argmax().item()
-            print(
-                f"[DEBUG] top patch idx: {top_patch}, grid pos: ({top_patch // (image_grid_thw[0][2].item() // 2)}, {top_patch % (image_grid_thw[0][2].item() // 2)})")
-
-
-
             # rater selection: question tokens with mean visual attention >= global mean
             r = A_tv.mean(dim=1)                        # [Lq]
             rater_mask = r >= r.mean()
