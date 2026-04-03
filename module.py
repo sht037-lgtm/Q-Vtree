@@ -192,11 +192,6 @@ class QuadTreeBuilder:
 # 3) Attention Scorer
 # =============================
 class AttentionScorer(nn.Module):
-    """
-      1. Compute T->V similarity matrix  [B, Lt, Lv]
-      2. Select raters: text tokens whose mean visual attention >= global mean
-      3. Aggregate: mean over rater dimension -> patch scores [B, Lv]
-    """
 
     def __init__(self, eps=1e-6, temp=2):
         super().__init__()
@@ -205,57 +200,64 @@ class AttentionScorer(nn.Module):
 
     def forward(self, t, v):
         """
-        t : [B, Lt, D]  text (query) tokens
-        v : [B, Lv, D]  visual tokens
-        return : [B, Lv] patch relevance scores in [0, 1]
+        t : [B, Lt, D]
+        v : [B, Lv, D]
+        return : [B, Lv]
         """
+
         dtype = v.dtype
         B, Lv, _ = v.shape
 
-        # ---------- clean + fp32 ----------
+        # ---------- clean + use fp32 ----------
         t = torch.nan_to_num(t).float()
         v = torch.nan_to_num(v).float()
 
-        # ---------- L2 normalize ----------
+        # ---------- normalize ----------
         t = F.normalize(t, dim=-1, eps=self.eps)
         v = F.normalize(v, dim=-1, eps=self.eps)
 
-        # ---------- T -> V similarity: [B, Lt, Lv] ----------
-        # single-direction: query (text) -> key (vision)
-        S_tv = torch.bmm(t, v.transpose(-1, -2))  # [B, Lt, Lv]
-        S_tv = S_tv / self.temp
-        S_tv = torch.nan_to_num(S_tv)
+        # ---------- Vision -> Text ----------
+        S_vt = v @ t.transpose(-1, -2)              # [B, Lv, Lt]
+        S_vt = S_vt / self.temp
+        S_vt = S_vt - S_vt.max(dim=2, keepdim=True).values
+        S_vt = torch.nan_to_num(S_vt)
 
-        # ---------- rater selection (SparseVLM eq. 5-6) ----------
-        # r[b, i] = mean over visual tokens of softmax(S_tv[b, i, :])
-        A_tv = torch.softmax(S_tv, dim=2)  # [B, Lt, Lv]
-        r = A_tv.mean(dim=2)  # [B, Lt]
+        A_vt = torch.softmax(S_vt, dim=2)           # [B, Lv, Lt]
 
-        # rater mask: text tokens with r >= mean(r)
-        threshold = r.mean(dim=1, keepdim=True)  # [B, 1]
-        rater_mask = r >= threshold  # [B, Lt]
+        # ---------- modified: use softmax pooling instead of mean pooling ----------
+        weights_vt = torch.softmax(A_vt / self.temp, dim=1)
+        text_score = (weights_vt * A_vt).sum(dim=1)  # [B, Lt]
+        text_score = text_score / (text_score.sum(dim=1, keepdim=True) + self.eps)
 
-        # fallback: keep all if nothing passes
-        empty = ~rater_mask.any(dim=1)  # [B]
-        if empty.any():
-            rater_mask[empty] = True
-
-        # ---------- aggregate rater attention -> patch scores ----------
         scores = []
-        for b in range(B):
-            rater_attn = A_tv[b][rater_mask[b]]  # [Lr, Lv]
-            score = rater_attn.mean(dim=0)  # [Lv]
-            scores.append(score)
 
-        scores = torch.stack(scores)  # [B, Lv]
-        scores = torch.nan_to_num(scores)
+        for b in range(B):
+
+            # ---------- Text -> Vision ----------
+            S_tv = v[b] @ t[b].T                    # [Lv, Lt]
+            S_tv = S_tv / self.temp
+            S_tv = S_tv - S_tv.max(dim=0, keepdim=True).values
+            S_tv = torch.nan_to_num(S_tv)
+
+            A_tv = torch.softmax(S_tv, dim=0)       # [Lv, Lt]
+
+            # soft token-weighted aggregation
+            token_w = text_score[b]                 # [Lt]
+            vision_score = (A_tv * token_w.unsqueeze(0)).sum(dim=1)   # [Lv]
+
+            scores.append(vision_score)
+
+        scores = torch.stack(scores)                # [B, Lv]
 
         # ---------- min-max normalize ----------
         min_vals = scores.min(dim=1, keepdim=True).values
         max_vals = scores.max(dim=1, keepdim=True).values
         scores = (scores - min_vals) / (max_vals - min_vals + self.eps)
 
-        return scores.to(dtype)
+        # ---------- cast back ----------
+        scores = scores.to(dtype)
+
+        return scores
 
 
 # =============================
