@@ -112,8 +112,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     use_cache=False,
                 )
 
-            # extract layer 24 attention: [B, heads, L, L]
-            layer_attn = first_out.attentions[24]
+            # extract layer 28 attention: [B, heads, L, L]
+            layer_attn = first_out.attentions[28]
 
             # locate visual and question token positions
             image_token_id = 151655
