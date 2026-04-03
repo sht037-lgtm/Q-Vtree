@@ -131,8 +131,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             v_raw = image_tokens_list[0].float()
 
             # normalize both
-            q_norm = F_func.normalize(q_hidden, dim=-1)   # [Lq, D]
-            v_norm = F_func.normalize(v_raw, dim=-1)       # [N, D]
+            q_norm = F_func.normalize(q_hidden, dim=-1)  # [Lq, D]
+            v_norm = F_func.normalize(v_raw, dim=-1)  # [N, D]
+            q_norm = q_norm.to(v_norm.device)  # 统一device
 
             # SparseVLM-style: single direction T->V
             S_tv = q_norm @ v_norm.T                       # [Lq, N]
