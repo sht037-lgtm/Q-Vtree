@@ -141,6 +141,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
+            # 存起来供debug用
+            self._debug_patch_scores = [patch_scores_global]
+
             selected_idx_per_image = []
             new_image_tokens_list = []
 
