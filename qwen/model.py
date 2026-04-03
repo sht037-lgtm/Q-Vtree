@@ -129,8 +129,14 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
             A_tv = torch.nan_to_num(A_tv)
 
-            # 所有question tokens都作为rater
-            patch_scores_global = A_tv.mean(dim=0)  # [N]
+            # rater selection: question tokens with mean visual attention >= global mean
+            r = A_tv.mean(dim=1)                        # [Lq]
+            rater_mask = r >= r.mean()
+            if not rater_mask.any():
+                rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
+
+            # patch scores: mean over raters [N]
+            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
 
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
