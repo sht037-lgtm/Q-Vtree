@@ -115,10 +115,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             # extract layer 28 attention: [B, heads, L, L]
             layer_attn = first_out.attentions[28]
 
-            print(f"layer_attn shape: {layer_attn.shape}")
-            extracted = layer_attn[0, :, qp[:, None], vp[None, :]]
-            print(f"extracted shape: {extracted.shape}")  # 应该是 [heads, Lq, N]
-
             # locate visual and question token positions
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
@@ -130,7 +126,18 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             ld = layer_attn.device
             vp = vis_positions.to(ld)
             qp = que_positions.to(ld)
-            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
+            # debug: verify indexing
+            print(f"[DEBUG] layer_attn shape: {layer_attn.shape}")
+            print(f"[DEBUG] qp shape: {qp.shape}, vp shape: {vp.shape}")
+            extracted = layer_attn[0, :, qp[:, None], vp[None, :]]
+            print(f"[DEBUG] extracted shape: {extracted.shape}")  # should be [heads, Lq, N]
+            A_tv = extracted.mean(dim=0).cpu()  # [Lq, N]
+            print(f"[DEBUG] A_tv shape: {A_tv.shape}")
+            print(f"[DEBUG] A_tv mean: {A_tv.mean():.6f}, std: {A_tv.std():.6f}")
+            print(f"[DEBUG] A_tv max: {A_tv.max():.6f}")
+            top_patch = A_tv.mean(dim=0).argmax().item()
+            _gw = image_grid_thw[0][2].item() // 2
+            print(f"[DEBUG] top patch: {top_patch}, grid pos: ({top_patch // _gw}, {top_patch % _gw})")
             A_tv = torch.nan_to_num(A_tv)
 
             # rater selection: question tokens with mean visual attention >= global mean
