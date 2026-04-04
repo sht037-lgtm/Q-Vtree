@@ -128,8 +128,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             qp = que_positions.to(ld)
             A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
             A_tv = torch.nan_to_num(A_tv)
-            A_tv = torch.log(A_tv + 1e-8)   # compress dynamic range
-            A_tv = A_tv - A_tv.min()         # shift to non-negative
 
             # rater selection: question tokens with mean visual attention >= global mean
             r = A_tv.mean(dim=1)                        # [Lq]
