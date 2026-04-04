@@ -99,21 +99,21 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: extract self-attention from LLM layer 8
+            # 4. First forward: extract hidden states from layer 24
             with torch.no_grad():
                 first_out = self.language_model(
                     input_ids=None,
                     inputs_embeds=inputs_embeds_full,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    output_attentions=True,
-                    output_hidden_states=False,
+                    output_attentions=False,
+                    output_hidden_states=True,
                     return_dict=True,
                     use_cache=False,
                 )
 
-            # extract layer 28 attention: [B, heads, L, L]
-            layer_attn = first_out.attentions[28]
+            # extract layer 24 hidden states: [B, L, D]
+            hidden = first_out.hidden_states[24]
 
             # locate visual and question token positions
             image_token_id = 151655
@@ -122,22 +122,20 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             img_end = vis_positions[-1].item()
             que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
-            # question tokens attend to visual tokens: [Lq, N]
-            ld = layer_attn.device
-            vp = vis_positions.to(ld)
-            qp = que_positions.to(ld)
-            # debug: verify indexing
-            print(f"[DEBUG] layer_attn shape: {layer_attn.shape}")
-            print(f"[DEBUG] qp shape: {qp.shape}, vp shape: {vp.shape}")
-            extracted = layer_attn[0, :, qp[:, None], vp[None, :]]
-            print(f"[DEBUG] extracted shape: {extracted.shape}")  # should be [heads, Lq, N]
-            A_tv = extracted.mean(dim=0).cpu()  # [Lq, N]
-            print(f"[DEBUG] A_tv shape: {A_tv.shape}")
-            print(f"[DEBUG] A_tv mean: {A_tv.mean():.6f}, std: {A_tv.std():.6f}")
-            print(f"[DEBUG] A_tv max: {A_tv.max():.6f}")
-            top_patch = A_tv.mean(dim=0).argmax().item()
-            _gw = image_grid_thw[0][2].item() // 2
-            print(f"[DEBUG] top patch: {top_patch}, grid pos: ({top_patch // _gw}, {top_patch % _gw})")
+            # extract aligned hidden states for visual and question tokens
+            ld = hidden.device
+            v_hidden = hidden[0, vis_positions.to(ld)]   # [N, D]
+            q_hidden = hidden[0, que_positions.to(ld)]   # [Lq, D]
+
+            # pass to AttentionScorer (SparseVLM-style T->V + rater selection)
+            # scorer expects [B, Lt, D] and [B, Lv, D]
+            import torch.nn.functional as F
+            v_h = F.normalize(v_hidden, dim=-1).unsqueeze(0).cpu().float()  # [1, N, D]
+            q_h = F.normalize(q_hidden, dim=-1).unsqueeze(0).cpu().float()  # [1, Lq, D]
+
+            # T->V similarity: [1, Lq, N]
+            S_tv = torch.bmm(q_h, v_h.transpose(-1, -2)) / 0.5  # temp=0.5
+            A_tv = torch.softmax(S_tv, dim=2)[0]                  # [Lq, N]
             A_tv = torch.nan_to_num(A_tv)
 
             # rater selection: question tokens with mean visual attention >= global mean

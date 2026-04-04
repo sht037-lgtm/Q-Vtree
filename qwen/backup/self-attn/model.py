@@ -69,21 +69,81 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return_dict=True
             ).pooler_output
 
-            # 2. Compute TEXT tokens using embedding (NO LLM)
+            # 2. Build full inputs_embeds for first forward pass
+            image_embeds_full = torch.cat(image_tokens_list, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            image_embeds_full = torch.nan_to_num(image_embeds_full)
+            inputs_embeds_full = torch.nan_to_num(inputs_embeds.clone())
+
+            image_mask_full, _ = self.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds_full,
+                image_features=image_embeds_full,
+            )
+            inputs_embeds_full = inputs_embeds_full.masked_scatter(
+                image_mask_full, image_embeds_full
+            )
+            inputs_embeds_full = torch.nan_to_num(inputs_embeds_full)
+
+            # 3. Compute position_ids based on full sequence
+            if position_ids is None:
+                position_ids = self.compute_3d_position_ids(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    inputs_embeds=inputs_embeds_full,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
+
+            # 4. First forward: extract self-attention from LLM layer 8
             with torch.no_grad():
-                text_embed = inputs_embeds  # [B, L, D]
+                first_out = self.language_model(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds_full,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_attentions=True,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    use_cache=False,
+                )
 
-                if mm_token_type_ids is not None:
-                    text_mask = (mm_token_type_ids == 0)
-                else:
-                    text_mask = torch.ones(
-                        (text_embed.shape[0], text_embed.shape[1]),
-                        dtype=torch.bool,
-                        device=text_embed.device,
-                    )
+            # extract layer 28 attention: [B, heads, L, L]
+            layer_attn = first_out.attentions[28]
 
-                text_tokens = text_embed[text_mask].view(1, -1, text_embed.size(-1))
-                text_tokens = text_tokens.to(inputs_embeds.device, inputs_embeds.dtype)
+            # locate visual and question token positions
+            image_token_id = 151655
+            is_image = (input_ids[0] == image_token_id)
+            vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
+            img_end = vis_positions[-1].item()
+            que_positions = torch.arange(img_end + 1, input_ids.shape[1])
+
+            # question tokens attend to visual tokens: [Lq, N]
+            ld = layer_attn.device
+            vp = vis_positions.to(ld)
+            qp = que_positions.to(ld)
+            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
+            A_tv = torch.nan_to_num(A_tv)
+
+            # rater selection: question tokens with mean visual attention >= global mean
+            r = A_tv.mean(dim=1)                        # [Lq]
+            rater_mask = r >= r.mean()
+            if not rater_mask.any():
+                rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
+
+            # patch scores: mean over raters [N]
+            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
+
+            s_min = patch_scores_global.min()
+            s_max = patch_scores_global.max()
+            patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
+
+            # 存起来供debug用
+            self._debug_patch_scores = [patch_scores_global]
 
             selected_idx_per_image = []
             new_image_tokens_list = []
@@ -92,9 +152,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             for i, tokens in enumerate(image_tokens_list):
                 # vision tokens: [Ni, D]
                 x = tokens.unsqueeze(0)  # [1, Ni, D]
-
-                # text tokens
-                ti = text_tokens.to(tokens.device, tokens.dtype)  # [1, Lt, D]
 
                 # infer downsampled grid
                 grid_t, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
@@ -110,22 +167,29 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         f"tokens={tokens.size(0)}"
                     )
 
-                # run tree
-                out = self.qvtree(x, ti, H=grid_h, W=grid_w)
+                # use self-attention patch scores directly
+                patch_scores = patch_scores_global.unsqueeze(0).to(
+                    tokens.device, tokens.dtype
+                )  # [1, N]
 
-                sel_nodes = out["selected_node_ids"][0]
+                # build quadtree and navigate
+                built = self.qvtree.builder.build(x, grid_h, grid_w)
+                nodes = built["nodes"]
+
+                sel_nodes_list, _ = self.qvtree.navigator.select_nodes(
+                    nodes=nodes,
+                    patch_scores=patch_scores,
+                    W=grid_w,
+                )
+                sel_nodes = sel_nodes_list[0]
                 selected_idx_per_image.append(sel_nodes)
-
-                nodes = out["nodes"]
-                grid_h = out["H"]
-                grid_w = out["W"]
 
                 # node ids -> patch ids
                 token_out = self.qvtree.navigator.nodes_to_tokens(
                     nodes,
                     H=grid_h,
                     W=grid_w,
-                    selected_node_ids=[sel_nodes],
+                    selected_node_ids=sel_nodes_list,
                     x=x,
                 )
 
