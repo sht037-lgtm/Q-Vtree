@@ -122,23 +122,21 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             img_end = vis_positions[-1].item()
             que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
-            # PyramidDrop style: use last instruction token's attention to visual tokens
+            # question tokens attend to visual tokens: [Lq, N]
             ld = layer_attn.device
             vp = vis_positions.to(ld)
-            last_que_pos = que_positions[-1].item()  # last instruction token position
+            qp = que_positions.to(ld)
+            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
+            A_tv = torch.nan_to_num(A_tv)
 
-            # post-softmax attention of last instruction token -> all tokens [heads, L]
-            attn_last = layer_attn[0, :, last_que_pos, :]  # [heads, L]
-            # extract visual token positions
-            attn_last_vis = attn_last[:, vp]               # [heads, N]
-            # mean over heads -> [N]
-            patch_scores_global = attn_last_vis.mean(dim=0).cpu()  # [N]
+            # rater selection: question tokens with mean visual attention >= global mean
+            r = A_tv.mean(dim=1)                        # [Lq]
+            rater_mask = r >= r.mean()
+            if not rater_mask.any():
+                rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
 
-            print(f"[DEBUG] patch_scores std: {patch_scores_global.std():.6f}")
-            print(f"[DEBUG] patch_scores max: {patch_scores_global.max():.6f}")
-            top_patch = patch_scores_global.argmax().item()
-            _gw = image_grid_thw[0][2].item() // 2
-            print(f"[DEBUG] top patch: {top_patch}, grid pos: ({top_patch // _gw}, {top_patch % _gw})")
+            # patch scores: mean over raters [N]
+            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
 
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
