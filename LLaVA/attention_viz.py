@@ -54,6 +54,11 @@ def get_attention_maps(
 
     num_image_tokens = 576  # 24x24 from CLIP ViT-L/14@336
 
+    # debug: print sequence shape
+    seq_len = attentions[0].shape[2]
+    n_text  = seq_len - num_image_tokens
+    print(f"[DEBUG] seq_len={seq_len}, num_image_tokens={num_image_tokens}, n_text_tokens={n_text}")
+
     if layers is None:
         layers = [15, 23, 31]
 
