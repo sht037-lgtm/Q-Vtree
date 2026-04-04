@@ -29,22 +29,18 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         image_token_id = 151655
         is_image = (input_ids[0] == image_token_id)
         vis_positions = is_image.nonzero(as_tuple=True)[0]
-        last_que_pos = input_ids.shape[1] - 1  # last token in sequence
-
         target_layers = [8, 16, 24]
         layer_outputs = {}
 
-        def make_hook(idx):
-            def hook(module, args, kwargs, output):
-                hidden = kwargs.get('hidden_states', None)
-                if hidden is None and len(args) > 0:
-                    hidden = args[0]
-                with torch.no_grad():
-                    q = module.q_proj(hidden)
-                    k = module.k_proj(hidden)
-                layer_outputs[idx] = (q.detach().cpu(), k.detach().cpu())
-                return output
-            return hook
+        def hook(module, args, kwargs, output):
+            hidden = kwargs.get('hidden_states', None)
+            if hidden is None and len(args) > 0:
+                hidden = args[0]
+            with torch.no_grad():
+                q = module.q_proj(hidden)
+                k = module.k_proj(hidden)
+            layer_outputs[layer_idx] = (q.detach().cpu(), k.detach().cpu())
+            return output  # 不修改原始output
 
         hooks = []
         for layer_idx in target_layers:
@@ -67,7 +63,14 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         for h in hooks:
             h.remove()
 
-        qk_scores = []
+        # locate question positions (same for all layers)
+        image_token_id = 151655
+        is_image = (input_ids[0] == image_token_id)
+        vis_pos_cpu = is_image.nonzero(as_tuple=True)[0].cpu()
+        img_end = vis_pos_cpu[-1].item()
+        que_pos_cpu = torch.arange(img_end + 1, input_ids.shape[1])
+
+        qk_layers = []
         for layer_idx in target_layers:
             q, k = layer_outputs[layer_idx]  # [B, L, HD] on cpu
             B, L, HD = q.shape
@@ -76,27 +79,38 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             num_kv_heads = attn_module.num_key_value_heads
             head_dim = HD // num_heads
 
-            q = q.view(B, L, num_heads, head_dim).transpose(1, 2)
+            q = q.view(B, L, num_heads, head_dim).transpose(1, 2)   # [B, heads, L, head_dim]
             kd = k.shape[-1] // num_kv_heads
-            k = k.view(B, L, num_kv_heads, kd).transpose(1, 2)
+            k = k.view(B, L, num_kv_heads, kd).transpose(1, 2)      # [B, kv_heads, L, head_dim]
 
             n_rep = num_heads // num_kv_heads
             if n_rep > 1:
-                k = k.repeat_interleave(n_rep, dim=1)
+                k = k.repeat_interleave(n_rep, dim=1)                # [B, heads, L, head_dim]
 
-            vp = vis_positions.cpu()
-            q_last = q[0, :, last_que_pos, :]   # [heads, head_dim]
-            k_vis  = k[0, :, vp, :]             # [heads, N, head_dim]
+            q_que = q[0, :, que_pos_cpu, :]   # [heads, Lq, head_dim]
+            k_vis = k[0, :, vis_pos_cpu, :]   # [heads, N,  head_dim]
 
-            scores = torch.einsum('hd,hnd->hn', q_last, k_vis) / (head_dim ** 0.5)
-            scores = scores.mean(dim=0)          # [N]
-            qk_scores.append(scores)
+            # raw QK dot product: [heads, Lq, N]
+            A_raw = torch.einsum('hqd,hnd->hqn', q_que, k_vis) / (head_dim ** 0.5)
+            A_raw = A_raw.mean(dim=0)          # [Lq, N] mean over heads
+            qk_layers.append(A_raw)
 
-        patch_scores = torch.stack(qk_scores).mean(dim=0)  # [N]
+        # average over layers: [Lq, N]
+        A_tv = torch.stack(qk_layers).mean(dim=0)
+
+        # rater selection: question tokens with mean visual score >= global mean
+        r = A_tv.mean(dim=1)                   # [Lq]
+        rater_mask = r >= r.mean()
+        if not rater_mask.any():
+            rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
+
+        # patch scores: mean over raters [N]
+        patch_scores = A_tv[rater_mask].mean(dim=0)  # [N]
         s_min = patch_scores.min()
         s_max = patch_scores.max()
         patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
-        return patch_scores, vis_positions
+
+        return patch_scores, vis_pos_cpu
 
     def forward(
             self,
