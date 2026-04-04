@@ -20,6 +20,81 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         self._debug_num_total_tokens = None
         self._debug_select_ratios = None
 
+
+    def _get_raw_qk_scores(self, inputs_embeds, attention_mask, position_ids, input_ids):
+        """
+        Hook into LLM attention layers to get pre-softmax QK scores.
+        Average over layers [8, 16, 24] using last instruction token as query.
+        """
+        image_token_id = 151655
+        is_image = (input_ids[0] == image_token_id)
+        vis_positions = is_image.nonzero(as_tuple=True)[0]
+        last_que_pos = input_ids.shape[1] - 1  # last token in sequence
+
+        target_layers = [8, 16, 24]
+        layer_outputs = {}
+
+        def make_hook(layer_idx):
+            def hook(module, args, kwargs, output):
+                hidden = args[0]
+                with torch.no_grad():
+                    q = module.q_proj(hidden)
+                    k = module.k_proj(hidden)
+                layer_outputs[layer_idx] = (q.detach().cpu(), k.detach().cpu())
+            return hook
+
+        hooks = []
+        for layer_idx in target_layers:
+            layer = self.language_model.model.layers[layer_idx].self_attn
+            h = layer.register_forward_hook(make_hook(layer_idx), with_kwargs=True)
+            hooks.append(h)
+
+        with torch.no_grad():
+            self.language_model(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        for h in hooks:
+            h.remove()
+
+        qk_scores = []
+        for layer_idx in target_layers:
+            q, k = layer_outputs[layer_idx]  # [B, L, HD] on cpu
+            B, L, HD = q.shape
+            attn_module = self.language_model.model.layers[layer_idx].self_attn
+            num_heads = attn_module.num_heads
+            num_kv_heads = attn_module.num_key_value_heads
+            head_dim = HD // num_heads
+
+            q = q.view(B, L, num_heads, head_dim).transpose(1, 2)
+            kd = k.shape[-1] // num_kv_heads
+            k = k.view(B, L, num_kv_heads, kd).transpose(1, 2)
+
+            n_rep = num_heads // num_kv_heads
+            if n_rep > 1:
+                k = k.repeat_interleave(n_rep, dim=1)
+
+            vp = vis_positions.cpu()
+            q_last = q[0, :, last_que_pos, :]   # [heads, head_dim]
+            k_vis  = k[0, :, vp, :]             # [heads, N, head_dim]
+
+            scores = torch.einsum('hd,hnd->hn', q_last, k_vis) / (head_dim ** 0.5)
+            scores = scores.mean(dim=0)          # [N]
+            qk_scores.append(scores)
+
+        patch_scores = torch.stack(qk_scores).mean(dim=0)  # [N]
+        s_min = patch_scores.min()
+        s_max = patch_scores.max()
+        patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
+        return patch_scores, vis_positions
+
     def forward(
             self,
             input_ids=None,
@@ -99,51 +174,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: extract self-attention from LLM layer 8
-            with torch.no_grad():
-                first_out = self.language_model(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds_full,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    output_attentions=True,
-                    output_hidden_states=False,
-                    return_dict=True,
-                    use_cache=False,
-                )
-
-            # extract layer 28 attention: [B, heads, L, L]
-            layer_attn = first_out.attentions[28]
-
-            # locate visual and question token positions
-            image_token_id = 151655
-            is_image = (input_ids[0] == image_token_id)
-            vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
-            img_end = vis_positions[-1].item()
-            que_positions = torch.arange(img_end + 1, input_ids.shape[1])
-
-            # question tokens attend to visual tokens: [Lq, N]
-            ld = layer_attn.device
-            vp = vis_positions.to(ld)
-            qp = que_positions.to(ld)
-            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
-            A_tv = torch.nan_to_num(A_tv)
-
-            # rater selection: question tokens with mean visual attention >= global mean
-            r = A_tv.mean(dim=1)                        # [Lq]
-            rater_mask = r >= r.mean()
-            if not rater_mask.any():
-                rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
-
-            # patch scores: mean over raters [N]
-            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
-
-            s_min = patch_scores_global.min()
-            s_max = patch_scores_global.max()
-            patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
-
-            # 存起来供debug用
+            # 4. Extract raw QK scores from layers [8, 16, 24]
+            patch_scores_global, vis_positions = self._get_raw_qk_scores(
+                inputs_embeds=inputs_embeds_full,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                input_ids=input_ids,
+            )
             self._debug_patch_scores = [patch_scores_global]
+
 
             selected_idx_per_image = []
             new_image_tokens_list = []
