@@ -45,7 +45,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
         hooks = []
         for layer_idx in target_layers:
-            layer = self.language_model.model.layers[layer_idx].self_attn
+            layer = self.language_model.layers[layer_idx].self_attn
             h = layer.register_forward_hook(make_hook(layer_idx), with_kwargs=True)
             hooks.append(h)
 
@@ -68,7 +68,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         for layer_idx in target_layers:
             q, k = layer_outputs[layer_idx]  # [B, L, HD] on cpu
             B, L, HD = q.shape
-            attn_module = self.language_model.model.layers[layer_idx].self_attn
+            attn_module = self.language_model.layers[layer_idx].self_attn
             num_heads = attn_module.num_heads
             num_kv_heads = attn_module.num_key_value_heads
             head_dim = HD // num_heads
