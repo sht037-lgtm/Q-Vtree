@@ -99,55 +99,48 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: full multimodal forward to get aligned question hidden states
+            # 4. First forward: extract self-attention from LLM layer 8
             with torch.no_grad():
                 first_out = self.language_model(
                     input_ids=None,
                     inputs_embeds=inputs_embeds_full,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    output_attentions=False,
-                    output_hidden_states=True,
+                    output_attentions=True,
+                    output_hidden_states=False,
                     return_dict=True,
                     use_cache=False,
                 )
 
-            # extract layer 24 hidden states: [B, L, D]
-            hidden = first_out.hidden_states[24]
+            # extract layer 28 attention: [B, heads, L, L]
+            layer_attn = first_out.attentions[28]
+
+            print(f"layer_attn shape: {layer_attn.shape}")
+            extracted = layer_attn[0, :, qp[:, None], vp[None, :]]
+            print(f"extracted shape: {extracted.shape}")  # 应该是 [heads, Lq, N]
 
             # locate visual and question token positions
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
-            vis_positions = is_image.nonzero(as_tuple=True)[0]
+            vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
             img_end = vis_positions[-1].item()
-            que_positions = torch.arange(img_end + 1, input_ids.shape[1], device=hidden.device)
+            que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
-            import torch.nn.functional as F_func
+            # question tokens attend to visual tokens: [Lq, N]
+            ld = layer_attn.device
+            vp = vis_positions.to(ld)
+            qp = que_positions.to(ld)
+            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
+            A_tv = torch.nan_to_num(A_tv)
 
-            # question hidden states: aligned, has seen visual context [Lq, D]
-            q_hidden = hidden[0, que_positions].float()
-
-            # visual tokens: raw ViT features (local patch features) [N, D]
-            v_raw = image_tokens_list[0].float()
-
-            # normalize both
-            q_norm = F_func.normalize(q_hidden, dim=-1)  # [Lq, D]
-            v_norm = F_func.normalize(v_raw, dim=-1)  # [N, D]
-            q_norm = q_norm.to(v_norm.device)  # 统一device
-
-            # SparseVLM-style: single direction T->V
-            S_tv = q_norm @ v_norm.T                       # [Lq, N]
-            S_tv = S_tv / 0.5                              # temperature
-            A_tv = torch.softmax(S_tv, dim=1)              # [Lq, N]
-
-            # rater selection
-            r = A_tv.mean(dim=1)                           # [Lq]
+            # rater selection: question tokens with mean visual attention >= global mean
+            r = A_tv.mean(dim=1)                        # [Lq]
             rater_mask = r >= r.mean()
             if not rater_mask.any():
                 rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
 
             # patch scores: mean over raters [N]
-            patch_scores_global = A_tv[rater_mask].mean(dim=0).cpu()  # [N]
+            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
 
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
