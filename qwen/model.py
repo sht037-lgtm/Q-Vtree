@@ -99,7 +99,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: hook layer 24 to get Q, K with RoPE
+            # 4. First forward: hook layer 24 to get Q, K + RoPE
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
@@ -110,7 +110,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             def make_hook(idx):
                 def hook(module, args, kwargs, output):
-                    # capture hidden_states and position_embeddings
                     hidden = kwargs.get('hidden_states', None)
                     if hidden is None and len(args) > 0:
                         hidden = args[0]
@@ -146,9 +145,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             # compute raw QK with RoPE
             captured = layer_capture[24]
-            q = captured['q']   # [B, L, num_heads * head_dim]
-            k = captured['k']   # [B, L, num_kv_heads * head_dim]
-            pos_emb = captured['pos_emb']  # (cos, sin) each [B, L, head_dim] or similar
+            q = captured['q']
+            k = captured['k']
+            pos_emb = captured['pos_emb']
 
             attn_module = self.language_model.layers[24].self_attn
             num_heads = attn_module.num_heads
@@ -158,16 +157,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             q = q.view(q.shape[0], q.shape[1], num_heads, head_dim).transpose(1, 2)
             k = k.view(k.shape[0], k.shape[1], num_kv_heads, head_dim).transpose(1, 2)
 
-            # apply RoPE if available
+            # apply RoPE
             if pos_emb is not None:
                 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
                 cos, sin = pos_emb
-                q, k = apply_multimodal_rotary_pos_emb(
-                    q, k, cos, sin,
-                    position_ids=position_ids,
-                    mrope_section=self.config.text_config.rope_scaling.get("mrope_section", None)
-                    if hasattr(self.config.text_config, 'rope_scaling') else None,
+                mrope_section = (
+                    self.config.text_config.rope_scaling.get("mrope_section", None)
+                    if hasattr(self.config.text_config, 'rope_scaling') else None
                 )
+                q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section)
 
             # GQA: repeat k
             if num_heads != num_kv_heads:
@@ -191,7 +189,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             if not rater_mask.any():
                 rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
 
-            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
+            patch_scores_global = A_tv[rater_mask].mean(dim=0)
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
