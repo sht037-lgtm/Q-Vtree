@@ -99,13 +99,14 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: hook layer 12 to get Q, K + RoPE
+            # 4. First forward: hook layer 4 to get Q, K + RoPE
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
             img_end = vis_positions[-1].item()
             que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
+            target_layers = [7, 14, 21, 28]
             layer_capture = {}
 
             def make_hook(idx):
@@ -125,9 +126,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     return output
                 return hook
 
-            hook_handle = self.language_model.layers[12].self_attn.register_forward_hook(
-                make_hook(12), with_kwargs=True
-            )
+            hook_handles = []
+            for layer_idx in target_layers:
+                h = self.language_model.layers[layer_idx].self_attn.register_forward_hook(
+                    make_hook(layer_idx), with_kwargs=True
+                )
+                hook_handles.append(h)
 
             with torch.no_grad():
                 self.language_model(
@@ -141,46 +145,49 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     use_cache=False,
                 )
 
-            hook_handle.remove()
+            for h in hook_handles:
+                h.remove()
 
-            # compute raw QK with RoPE
-            captured = layer_capture[12]
-            q = captured['q']
-            k = captured['k']
-            pos_emb = captured['pos_emb']
-
-            attn_module = self.language_model.layers[12].self_attn
-            num_heads = attn_module.num_heads
-            num_kv_heads = attn_module.num_key_value_heads
-            head_dim = q.shape[-1] // num_heads
-
-            q = q.view(q.shape[0], q.shape[1], num_heads, head_dim).transpose(1, 2)
-            k = k.view(k.shape[0], k.shape[1], num_kv_heads, head_dim).transpose(1, 2)
-
-            # apply RoPE
-            if pos_emb is not None:
-                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
-                cos, sin = pos_emb
-                mrope_section = (
-                    self.config.text_config.rope_scaling.get("mrope_section", None)
-                    if hasattr(self.config.text_config, 'rope_scaling') else None
-                )
-                q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section)
-
-            # GQA: repeat k
-            if num_heads != num_kv_heads:
-                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-
-            ld = q.device
+            # compute raw QK with RoPE for each layer and average
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
+            ld = inputs_embeds_full.device
             vp = vis_positions.to(ld)
             qp = que_positions.to(ld)
 
-            q_que = q[0, :, qp, :]   # [heads, Lq, head_dim]
-            k_vis = k[0, :, vp, :]   # [heads, N,  head_dim]
+            A_tv_layers = []
+            for layer_idx in target_layers:
+                captured = layer_capture[layer_idx]
+                q = captured['q']
+                k = captured['k']
+                pos_emb = captured['pos_emb']
 
-            # raw QK with RoPE: [heads, Lq, N]
-            A_raw = torch.einsum('hqd,hnd->hqn', q_que, k_vis) / (head_dim ** 0.5)
-            A_tv = A_raw.mean(dim=0).cpu()   # [Lq, N]
+                attn_module = self.language_model.layers[layer_idx].self_attn
+                num_heads = attn_module.num_heads
+                num_kv_heads = attn_module.num_key_value_heads
+                head_dim = q.shape[-1] // num_heads
+
+                q = q.view(q.shape[0], q.shape[1], num_heads, head_dim).transpose(1, 2)
+                k = k.view(k.shape[0], k.shape[1], num_kv_heads, head_dim).transpose(1, 2)
+
+                if pos_emb is not None:
+                    cos, sin = pos_emb
+                    mrope_section = (
+                        self.config.text_config.rope_scaling.get("mrope_section", None)
+                        if hasattr(self.config.text_config, 'rope_scaling') else None
+                    )
+                    q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section)
+
+                if num_heads != num_kv_heads:
+                    k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+
+                q_que = q[0, :, qp.to(q.device), :]
+                k_vis = k[0, :, vp.to(k.device), :]
+
+                A_raw = torch.einsum('hqd,hnd->hqn', q_que, k_vis) / (head_dim ** 0.5)
+                A_tv_layers.append(A_raw.mean(dim=0).cpu())  # [Lq, N]
+
+            # average over layers: [Lq, N]
+            A_tv = torch.stack(A_tv_layers).mean(dim=0)
             A_tv = torch.nan_to_num(A_tv)
 
             # rater selection
