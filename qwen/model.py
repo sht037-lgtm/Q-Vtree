@@ -99,80 +99,52 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: hook layer 24 to get raw QK scores
+            # 4. First forward: extract self-attention from LLM layer 8
+            with torch.no_grad():
+                first_out = self.language_model(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds_full,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_attentions=True,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    use_cache=False,
+                )
+
+            # extract layer 28 attention: [B, heads, L, L]
+            layer_attn = first_out.attentions[28]
+
+            # locate visual and question token positions
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
             img_end = vis_positions[-1].item()
             que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
-            layer_output = {}
+            # question tokens attend to visual tokens: [Lq, N]
+            ld = layer_attn.device
+            vp = vis_positions.to(ld)
+            qp = que_positions.to(ld)
+            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
+            A_tv = torch.nan_to_num(A_tv)
+            A_tv = torch.log(A_tv + 1e-8)   # compress dynamic range
+            A_tv = A_tv - A_tv.min()         # shift to non-negative
 
-            def make_hook(idx):
-                def hook(module, args, kwargs, output):
-                    hidden = kwargs.get('hidden_states', None)
-                    if hidden is None and len(args) > 0:
-                        hidden = args[0]
-                    with torch.no_grad():
-                        q = module.q_proj(hidden)
-                        k = module.k_proj(hidden)
-                    layer_output[idx] = (q.detach().cpu(), k.detach().cpu())
-                    return output
-                return hook
-
-            hook_handle = self.language_model.layers[24].self_attn.register_forward_hook(
-                make_hook(24), with_kwargs=True
-            )
-
-            with torch.no_grad():
-                self.language_model(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds_full,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True,
-                    use_cache=False,
-                )
-
-            hook_handle.remove()
-
-            # compute raw QK scores
-            q, k = layer_output[24]
-            B, L, HD = q.shape
-            attn_module = self.language_model.layers[24].self_attn
-            num_heads = attn_module.num_heads
-            num_kv_heads = attn_module.num_key_value_heads
-            head_dim = HD // num_heads
-
-            q = q.view(B, L, num_heads, head_dim).transpose(1, 2)    # [B, heads, L, head_dim]
-            kd = k.shape[-1] // num_kv_heads
-            k = k.view(B, L, num_kv_heads, kd).transpose(1, 2)       # [B, kv_heads, L, head_dim]
-            if num_heads != num_kv_heads:
-                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-
-            vp = vis_positions
-            qp = que_positions
-
-            q_que = q[0, :, qp, :]   # [heads, Lq, head_dim]
-            k_vis = k[0, :, vp, :]   # [heads, N,  head_dim]
-
-            # raw dot product: [heads, Lq, N]
-            A_tv = torch.einsum('hqd,hnd->hqn', q_que, k_vis) / (head_dim ** 0.5)
-            A_tv = A_tv.mean(dim=0)   # [Lq, N] mean over heads
-
-            # rater selection
-            r = A_tv.mean(dim=1)      # [Lq]
+            # rater selection: question tokens with mean visual attention >= global mean
+            r = A_tv.mean(dim=1)                        # [Lq]
             rater_mask = r >= r.mean()
             if not rater_mask.any():
                 rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
 
-            patch_scores_global = A_tv[rater_mask].mean(dim=0)  # [N]
+            # patch scores: mean over raters [N]
+            patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
+
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
+            # 存起来供debug用
             self._debug_patch_scores = [patch_scores_global]
 
             selected_idx_per_image = []
