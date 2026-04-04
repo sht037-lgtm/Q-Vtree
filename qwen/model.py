@@ -99,50 +99,103 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: extract self-attention from LLM layer 8
-            with torch.no_grad():
-                first_out = self.language_model(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds_full,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    output_attentions=True,
-                    output_hidden_states=False,
-                    return_dict=True,
-                    use_cache=False,
-                )
-
-            # extract layer 28 attention: [B, heads, L, L]
-            layer_attn = first_out.attentions[28]
-
-            # locate visual and question token positions
+            # 4. First forward: hook layer 24 to get Q, K with RoPE
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
             img_end = vis_positions[-1].item()
             que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
-            # question tokens attend to visual tokens: [Lq, N]
-            ld = layer_attn.device
+            layer_capture = {}
+
+            def make_hook(idx):
+                def hook(module, args, kwargs, output):
+                    # capture hidden_states and position_embeddings
+                    hidden = kwargs.get('hidden_states', None)
+                    if hidden is None and len(args) > 0:
+                        hidden = args[0]
+                    pos_emb = kwargs.get('position_embeddings', None)
+                    with torch.no_grad():
+                        q = module.q_proj(hidden)
+                        k = module.k_proj(hidden)
+                    layer_capture[idx] = {
+                        'q': q.detach(),
+                        'k': k.detach(),
+                        'pos_emb': pos_emb,
+                    }
+                    return output
+                return hook
+
+            hook_handle = self.language_model.layers[24].self_attn.register_forward_hook(
+                make_hook(24), with_kwargs=True
+            )
+
+            with torch.no_grad():
+                self.language_model(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds_full,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    use_cache=False,
+                )
+
+            hook_handle.remove()
+
+            # compute raw QK with RoPE
+            captured = layer_capture[24]
+            q = captured['q']   # [B, L, num_heads * head_dim]
+            k = captured['k']   # [B, L, num_kv_heads * head_dim]
+            pos_emb = captured['pos_emb']  # (cos, sin) each [B, L, head_dim] or similar
+
+            attn_module = self.language_model.layers[24].self_attn
+            num_heads = attn_module.num_heads
+            num_kv_heads = attn_module.num_key_value_heads
+            head_dim = q.shape[-1] // num_heads
+
+            q = q.view(q.shape[0], q.shape[1], num_heads, head_dim).transpose(1, 2)
+            k = k.view(k.shape[0], k.shape[1], num_kv_heads, head_dim).transpose(1, 2)
+
+            # apply RoPE if available
+            if pos_emb is not None:
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
+                cos, sin = pos_emb
+                q, k = apply_multimodal_rotary_pos_emb(
+                    q, k, cos, sin,
+                    position_ids=position_ids,
+                    mrope_section=self.config.text_config.rope_scaling.get("mrope_section", None)
+                    if hasattr(self.config.text_config, 'rope_scaling') else None,
+                )
+
+            # GQA: repeat k
+            if num_heads != num_kv_heads:
+                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+
+            ld = q.device
             vp = vis_positions.to(ld)
             qp = que_positions.to(ld)
-            A_tv = layer_attn[0, :, qp[:, None], vp[None, :]].mean(dim=0).cpu()  # [Lq, N]
+
+            q_que = q[0, :, qp, :]   # [heads, Lq, head_dim]
+            k_vis = k[0, :, vp, :]   # [heads, N,  head_dim]
+
+            # raw QK with RoPE: [heads, Lq, N]
+            A_raw = torch.einsum('hqd,hnd->hqn', q_que, k_vis) / (head_dim ** 0.5)
+            A_tv = A_raw.mean(dim=0).cpu()   # [Lq, N]
             A_tv = torch.nan_to_num(A_tv)
 
-            # rater selection: question tokens with mean visual attention >= global mean
-            r = A_tv.mean(dim=1)                        # [Lq]
+            # rater selection
+            r = A_tv.mean(dim=1)
             rater_mask = r >= r.mean()
             if not rater_mask.any():
                 rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
 
-            # patch scores: mean over raters [N]
             patch_scores_global = A_tv[rater_mask].mean(dim=0)   # [N]
-
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
-            # 存起来供debug用
             self._debug_patch_scores = [patch_scores_global]
 
             selected_idx_per_image = []
