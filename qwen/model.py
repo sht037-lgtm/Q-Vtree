@@ -29,18 +29,22 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         image_token_id = 151655
         is_image = (input_ids[0] == image_token_id)
         vis_positions = is_image.nonzero(as_tuple=True)[0]
+        last_que_pos = input_ids.shape[1] - 1  # last token in sequence
+
         target_layers = [8, 16, 24]
         layer_outputs = {}
 
-        def hook(module, args, kwargs, output):
-            hidden = kwargs.get('hidden_states', None)
-            if hidden is None and len(args) > 0:
-                hidden = args[0]
-            with torch.no_grad():
-                q = module.q_proj(hidden)
-                k = module.k_proj(hidden)
-            layer_outputs[layer_idx] = (q.detach().cpu(), k.detach().cpu())
-            return output  # 不修改原始output
+        def make_hook(idx):
+            def hook(module, args, kwargs, output):
+                hidden = kwargs.get('hidden_states', None)
+                if hidden is None and len(args) > 0:
+                    hidden = args[0]
+                with torch.no_grad():
+                    q = module.q_proj(hidden)
+                    k = module.k_proj(hidden)
+                layer_outputs[idx] = (q.detach().cpu(), k.detach().cpu())
+                return output
+            return hook
 
         hooks = []
         for layer_idx in target_layers:
@@ -63,10 +67,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         for h in hooks:
             h.remove()
 
-        # locate question positions (same for all layers)
+        # locate question positions
         image_token_id = 151655
-        is_image = (input_ids[0] == image_token_id)
-        vis_pos_cpu = is_image.nonzero(as_tuple=True)[0].cpu()
+        is_image2 = (input_ids[0] == image_token_id)
+        vis_pos_cpu = is_image2.nonzero(as_tuple=True)[0].cpu()
         img_end = vis_pos_cpu[-1].item()
         que_pos_cpu = torch.arange(img_end + 1, input_ids.shape[1])
 
