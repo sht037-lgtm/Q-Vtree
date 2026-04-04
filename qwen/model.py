@@ -34,14 +34,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         target_layers = [8, 16, 24]
         layer_outputs = {}
 
-        def make_hook(layer_idx):
-            def hook(module, args, kwargs, output):
+        def hook(module, args, kwargs, output):
+            hidden = kwargs.get('hidden_states', None)
+            if hidden is None and len(args) > 0:
                 hidden = args[0]
-                with torch.no_grad():
-                    q = module.q_proj(hidden)
-                    k = module.k_proj(hidden)
-                layer_outputs[layer_idx] = (q.detach().cpu(), k.detach().cpu())
-            return hook
+            with torch.no_grad():
+                q = module.q_proj(hidden)
+                k = module.k_proj(hidden)
+            layer_outputs[layer_idx] = (q.detach().cpu(), k.detach().cpu())
+            return output  # 不修改原始output
 
         hooks = []
         for layer_idx in target_layers:
