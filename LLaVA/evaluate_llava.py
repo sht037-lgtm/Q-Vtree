@@ -72,6 +72,7 @@ def run_vstar_inference_llava(
     model,
     processor,
     dataset,
+    dataset_dir: str = "vstar_bench",
     output_file: str = "vstar_predictions_llava15.jsonl",
     max_samples: int | None = None,
     max_new_tokens: int = 16,
@@ -84,6 +85,8 @@ def run_vstar_inference_llava(
         model         : loaded LlavaForConditionalGeneration
         processor     : corresponding LlavaProcessor
         dataset       : HuggingFace Dataset object, e.g. ds["test"]
+        dataset_dir   : root dir of cloned vstar_bench repo
+                        (images live at dataset_dir/direct_attributes/xxx.jpg)
         output_file   : path to save prediction jsonl
         max_samples   : optional subset for quick testing
         max_new_tokens: tokens to generate
@@ -98,12 +101,9 @@ def run_vstar_inference_llava(
     with open(output_file, "w", encoding="utf-8") as fout:
         for sample in tqdm(samples, desc="[LLaVA-1.5] V-Star"):
             try:
-                # HuggingFace loads image as PIL.Image directly
-                image = sample["image"]
-                if not isinstance(image, Image.Image):
-                    image = Image.open(image).convert("RGB")
-                else:
-                    image = image.convert("RGB")
+                # join dataset root dir with the relative path stored in dataset
+                img_path = os.path.join(dataset_dir, sample["image"])
+                image    = Image.open(img_path).convert("RGB")
 
                 # LLaVA-1.5 official prompt format
                 prompt = f"USER: <image>\n{sample['text']}\nASSISTANT:"
