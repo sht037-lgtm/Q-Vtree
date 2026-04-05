@@ -101,7 +101,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     inputs_embeds=inputs_embeds_full,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
-                    mm_token_type_ids=mm_token_type_ids,
                 )
 
             # 4. Relative attention scoring (ViCrop style)
