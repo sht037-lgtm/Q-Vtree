@@ -18,23 +18,27 @@ def get_attention_maps(
     """
     Extract answer-token→image attention weights from LLaVA-1.5.
 
-    Instead of using prefill (question→image) attention, we generate
-    the first answer token and use ITS attention to image tokens.
-    This reflects where the model looks when making its decision.
+    Strategy:
+        1. generate() to get the answer token id (e.g. 'A')
+        2. Append the answer token to the input sequence
+        3. Full forward pass with the 640-length sequence
+        4. Take the LAST row of attention (answer token's attention)
+           and slice the first 576 columns (image token part)
+
+    This correctly captures where the model looks when generating the answer.
 
     Args:
         model     : loaded LlavaForConditionalGeneration
                     (must be loaded with attn_implementation="eager")
         processor : corresponding LlavaProcessor
         image     : PIL.Image
-        question  : question string
+        question  : question string (should include options for MCQ)
         layers    : which transformer layers to extract, e.g. [15, 23, 31]
                     defaults to [15, 23, 31]
 
     Returns:
         dict with keys:
-            "answer_to_image" : list of [num_heads, 576] tensors per layer
-                                answer token's attention to each image patch
+            "answer_to_image" : list of [H, 576] tensors per layer
             "layers"          : layer indices used
             "answer_token"    : the generated answer token string
             "prompt"          : prompt string used
@@ -49,55 +53,60 @@ def get_attention_maps(
         return_tensors="pt",
     ).to(device)
 
-    num_image_tokens = 576  # 24x24 from CLIP ViT-L/14@336
+    num_image_tokens = 576  # 24×24 from CLIP ViT-L/14@336
 
     if layers is None:
         layers = [15, 23, 31]
 
-    # generate only 1 token (the first answer token)
-    # output_attentions=True returns attentions for the generated token
+    # step 1: generate the first answer token
     with torch.inference_mode():
-        outputs = model.generate(
+        gen_out = model.generate(
             **inputs,
             max_new_tokens=1,
-            output_attentions=True,
-            return_dict_in_generate=True,
             do_sample=False,
         )
 
-    # outputs.attentions is a tuple of length max_new_tokens (=1)
-    # outputs.attentions[0] = attentions for the 1st generated token
-    # each element: tuple of L tensors, each [batch, H, 1, seq_len]
-    gen_attentions = outputs.attentions[0]
-    # gen_attentions: tuple of 32 tensors (one per layer)
-    # each tensor shape: [batch, H, 1, seq_len]
-    #   - 1      = the single generated answer token
-    #   - seq_len = full input sequence length (image + question tokens)
-
-    # decode the generated answer token for display
+    answer_token_id = gen_out[:, inputs["input_ids"].shape[1]:]  # [1, 1]
     answer_token = processor.batch_decode(
-        outputs.sequences[:, inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True,
+        answer_token_id, skip_special_tokens=True
     )[0].strip()
 
-    seq_len = gen_attentions[0].shape[-1]
+    # step 2: append answer token to input → length 639+1=640
+    full_input_ids = torch.cat(
+        [inputs["input_ids"], answer_token_id], dim=1
+    )  # [1, 640]
+
+    # step 3: full forward pass with output_attentions=True
+    with torch.inference_mode():
+        full_outputs = model(
+            input_ids=full_input_ids,
+            pixel_values=inputs["pixel_values"],
+            attention_mask=torch.ones_like(full_input_ids),
+            output_attentions=True,
+        )
+
+    # full_outputs.attentions: tuple of 32 tensors
+    # each shape: [1, 32, 640, 640]
+
+    seq_len = full_outputs.attentions[0].shape[2]
     n_text  = seq_len - num_image_tokens
     print(f"[DEBUG] seq_len={seq_len}, num_image_tokens={num_image_tokens}, n_text_tokens={n_text}")
     print(f"[DEBUG] answer token = '{answer_token}'")
 
     answer_to_image = []
     for l in layers:
-        # shape: [batch, H, seq_len, seq_len]
-        attn = gen_attentions[l][0]    # [H, seq_len, seq_len]
+        # shape: [1, 32, 640, 640]
+        attn = full_outputs.attentions[l][0]   # [32, 640, 640]
 
-        # the answer token is the last row in the attention matrix
-        a2i = attn[:, -1, :num_image_tokens]   # [H, 576]
+        # last row = answer token's attention to all previous tokens
+        # first 576 columns = image tokens
+        a2i = attn[:, -1, :num_image_tokens]   # [32, 576]
 
         # suppress attention sink at position 0
         a2i = a2i.clone()
         a2i[:, 0] = 0.0
 
-        print(f"[DEBUG] Layer {l}: a2i shape = {a2i.shape}")
+        print(f"[DEBUG] Layer {l}: a2i shape={a2i.shape}, max={a2i.max():.4f}, mean={a2i.mean():.6f}")
 
         answer_to_image.append(a2i.cpu().float())
 
@@ -131,7 +140,7 @@ def visualize_attention(
         save_path    : optional path to save the figure
     """
     layers          = attn_result["layers"]
-    answer_to_image = attn_result["answer_to_image"]  # list of [H, 576]
+    answer_to_image = attn_result["answer_to_image"]  # list of [32, 576]
     answer_token    = attn_result.get("answer_token", "?")
 
     fig, axes = plt.subplots(1, len(layers), figsize=(5 * len(layers), 5))
@@ -139,13 +148,13 @@ def visualize_attention(
         axes = [axes]
 
     for ax, layer_idx, a2i in zip(axes, layers, answer_to_image):
-        # a2i: [H, 576]
+        # a2i: [32, 576]
 
         # 1. aggregate over heads
         if head_reduce == "mean":
-            attn_map = a2i.mean(dim=0)         # [576]
+            attn_map = a2i.mean(dim=0)          # [576]
         else:
-            attn_map = a2i.max(dim=0).values   # [576]
+            attn_map = a2i.max(dim=0).values    # [576]
 
         # 2. reshape to 24x24
         attn_map = attn_map.reshape(24, 24).numpy()
