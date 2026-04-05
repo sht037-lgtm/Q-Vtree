@@ -101,6 +101,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     inputs_embeds=inputs_embeds_full,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
+                    mm_token_type_ids=mm_token_type_ids,
                 )
 
             # 4. Relative attention scoring (ViCrop style)
@@ -186,7 +187,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 inputs_embeds=generic_embeds,
                 attention_mask=generic_attn_mask,
                 past_key_values=None,
-                mm_token_type_ids=mm_token_type_ids,
             )
 
             A_generic = get_attn_scores(generic_embeds, generic_attn_mask, generic_pos_ids)
