@@ -87,11 +87,11 @@ def get_attention_maps(
 
     answer_to_image = []
     for l in layers:
-        # shape: [batch, H, 1, seq_len]
-        attn = gen_attentions[l][0]    # [H, 1, seq_len]
+        # shape: [batch, H, seq_len, seq_len]
+        attn = gen_attentions[l][0]    # [H, seq_len, seq_len]
 
-        # take answer token's attention to image tokens only
-        a2i = attn[:, 0, :num_image_tokens]   # [H, 576]
+        # the answer token is the last row in the attention matrix
+        a2i = attn[:, -1, :num_image_tokens]   # [H, 576]
 
         # suppress attention sink at position 0
         a2i = a2i.clone()
