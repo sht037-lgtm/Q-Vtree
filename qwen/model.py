@@ -99,7 +99,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: hook layer 27 to get Q, K + RoPE
+            # 4. First forward: hook layer 7 to get Q, K + RoPE
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
@@ -125,8 +125,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     return output
                 return hook
 
-            hook_handle = self.language_model.layers[27].self_attn.register_forward_hook(
-                make_hook(27), with_kwargs=True
+            hook_handle = self.language_model.layers[7].self_attn.register_forward_hook(
+                make_hook(7), with_kwargs=True
             )
 
             with torch.no_grad():
@@ -144,12 +144,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             hook_handle.remove()
 
             # compute raw QK with RoPE
-            captured = layer_capture[27]
+            captured = layer_capture[7]
             q = captured['q']
             k = captured['k']
             pos_emb = captured['pos_emb']
 
-            attn_module = self.language_model.layers[27].self_attn
+            attn_module = self.language_model.layers[7].self_attn
             num_heads = attn_module.num_heads
             num_kv_heads = attn_module.num_key_value_heads
             head_dim = q.shape[-1] // num_heads
