@@ -5,22 +5,36 @@ from PIL import Image
 
 
 # =========================================================
-# ------------- Single Forward Pass Helper ----------------
+# ------------- Single Forward Pass -----------------------
 # =========================================================
 
-def _get_answer_attention(model, processor, image, question, layers, num_image_tokens=576):
+def _get_answer_attention(
+    model,
+    processor,
+    image,
+    question,
+    target_layers=(6, 13, 20, 27),
+):
     """
-    Helper: run one forward pass and return answer token's attention to image patches.
+    Run one forward pass and return answer token's attention to image patches.
+
+    Key improvements over naive approach:
+      1. Use multiple layers (target_layers) and average them → more stable
+      2. Precisely locate image token positions using image_token_id
+         instead of assuming they occupy the first 576 positions
 
     Steps:
-        1. generate() to get the first answer token id
-        2. append answer token to input → length N+1
-        3. full forward pass with output_attentions=True
-        4. take last row of attention, slice first 576 cols (image part)
+        1. generate() to get first answer token id
+        2. Append answer token → full sequence (length N+1)
+        3. Forward pass with output_attentions=True
+        4. For each target layer:
+               attn[batch=0, :heads, ans_pos, image_positions] → mean over heads → [N_img]
+        5. Average across target layers → [N_img]
 
     Returns:
-        answer_to_image : list of [H, 576] tensors per layer
-        answer_token    : decoded answer token string
+        patch_scores : [N_img] tensor, answer token's attention to each image patch
+        answer_token : str
+        image_positions : LongTensor of image token indices in the sequence
     """
     device = next(model.parameters()).device
 
@@ -43,9 +57,26 @@ def _get_answer_attention(model, processor, image, question, layers, num_image_t
     # step 2: append answer token → length N+1
     full_input_ids = torch.cat(
         [inputs["input_ids"], answer_token_id], dim=1
-    )
+    )   # [1, N+1]
 
-    # step 3: full forward pass
+    # step 3: precisely locate image token positions
+    # LLaVA uses token id 32000 as the <image> placeholder
+    image_token_id = 32000
+    is_image = (full_input_ids[0] == image_token_id)
+    image_positions = is_image.nonzero(as_tuple=True)[0]   # [N_img]
+
+    if image_positions.numel() == 0:
+        # fallback: assume first 576 tokens are image tokens
+        image_positions = torch.arange(576, device=device)
+
+    # answer token is always the last position
+    ans_pos = full_input_ids.shape[1] - 1
+
+    print(f"[DEBUG] answer token = '{answer_token}'")
+    print(f"[DEBUG] seq_len = {full_input_ids.shape[1]}, ans_pos = {ans_pos}")
+    print(f"[DEBUG] num image tokens = {image_positions.numel()}")
+
+    # step 4: full forward pass
     with torch.inference_mode():
         full_outputs = model(
             input_ids=full_input_ids,
@@ -54,15 +85,20 @@ def _get_answer_attention(model, processor, image, question, layers, num_image_t
             output_attentions=True,
         )
 
-    # step 4: extract answer token → image attention per layer
-    answer_to_image = []
-    for l in layers:
-        attn = full_outputs.attentions[l][0]          # [H, seq_len, seq_len]
-        a2i  = attn[:, -1, :num_image_tokens].clone() # [H, 576]
-        a2i[:, 0] = 0.0                               # suppress sink
-        answer_to_image.append(a2i.cpu().float())
+    # step 5: extract attention, average over target layers
+    layer_scores = []
+    for l in target_layers:
+        # shape: [1, H, seq_len, seq_len]
+        attn = full_outputs.attentions[l]
+        # [batch=0, all heads, ans_pos, image_positions]
+        ip = image_positions.to(attn.device)
+        s = attn[0, :, ans_pos, ip]        # [H, N_img]
+        s = s.mean(dim=0).cpu().float()    # [N_img]
+        layer_scores.append(s)
 
-    return answer_to_image, answer_token
+    patch_scores = torch.stack(layer_scores).mean(dim=0)   # [N_img]
+
+    return patch_scores, answer_token, image_positions.cpu()
 
 
 # =========================================================
@@ -74,76 +110,56 @@ def get_attention_maps(
     processor,
     image: Image.Image,
     question: str,
-    layers: list[int] | None = None,
+    target_layers: tuple = (6, 13, 20, 27),
     use_relative: bool = True,
     generic_question: str = "Describe the image.",
+    grid_size: int = 24,
 ):
     """
-    Extract answer-token→image attention weights from LLaVA-1.5.
-
-    If use_relative=True (recommended), runs two forward passes:
-        1. specific question  → A_q   [H, 576] per layer
-        2. generic question   → A_q0  [H, 576] per layer
-        relative = A_q / (A_q0 + eps)
-
-    This cancels out fixed high-attention regions (sink, salient backgrounds)
-    and leaves only question-relevant attention.
+    Extract answer-token→image attention from LLaVA-1.5.
 
     Args:
         model            : LlavaForConditionalGeneration (attn_implementation="eager")
         processor        : LlavaProcessor
         image            : PIL.Image
         question         : specific question string (with options for MCQ)
-        layers           : transformer layers to extract, default [15, 23, 31]
-        use_relative     : whether to apply relative attention normalization
-        generic_question : generic prompt used as baseline for relative attention
+        target_layers    : which layers to average, default (6, 13, 20, 27)
+        use_relative     : whether to use relative attention normalization
+        generic_question : baseline question for relative attention
+        grid_size        : spatial grid size (24 for LLaVA-1.5)
 
     Returns:
         dict with keys:
-            "answer_to_image" : list of [576] tensors per layer (head-averaged)
-            "layers"          : layer indices used
-            "answer_token"    : generated answer token string
-            "use_relative"    : whether relative attention was applied
+            "patch_scores"  : [N_img] tensor (relative or raw attention)
+            "answer_token"  : str
+            "use_relative"  : bool
+            "grid_size"     : int
     """
-    if layers is None:
-        layers = [15, 23, 31]
-
-    num_image_tokens = 576
-
     # forward pass 1: specific question
-    print("[INFO] Forward pass 1: specific question...")
-    a2i_q, answer_token = _get_answer_attention(
-        model, processor, image, question, layers, num_image_tokens
+    print(f"[INFO] Forward pass 1: specific question")
+    A_q, answer_token, img_pos = _get_answer_attention(
+        model, processor, image, question, target_layers
     )
-    print(f"[DEBUG] answer token = '{answer_token}'")
+    print(f"[DEBUG] A_q   max={A_q.max():.6f}, mean={A_q.mean():.8f}")
 
     if use_relative:
-        # forward pass 2: generic question as baseline
-        print("[INFO] Forward pass 2: generic question (baseline)...")
-        a2i_q0, generic_token = _get_answer_attention(
-            model, processor, image, generic_question, layers, num_image_tokens
+        # forward pass 2: generic question
+        print(f"[INFO] Forward pass 2: generic question")
+        A_q0, _, _ = _get_answer_attention(
+            model, processor, image, generic_question, target_layers
         )
-        print(f"[DEBUG] generic token = '{generic_token}'")
+        print(f"[DEBUG] A_q0  max={A_q0.max():.6f}, mean={A_q0.mean():.8f}")
 
-    answer_to_image = []
-    for i, l in enumerate(layers):
-        # aggregate heads: [H, 576] → [576]
-        attn_q = a2i_q[i].mean(dim=0)    # [576]
-
-        if use_relative:
-            attn_q0  = a2i_q0[i].mean(dim=0)          # [576]
-            attn_map = attn_q / (attn_q0 + 1e-8)      # [576] relative attention
-        else:
-            attn_map = attn_q                           # [576] raw attention
-
-        print(f"[DEBUG] Layer {l}: max={attn_map.max():.4f}, mean={attn_map.mean():.6f}")
-        answer_to_image.append(attn_map)
+        patch_scores = A_q / (A_q0 + 1e-8)
+        print(f"[DEBUG] relative max={patch_scores.max():.4f}, mean={patch_scores.mean():.6f}")
+    else:
+        patch_scores = A_q
 
     return {
-        "answer_to_image" : answer_to_image,
-        "layers"          : layers,
-        "answer_token"    : answer_token,
-        "use_relative"    : use_relative,
+        "patch_scores"  : patch_scores,
+        "answer_token"  : answer_token,
+        "use_relative"  : use_relative,
+        "grid_size"     : grid_size,
     }
 
 
@@ -158,7 +174,7 @@ def visualize_attention(
     save_path: str | None = None,
 ):
     """
-    Visualize answer-token→image attention maps overlaid on the original image.
+    Visualize answer-token→image attention map overlaid on the original image.
 
     Args:
         image       : original PIL.Image
@@ -166,40 +182,35 @@ def visualize_attention(
         alpha       : heatmap overlay transparency
         save_path   : optional path to save the figure
     """
-    layers          = attn_result["layers"]
-    answer_to_image = attn_result["answer_to_image"]  # list of [576]
-    answer_token    = attn_result.get("answer_token", "?")
-    use_relative    = attn_result.get("use_relative", False)
+    patch_scores = attn_result["patch_scores"]   # [N_img]
+    answer_token = attn_result.get("answer_token", "?")
+    use_relative = attn_result.get("use_relative", False)
+    grid_size    = attn_result.get("grid_size", 24)
 
-    fig, axes = plt.subplots(1, len(layers), figsize=(5 * len(layers), 5))
-    if len(layers) == 1:
-        axes = [axes]
+    # reshape to spatial grid
+    attn_map = patch_scores[:grid_size * grid_size].reshape(grid_size, grid_size).numpy()
 
-    for ax, layer_idx, attn_map in zip(axes, layers, answer_to_image):
-        # attn_map: [576] already head-aggregated
+    # normalize to [0, 1]
+    vmin, vmax = attn_map.min(), attn_map.max()
+    attn_map = (attn_map - vmin) / (vmax - vmin + 1e-8)
 
-        # reshape to 24x24
-        heat = attn_map.reshape(24, 24).numpy()
+    # resize to original image size
+    heatmap = Image.fromarray((attn_map * 255).astype(np.uint8)).resize(
+        image.size, resample=Image.BILINEAR
+    )
+    heatmap = np.array(heatmap)
 
-        # normalize to [0, 1]
-        vmin, vmax = heat.min(), heat.max()
-        heat = (heat - vmin) / (vmax - vmin + 1e-8)
-
-        # resize to original image size
-        heatmap = Image.fromarray((heat * 255).astype(np.uint8)).resize(
-            image.size, resample=Image.BILINEAR
-        )
-
-        # overlay
-        ax.imshow(image)
-        ax.imshow(np.array(heatmap), cmap="jet", alpha=alpha)
-        ax.set_title(f"Layer {layer_idx}", fontsize=12)
-        ax.axis("off")
+    # plot
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.imshow(image)
+    ax.imshow(heatmap, cmap="jet", alpha=alpha)
+    ax.axis("off")
 
     mode = "relative" if use_relative else "raw"
     plt.suptitle(
-        f"Answer-to-Image Attention  |  answer='{answer_token}'  [{mode}]",
-        fontsize=12, y=1.02,
+        f"Answer-to-Image Attention  |  answer='{answer_token}'  layers={mode}\n"
+        f"target_layers=(6,13,20,27)  averaged",
+        fontsize=11, y=1.02,
     )
     plt.tight_layout()
 
