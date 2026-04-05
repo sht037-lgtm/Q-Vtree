@@ -125,12 +125,14 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     )
                 # starting answer token = last token in sequence
                 ans_pos = inputs_embeds_in.shape[1] - 1
-                # average over all layers and heads: [N]
+                # average over 4 evenly-spaced layers: [6, 13, 20, 27]
+                target_layers = [6, 13, 20, 27]
                 scores = []
-                for layer_attn in out.attentions:
+                for i, layer_attn in enumerate(out.attentions):
+                    if i not in target_layers:
+                        continue
                     ld = layer_attn.device
                     vp = vis_positions.to(ld)
-                    # [heads, N]
                     s = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
                     scores.append(s)
                 return torch.stack(scores).mean(dim=0)  # [N]
@@ -192,7 +194,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             A_generic = get_attn_scores(generic_embeds, generic_attn_mask, generic_pos_ids)
 
             # relative attention: element-wise division
-            patch_scores_global = A_q
+            patch_scores_global = A_q / (A_generic + 1e-8)
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
