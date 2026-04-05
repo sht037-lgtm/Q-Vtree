@@ -13,6 +13,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
         self.qvtree = QVTree(D=config.text_config.hidden_size)
 
+        # pre-encode generic description for relative attention
+        # hardcoded token ids for "Write a general description of the image."
+        # using qwen2.5 tokenizer token ids
+        self._generic_token_ids = None  # will be lazily initialized in forward
+
         # debug states
         self._debug_selected_idx = None
         self._debug_patch_ids = None
@@ -99,97 +104,96 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     mm_token_type_ids=mm_token_type_ids,
                 )
 
-            # 4. First forward: hook layer 34 to get Q, K + RoPE
+            # 4. Relative attention scoring (ViCrop style)
+            # Two forward passes: question-specific and generic description
+            # Use starting answer token (last token) attention to image tokens
             image_token_id = 151655
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
+
+            def get_attn_scores(inputs_embeds_in, attention_mask_in, position_ids_in):
+                with torch.no_grad():
+                    out = self.language_model(
+                        input_ids=None,
+                        inputs_embeds=inputs_embeds_in,
+                        attention_mask=attention_mask_in,
+                        position_ids=position_ids_in,
+                        output_attentions=True,
+                        output_hidden_states=False,
+                        return_dict=True,
+                        use_cache=False,
+                    )
+                # starting answer token = last token in sequence
+                ans_pos = inputs_embeds_in.shape[1] - 1
+                # average over all layers and heads: [N]
+                scores = []
+                for layer_attn in out.attentions:
+                    ld = layer_attn.device
+                    vp = vis_positions.to(ld)
+                    # [heads, N]
+                    s = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
+                    scores.append(s)
+                return torch.stack(scores).mean(dim=0)  # [N]
+
+            # First pass: question-specific attention
+            A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids)
+
+            # Second pass: generic description attention
+            # Build generic inputs_embeds by replacing question tokens with generic description
+            # Use the processor to build generic input_ids
+            generic_text = "Write a general description of the image."
+            # locate img_end to replace question tokens
             img_end = vis_positions[-1].item()
-            que_positions = torch.arange(img_end + 1, input_ids.shape[1])
 
-            layer_capture = {}
+            # encode generic text (lazy init using language model's tokenizer vocab)
+            if self._generic_token_ids is None:
+                from transformers import AutoTokenizer
+                _tok = AutoTokenizer.from_pretrained(self.config._name_or_path)
+                _generic_text = "Write a general description of the image."
+                self._generic_token_ids = _tok(
+                    _generic_text, return_tensors="pt", add_special_tokens=False
+                ).input_ids
+            generic_ids = self._generic_token_ids.to(input_ids.device)
 
-            def make_hook(idx):
-                def hook(module, args, kwargs, output):
-                    hidden = kwargs.get('hidden_states', None)
-                    if hidden is None and len(args) > 0:
-                        hidden = args[0]
-                    pos_emb = kwargs.get('position_embeddings', None)
-                    with torch.no_grad():
-                        q = module.q_proj(hidden)
-                        k = module.k_proj(hidden)
-                    layer_capture[idx] = {
-                        'q': q.detach(),
-                        'k': k.detach(),
-                        'pos_emb': pos_emb,
-                    }
-                    return output
-                return hook
+            # build new input_ids: keep prefix+image, replace question with generic
+            prefix_ids = input_ids[:, :img_end + 1]
+            # get suffix (assistant start tokens) from original
+            # find where question ends and assistant starts
+            # heuristic: keep last 3 tokens (im_end + im_start + assistant)
+            suffix_ids = input_ids[:, -3:]
+            new_input_ids = torch.cat([prefix_ids, generic_ids, suffix_ids], dim=1)
 
-            hook_handle = self.language_model.layers[34].self_attn.register_forward_hook(
-                make_hook(34), with_kwargs=True
+            # rebuild inputs_embeds for generic
+            generic_embeds = self.get_input_embeddings()(new_input_ids)
+            image_mask_generic, _ = self.get_placeholder_mask(
+                new_input_ids,
+                inputs_embeds=generic_embeds,
+                image_features=image_embeds_full,
+            )
+            generic_embeds = generic_embeds.masked_scatter(image_mask_generic, image_embeds_full)
+            generic_embeds = torch.nan_to_num(generic_embeds)
+
+            # build attention mask and position_ids for generic
+            generic_attn_mask = torch.ones(
+                1, new_input_ids.shape[1],
+                dtype=attention_mask.dtype,
+                device=attention_mask.device
+            )
+            generic_pos_ids = self.compute_3d_position_ids(
+                input_ids=new_input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                inputs_embeds=generic_embeds,
+                attention_mask=generic_attn_mask,
+                past_key_values=None,
+                mm_token_type_ids=mm_token_type_ids,
             )
 
-            with torch.no_grad():
-                self.language_model(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds_full,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True,
-                    use_cache=False,
-                )
+            A_generic = get_attn_scores(generic_embeds, generic_attn_mask, generic_pos_ids)
 
-            hook_handle.remove()
-
-            # compute raw QK with RoPE
-            captured = layer_capture[34]
-            q = captured['q']
-            k = captured['k']
-            pos_emb = captured['pos_emb']
-
-            attn_module = self.language_model.layers[34].self_attn
-            num_heads = attn_module.num_heads
-            num_kv_heads = attn_module.num_key_value_heads
-            head_dim = q.shape[-1] // num_heads
-
-            q = q.view(q.shape[0], q.shape[1], num_heads, head_dim).transpose(1, 2)
-            k = k.view(k.shape[0], k.shape[1], num_kv_heads, head_dim).transpose(1, 2)
-
-            # apply RoPE
-            if pos_emb is not None:
-                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
-                cos, sin = pos_emb
-                mrope_section = (
-                    self.config.text_config.rope_scaling.get("mrope_section", None)
-                    if hasattr(self.config.text_config, 'rope_scaling') else None
-                )
-                q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section)
-
-            # GQA: repeat k
-            if num_heads != num_kv_heads:
-                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-
-            ld = q.device
-            vp = vis_positions.to(ld)
-            qp = que_positions.to(ld)
-
-            q_que = q[0, :, qp, :]   # [heads, Lq, head_dim]
-            k_vis = k[0, :, vp, :]   # [heads, N,  head_dim]
-
-            # raw QK with RoPE: [heads, Lq, N]
-            A_raw = torch.einsum('hqd,hnd->hqn', q_que, k_vis) / (head_dim ** 0.5)
-            A_tv = A_raw.mean(dim=0).cpu()   # [Lq, N]
-            A_tv = torch.nan_to_num(A_tv)
-
-            # rater selection
-            r = A_tv.mean(dim=1)
-            rater_mask = r >= r.mean()
-            if not rater_mask.any():
-                rater_mask = torch.ones_like(rater_mask, dtype=torch.bool)
-
-            patch_scores_global = A_tv[rater_mask].mean(dim=0)
+            # relative attention: element-wise division
+            patch_scores_global = A_q / (A_generic + 1e-8)
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
