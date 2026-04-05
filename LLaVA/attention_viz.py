@@ -52,7 +52,7 @@ def get_attention_maps(
     num_image_tokens = 576  # 24x24 from CLIP ViT-L/14@336
 
     if layers is None:
-        layers = [15, 23, 31]
+        layers = [0,15, 23, 31]
 
     # generate only 1 token (the first answer token)
     # output_attentions=True returns attentions for the generated token
