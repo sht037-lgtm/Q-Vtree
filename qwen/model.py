@@ -199,6 +199,25 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
+            # Gaussian smoothing: reshape to 2D spatial grid, smooth, reshape back
+            # sigma and ks control spread; ks must be odd (1,3,5,7,...)
+            grid_t0, grid_h0_raw, grid_w0_raw = image_grid_thw[0].tolist()
+            grid_h0 = grid_h0_raw // 2
+            grid_w0 = grid_w0_raw // 2
+            if patch_scores_global.shape[0] == grid_h0 * grid_w0:
+                import torch.nn.functional as F
+                sigma, ks = 1.0, 3  # tune: larger sigma/ks = more spread
+                ax = torch.arange(ks, dtype=torch.float32) - ks // 2
+                gauss_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+                gauss_1d = gauss_1d / gauss_1d.sum()
+                kernel = (gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)).view(1, 1, ks, ks)
+                score_map = patch_scores_global.float().view(1, 1, grid_h0, grid_w0)
+                score_map = F.conv2d(score_map, kernel, padding=ks // 2)
+                patch_scores_global = score_map.view(-1)
+                s_min = patch_scores_global.min()
+                s_max = patch_scores_global.max()
+                patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
+
             self._debug_patch_scores = [patch_scores_global]
 
             selected_idx_per_image = []
