@@ -183,20 +183,14 @@ def visualize_attention(
     # reshape to spatial grid
     attn_map = patch_scores[:grid_size * grid_size].reshape(grid_size, grid_size).numpy()
 
-    # apply 3x3 gaussian blur to smooth sparse hotspots
-    from scipy.ndimage import gaussian_filter
-    attn_map = gaussian_filter(attn_map, sigma=1.0)
-
     # normalize to [0, 1]
     vmin, vmax = attn_map.min(), attn_map.max()
     attn_map = (attn_map - vmin) / (vmax - vmin + 1e-8)
 
     # resize to original image size
-    # step 1: resize to 336x336 (CLIP's square resolution) to preserve spatial alignment
-    # step 2: resize to original image size (which may be non-square)
-    heatmap = Image.fromarray((attn_map * 255).astype(np.uint8))
-    heatmap = heatmap.resize((336, 336), resample=Image.BILINEAR)
-    heatmap = heatmap.resize(image.size, resample=Image.BILINEAR)
+    heatmap = Image.fromarray((attn_map * 255).astype(np.uint8)).resize(
+        image.size, resample=Image.BILINEAR
+    )
     heatmap = np.array(heatmap)
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
