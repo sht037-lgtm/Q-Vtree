@@ -209,7 +209,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 score_map = patch_scores_global.view(1, 1, grid_h0, grid_w0).float()
                 # Gaussian kernel: sigma=1.0, kernel_size=3
                 sigma = 0.5
-                ks = 2
+                ks = 3
                 ax = torch.arange(ks, dtype=torch.float32) - ks // 2
                 gauss_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
                 gauss_1d = gauss_1d / gauss_1d.sum()
