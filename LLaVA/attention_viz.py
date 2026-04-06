@@ -192,9 +192,11 @@ def visualize_attention(
     attn_map = (attn_map - vmin) / (vmax - vmin + 1e-8)
 
     # resize to original image size
-    heatmap = Image.fromarray((attn_map * 255).astype(np.uint8)).resize(
-        image.size, resample=Image.BILINEAR
-    )
+    # step 1: resize to 336x336 (CLIP's square resolution) to preserve spatial alignment
+    # step 2: resize to original image size (which may be non-square)
+    heatmap = Image.fromarray((attn_map * 255).astype(np.uint8))
+    heatmap = heatmap.resize((336, 336), resample=Image.BILINEAR)
+    heatmap = heatmap.resize(image.size, resample=Image.BILINEAR)
     heatmap = np.array(heatmap)
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
