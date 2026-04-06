@@ -40,7 +40,7 @@ def _get_answer_attention(
 
     # generate answer token for display only (not used in attention)
     with torch.inference_mode():
-        gen_out = model.generate(**inputs, max_new_tokens=1, do_sample=False)
+        gen_out = model.generate(**inputs, max_new_tokens=128, do_sample=False)
     answer_token = processor.batch_decode(
         gen_out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
     )[0].strip()
