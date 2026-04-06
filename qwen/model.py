@@ -111,16 +111,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             is_image = (input_ids[0] == image_token_id)
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
 
-            def get_attn_scores(inputs_embeds_in, attention_mask_in, position_ids_in, text_positions_in):
-                """
-                Extract attention from all text token positions to image patches at layer 15,
-                then average across text tokens and heads.
-
-                Args:
-                    text_positions_in: 1D LongTensor of text token positions in the sequence
-                Returns:
-                    patch_scores: [N_img] tensor
-                """
+            def get_attn_scores(inputs_embeds_in, attention_mask_in, position_ids_in):
                 with torch.no_grad():
                     out = self.language_model(
                         input_ids=None,
@@ -132,39 +123,29 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         return_dict=True,
                         use_cache=False,
                     )
-                target_layer = 15
-                layer_attn = out.attentions[target_layer]  # [1, H, seq_len, seq_len]
-                ld = layer_attn.device
-                vp = vis_positions.to(ld)
-                tp = text_positions_in.to(ld)
+                # starting answer token = last token in sequence
+                ans_pos = inputs_embeds_in.shape[1] - 1
+                # average over 4 evenly-spaced layers: [15]
+                target_layers = [15]
+                scores = []
+                for i, layer_attn in enumerate(out.attentions):
+                    if i not in target_layers:
+                        continue
+                    ld = layer_attn.device
+                    vp = vis_positions.to(ld)
+                    s = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
+                    scores.append(s)
+                return torch.stack(scores).mean(dim=0)  # [N]
 
-                # attn_to_img: [H, num_text_tokens, N_img]
-                attn_to_img = layer_attn[0, :, :, vp]     # [H, seq_len, N_img]
-                attn_to_img = attn_to_img[:, tp, :]        # [H, num_text_tokens, N_img]
-
-                # average over heads and text tokens -> [N_img]
-                patch_scores = attn_to_img.mean(dim=0).mean(dim=0).cpu().float()
-                return patch_scores
-
-            # locate question text token positions
-            # text tokens = all tokens after image tokens and before the last 3 suffix tokens
-            img_end = vis_positions[-1].item()
-            seq_len = input_ids.shape[1]
-            # question text tokens: positions after image end, before suffix (last 3 tokens)
-            text_start = img_end + 1
-            text_end = seq_len - 3  # exclude im_end + im_start + assistant
-            if text_end > text_start:
-                text_positions = torch.arange(text_start, text_end, dtype=torch.long)
-            else:
-                # fallback: use last token if no text tokens found
-                text_positions = torch.tensor([seq_len - 1], dtype=torch.long)
-
-            # First pass: question-specific attention (all question text tokens)
-            A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids, text_positions)
+            # First pass: question-specific attention
+            A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids)
 
             # Second pass: generic description attention
             # Build generic inputs_embeds by replacing question tokens with generic description
+            # Use the processor to build generic input_ids
             generic_text = "Write a general description of the image."
+            # locate img_end to replace question tokens
+            img_end = vis_positions[-1].item()
 
             # encode generic text (lazy init using language model's tokenizer vocab)
             if self._generic_token_ids is None:
@@ -210,22 +191,37 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 past_key_values=None,
             )
 
-            # for generic pass, text positions are the same offset from img_end
-            # generic sequence: prefix_ids (img_end+1 tokens) + generic_ids + suffix_ids
-            generic_text_start = img_end + 1
-            generic_text_end = generic_ids.shape[1] + img_end + 1
-            if generic_text_end > generic_text_start:
-                generic_text_positions = torch.arange(generic_text_start, generic_text_end, dtype=torch.long)
-            else:
-                generic_text_positions = torch.tensor([new_input_ids.shape[1] - 1], dtype=torch.long)
-
-            A_generic = get_attn_scores(generic_embeds, generic_attn_mask, generic_pos_ids, generic_text_positions)
+            A_generic = get_attn_scores(generic_embeds, generic_attn_mask, generic_pos_ids)
 
             # relative attention: element-wise division
             patch_scores_global = A_q / (A_generic + 1e-8)
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
+
+            # Gaussian smoothing on the 2D patch score map to fill sparse attention gaps
+            # reshape to spatial grid for the first image (assumes single image per forward)
+            grid_t0, grid_h0_raw, grid_w0_raw = image_grid_thw[0].tolist()
+            grid_h0 = grid_h0_raw // 2
+            grid_w0 = grid_w0_raw // 2
+            if grid_h0 * grid_w0 == patch_scores_global.shape[0]:
+                import torch.nn.functional as F
+                score_map = patch_scores_global.view(1, 1, grid_h0, grid_w0).float()
+                # Gaussian kernel: sigma=1.0, kernel_size=3
+                # increase sigma (e.g. 2.0) or ks (e.g. 5) for more smoothing
+                sigma = 1.0
+                ks = 3
+                ax = torch.arange(ks, dtype=torch.float32) - ks // 2
+                gauss_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+                gauss_1d = gauss_1d / gauss_1d.sum()
+                gauss_2d = gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)  # [ks, ks]
+                kernel = gauss_2d.view(1, 1, ks, ks).to(score_map.device)
+                score_map = F.conv2d(score_map, kernel, padding=ks // 2)
+                patch_scores_global = score_map.view(-1)
+                # re-normalize after smoothing
+                s_min = patch_scores_global.min()
+                s_max = patch_scores_global.max()
+                patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
             self._debug_patch_scores = [patch_scores_global]
 
