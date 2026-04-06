@@ -125,8 +125,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     )
                 # starting answer token = last token in sequence
                 ans_pos = inputs_embeds_in.shape[1] - 1
-                # average over 4 evenly-spaced layers: [15]
-                target_layers = [15]
+                # average over 4 evenly-spaced layers: [6, 13, 20, 27]
+                target_layers = [6, 13, 20, 27]
                 scores = []
                 for i, layer_attn in enumerate(out.attentions):
                     if i not in target_layers:
@@ -198,29 +198,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             s_min = patch_scores_global.min()
             s_max = patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
-
-            # Gaussian smoothing on the 2D patch score map to fill sparse attention gaps
-            # reshape to spatial grid for the first image (assumes single image per forward)
-            grid_t0, grid_h0_raw, grid_w0_raw = image_grid_thw[0].tolist()
-            grid_h0 = grid_h0_raw // 2
-            grid_w0 = grid_w0_raw // 2
-            if grid_h0 * grid_w0 == patch_scores_global.shape[0]:
-                import torch.nn.functional as F
-                score_map = patch_scores_global.view(1, 1, grid_h0, grid_w0).float()
-                # Gaussian kernel: sigma=1.0, kernel_size=3
-                sigma = 0.5
-                ks = 3
-                ax = torch.arange(ks, dtype=torch.float32) - ks // 2
-                gauss_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
-                gauss_1d = gauss_1d / gauss_1d.sum()
-                gauss_2d = gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)  # [ks, ks]
-                kernel = gauss_2d.view(1, 1, ks, ks).to(score_map.device)
-                score_map = F.conv2d(score_map, kernel, padding=ks // 2)
-                patch_scores_global = score_map.view(-1)
-                # re-normalize after smoothing
-                s_min = patch_scores_global.min()
-                s_max = patch_scores_global.max()
-                patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
             self._debug_patch_scores = [patch_scores_global]
 
