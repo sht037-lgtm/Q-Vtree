@@ -126,7 +126,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 # starting answer token = last token in sequence
                 ans_pos = inputs_embeds_in.shape[1] - 1
                 # average over 4 evenly-spaced layers: [6, 13, 20, 27]
-                target_layers = [6, 13, 20, 27]
+                target_layers = [15]
                 scores = []
                 for i, layer_attn in enumerate(out.attentions):
                     if i not in target_layers:
