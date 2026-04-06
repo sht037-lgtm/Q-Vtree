@@ -183,6 +183,10 @@ def visualize_attention(
     # reshape to spatial grid
     attn_map = patch_scores[:grid_size * grid_size].reshape(grid_size, grid_size).numpy()
 
+    # apply gaussian blur to smooth sparse hotspots (before normalization)
+    from scipy.ndimage import gaussian_filter
+    attn_map = gaussian_filter(attn_map, sigma=1.0)
+
     # normalize to [0, 1]
     vmin, vmax = attn_map.min(), attn_map.max()
     attn_map = (attn_map - vmin) / (vmax - vmin + 1e-8)
