@@ -30,13 +30,22 @@ def download_hf_model(
     print(f"[INFO] Download complete: {local_dir}")
     return local_dir
 
-def download_qwen():
 
+def download_qwen():
     model_path = download_hf_model(
         repo_id="Qwen/Qwen2.5-VL-3B-Instruct",
     )
-
     print("Model path:", model_path)
+    return model_path
+
+
+def download_internvl3():
+    model_path = download_hf_model(
+        repo_id="OpenGVLab/InternVL3-8B",
+    )
+    print("Model path:", model_path)
+    return model_path
+
 
 if __name__ == '__main__':
-    download_qwen()
+    download_internvl3()
