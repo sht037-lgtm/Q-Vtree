@@ -125,7 +125,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     )
                 # starting answer token = last token in sequence
                 ans_pos = inputs_embeds_in.shape[1] - 1
-                # filter heads by attention sum within each of the 4 target layers
+                # average over 4 evenly-spaced layers: [6, 13, 20, 27]
                 target_layers = [6, 13, 20, 27]
                 scores = []
                 for i, layer_attn in enumerate(out.attentions):
@@ -133,16 +133,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         continue
                     ld = layer_attn.device
                     vp = vis_positions.to(ld)
-                    # attn_to_img: [num_heads, N_img]
-                    attn_to_img = layer_attn[0, :, ans_pos, vp].float()
-                    # attention sum per head: [num_heads]
-                    s_img = attn_to_img.sum(dim=1)
-                    # keep heads with S_img >= mean
-                    keep_mask = s_img >= s_img.mean()
-                    if keep_mask.sum() == 0:
-                        keep_mask = torch.ones_like(keep_mask, dtype=torch.bool)
-                    # average over kept heads -> [N_img]
-                    s = attn_to_img[keep_mask].mean(dim=0).cpu()
+                    s = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
                     scores.append(s)
                 return torch.stack(scores).mean(dim=0)  # [N]
 
