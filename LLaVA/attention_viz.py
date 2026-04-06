@@ -45,38 +45,28 @@ def _get_answer_attention(
         return_tensors="pt",
     ).to(device)
 
-    # step 1: generate first answer token
-    with torch.inference_mode():
-        gen_out = model.generate(**inputs, max_new_tokens=1, do_sample=False)
+    # use last input token directly (no generate needed)
+    full_input_ids = inputs["input_ids"]   # [1, N]
 
-    answer_token_id = gen_out[:, inputs["input_ids"].shape[1]:]   # [1, 1]
-    answer_token = processor.batch_decode(
-        answer_token_id, skip_special_tokens=True
-    )[0].strip()
-
-    # step 2: append answer token → length N+1
-    full_input_ids = torch.cat(
-        [inputs["input_ids"], answer_token_id], dim=1
-    )   # [1, N+1]
-
-    # step 3: precisely locate image token positions
-    # LLaVA uses token id 32000 as the <image> placeholder
+    # precisely locate image token positions
     image_token_id = 32000
     is_image = (full_input_ids[0] == image_token_id)
     image_positions = is_image.nonzero(as_tuple=True)[0]   # [N_img]
 
     if image_positions.numel() == 0:
-        # fallback: assume first 576 tokens are image tokens
         image_positions = torch.arange(576, device=device)
 
-    # answer token is always the last position
+    # last input token (the ':' after ASSISTANT)
     ans_pos = full_input_ids.shape[1] - 1
+    last_token = processor.tokenizer.decode(
+        [full_input_ids[0, ans_pos].item()]
+    ).strip()
 
-    print(f"[DEBUG] answer token = '{answer_token}'")
+    print(f"[DEBUG] last input token = '{last_token}'")
     print(f"[DEBUG] seq_len = {full_input_ids.shape[1]}, ans_pos = {ans_pos}")
     print(f"[DEBUG] num image tokens = {image_positions.numel()}")
 
-    # step 4: full forward pass
+    # full forward pass
     with torch.inference_mode():
         full_outputs = model(
             input_ids=full_input_ids,
@@ -98,7 +88,7 @@ def _get_answer_attention(
 
     patch_scores = torch.stack(layer_scores).mean(dim=0)   # [N_img]
 
-    return patch_scores, answer_token, image_positions.cpu()
+    return patch_scores, last_token, image_positions.cpu()
 
 
 # =========================================================
