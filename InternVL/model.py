@@ -170,7 +170,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 return_dict=True,
                 use_cache=False,
             )
-        ans_pos = input_embeds.shape[1] - 1
+        ans_pos = input_embeds.shape[1] - 2
         scores_list = []
         for i in [6, 13, 20, 27]:
             layer_attn = out.attentions[i]
