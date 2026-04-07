@@ -239,7 +239,8 @@ class InternVLChatModelWithTree(PreTrainedModel):
         new_B, new_N, _ = generic_embeds.shape
         generic_embeds_flat = generic_embeds.reshape(new_B * new_N, D)
         new_selected_flat = new_selected.reshape(new_B * new_N)
-        generic_embeds_flat[new_selected_flat] = vit_embeds.reshape(-1, D).to(dtype)
+        generic_embeds_flat[new_selected_flat] = vit_embeds.reshape(-1, D).to(device=generic_embeds_flat.device,
+                                                                              dtype=dtype)
         generic_embeds = generic_embeds_flat.reshape(new_B, new_N, D)
         generic_embeds = torch.nan_to_num(generic_embeds)
 
