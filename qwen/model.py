@@ -665,6 +665,14 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # =============================
         # LLM
         # =============================
+        # Recompute cache_position to match the actual inputs_embeds sequence length.
+        # After LPD the sequence may be shorter than the original, so the
+        # cache_position passed in by generate() would be stale.
+        seq_len = inputs_embeds.shape[1]
+        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(past_len, past_len + seq_len,
+                                      device=inputs_embeds.device)
+
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
