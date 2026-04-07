@@ -1,7 +1,14 @@
-import torch
+import math
+import warnings
 from typing import List, Optional, Tuple, Union
 
-from transformers import GenerationConfig
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
+from PIL import Image
+
+from transformers import AutoTokenizer, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .modeling_internvl_chat import InternVLChatModel
@@ -10,6 +17,98 @@ from .conversation import get_conv_template
 from module import QVTree
 
 
+# =========================================================
+# Image loading utilities
+# =========================================================
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+
+def build_transform(input_size=448):
+    return T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+
+def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=True):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1)
+        for i in range(1, n + 1)
+        for j in range(1, n + 1)
+        if min_num <= i * j <= max_num
+    )
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    best_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size
+    )
+
+    target_width  = image_size * best_ratio[0]
+    target_height = image_size * best_ratio[1]
+    blocks = best_ratio[0] * best_ratio[1]
+
+    resized = image.resize((target_width, target_height))
+    tiles = []
+    for i in range(blocks):
+        col = i % best_ratio[0]
+        row = i // best_ratio[0]
+        box = (
+            col * image_size,
+            row * image_size,
+            (col + 1) * image_size,
+            (row + 1) * image_size,
+        )
+        tiles.append(resized.crop(box))
+
+    if use_thumbnail and len(tiles) != 1:
+        tiles.append(image.resize((image_size, image_size)))
+
+    return tiles, best_ratio
+
+
+def load_image(image_path, input_size=448, max_num=6):
+    """
+    Load an image with dynamic tiling.
+
+    Returns:
+        pixel_values : [num_tiles, 3, H, W]  (last tile is thumbnail)
+        best_ratio   : (ratio_w, ratio_h)
+    """
+    image = Image.open(image_path).convert('RGB')
+    transform = build_transform(input_size)
+    tiles, best_ratio = dynamic_preprocess(
+        image, min_num=1, max_num=max_num,
+        image_size=input_size, use_thumbnail=True,
+    )
+    pixel_values = torch.stack([transform(t) for t in tiles])
+    return pixel_values, best_ratio
+
+
+# =========================================================
+# Model
+# =========================================================
 class InternVLChatModelWithTree(InternVLChatModel):
 
     def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None, use_flash_attn=True):
@@ -18,40 +117,58 @@ class InternVLChatModelWithTree(InternVLChatModel):
         llm_hidden_size = config.llm_config.hidden_size
         self.qvtree = QVTree(D=llm_hidden_size)
 
-        # cache generic token ids (lazy init)
         self._generic_token_ids = None
 
         # debug states
-        self._debug_selected_idx = None
-        self._debug_patch_ids = None
+        self._debug_selected_idx        = None
+        self._debug_patch_ids           = None
         self._debug_num_selected_tokens = None
-        self._debug_num_total_tokens = None
-        self._debug_select_ratios = None
-        self._debug_patch_scores = None
+        self._debug_num_total_tokens    = None
+        self._debug_select_ratios       = None
+        self._debug_patch_scores        = None
+        self._debug_best_ratio          = None
 
     # ------------------------------------------------------------------
-    # Internal helper: run one LLM forward and extract attention scores
-    # from the last token (answer start) to all image token positions.
+    # extract_feature with grid shape
+    # ------------------------------------------------------------------
+    def extract_feature_with_grid(self, pixel_values):
+        """
+        Returns:
+            vit_embeds      : [B_tiles, N_per_tile, D]
+            grid_h, grid_w  : int  (per-tile spatial grid after pixel_shuffle)
+        """
+        if self.select_layer == -1:
+            raw = self.vision_model(
+                pixel_values=pixel_values,
+                output_hidden_states=False,
+                return_dict=True,
+            ).last_hidden_state
+        else:
+            raw = self.vision_model(
+                pixel_values=pixel_values,
+                output_hidden_states=True,
+                return_dict=True,
+            ).hidden_states[self.select_layer]
+
+        raw    = raw[:, 1:, :]                          # drop CLS token
+        h = w  = int(raw.shape[1] ** 0.5)
+        x      = raw.reshape(raw.shape[0], h, w, -1)
+        x      = self.pixel_shuffle(x, scale_factor=self.downsample_ratio)
+        grid_h = x.shape[1]
+        grid_w = x.shape[2]
+        x      = x.reshape(x.shape[0], -1, x.shape[-1])
+        x      = self.mlp1(x)
+        return x, grid_h, grid_w
+
+    # ------------------------------------------------------------------
+    # LLM attention scorer
     # ------------------------------------------------------------------
     def _get_attn_scores(
         self,
-        input_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
-        img_positions: torch.Tensor,
-        target_layer: int = 27,
-    ) -> torch.Tensor:
-        """
-        Run a no-grad LLM forward and return per-patch attention scores.
-
-        Args:
-            input_embeds  : [1, L, D]
-            attention_mask: [1, L]
-            img_positions : 1-D tensor of image token indices in the sequence
-            target_layer  : which decoder layer to read attention from
-
-        Returns:
-            scores: [N_img]  (float32, CPU)
-        """
+        input_embeds: torch.Tensor,    # [1, L, D]
+        attention_mask: torch.Tensor,  # [1, L]
+        img_positions: torch.Tensor,   # [N_img]  cpu indices
+    ) -> torch.Tensor:                 # [N_img]  cpu float32
         with torch.no_grad():
             out = self.language_model(
                 inputs_embeds=input_embeds,
@@ -61,56 +178,133 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 return_dict=True,
                 use_cache=False,
             )
-
-        # last token attends to image positions
-        ans_pos = input_embeds.shape[1] - 1
-        layer_attn = out.attentions[target_layer]          # [1, heads, L, L]
-        ld = layer_attn.device
-        vp = img_positions.to(ld)
-        scores = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()  # [N_img]
+        ans_pos    = input_embeds.shape[1] - 1
+        layer_attn = out.attentions[-1]                         # [1, heads, L, L]
+        vp         = img_positions.to(layer_attn.device)
+        scores     = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
         return scores
 
     # ------------------------------------------------------------------
-    # Override extract_feature to also return grid shape (H, W)
+    # Global scoring → per-tile QVTree → modulated embeddings
     # ------------------------------------------------------------------
-    def extract_feature_with_grid(self, pixel_values):
-        """
-        Same as extract_feature but also returns (H, W) of the patch grid
-        after pixel_shuffle downsampling.
+    def _score_and_modulate(
+        self,
+        vit_embeds: torch.Tensor,          # [B_tiles, N_per_tile, D]
+        input_embeds_full: torch.Tensor,   # [1, L, D]
+        attention_mask: torch.Tensor,      # [1, L]
+        input_ids: torch.Tensor,           # [1, L]
+        grid_h: int,
+        grid_w: int,
+        best_ratio: Tuple[int, int],       # (ratio_w, ratio_h)
+    ) -> torch.Tensor:                     # [B_tiles * N_per_tile, D]
+        B_tiles, N_per_tile, D = vit_embeds.shape
+        device = vit_embeds.device
+        dtype  = vit_embeds.dtype
 
-        Returns:
-            vit_embeds : [B, N_down, D]   (after mlp1)
-            grid_h     : int
-            grid_w     : int
-        """
-        if self.select_layer == -1:
-            vit_embeds_raw = self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=False,
-                return_dict=True,
-            ).last_hidden_state
-        else:
-            vit_embeds_raw = self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=True,
-                return_dict=True,
-            ).hidden_states[self.select_layer]
+        # init debug
+        self._debug_patch_ids           = []
+        self._debug_num_selected_tokens = []
+        self._debug_num_total_tokens    = []
+        self._debug_select_ratios       = []
+        self._debug_best_ratio          = best_ratio
 
-        vit_embeds_raw = vit_embeds_raw[:, 1:, :]  # drop CLS token
+        # vis token positions
+        ids_flat      = input_ids.reshape(-1)
+        sel_mask      = (ids_flat == self.img_context_token_id)
+        vis_positions = sel_mask.nonzero(as_tuple=True)[0].cpu()
 
-        h_raw = w_raw = int(vit_embeds_raw.shape[1] ** 0.5)
-        vit_embeds_2d = vit_embeds_raw.reshape(vit_embeds_raw.shape[0], h_raw, w_raw, -1)
-        vit_embeds_2d = self.pixel_shuffle(vit_embeds_2d, scale_factor=self.downsample_ratio)
+        # ---- question-specific pass ----
+        A_q = self._get_attn_scores(input_embeds_full, attention_mask, vis_positions)
 
-        grid_h = vit_embeds_2d.shape[1]
-        grid_w = vit_embeds_2d.shape[2]
+        # ---- generic description pass ----
+        if self._generic_token_ids is None:
+            _tok = AutoTokenizer.from_pretrained(
+                self.config._name_or_path, trust_remote_code=True
+            )
+            self._generic_token_ids = _tok(
+                "Write a general description of the image.",
+                return_tensors="pt", add_special_tokens=False,
+            ).input_ids
 
-        vit_embeds = vit_embeds_2d.reshape(vit_embeds_2d.shape[0], -1, vit_embeds_2d.shape[-1])
-        vit_embeds = self.mlp1(vit_embeds)
-        return vit_embeds, grid_h, grid_w
+        generic_ids = self._generic_token_ids.to(input_ids.device)
+        img_end     = vis_positions[-1].item()
+        new_ids     = torch.cat([input_ids[:, :img_end + 1], generic_ids, input_ids[:, -3:]], dim=1)
+
+        gen_emb         = self.language_model.get_input_embeddings()(new_ids)
+        gflat           = gen_emb.reshape(-1, D)
+        gen_sel         = (new_ids.reshape(-1) == self.img_context_token_id)
+        gflat[gen_sel]  = vit_embeds.reshape(-1, D).to(device=gflat.device, dtype=gflat.dtype)
+        gen_emb         = torch.nan_to_num(gflat.reshape(1, -1, D))
+        gen_mask        = torch.ones(1, new_ids.shape[1], dtype=attention_mask.dtype, device=device)
+
+        A_generic = self._get_attn_scores(gen_emb, gen_mask, vis_positions)
+
+        # ---- relative scores → global normalize ----
+        scores_all = A_q / (A_generic + 1e-8)
+        scores_all = (scores_all - scores_all.min()) / (scores_all.max() - scores_all.min() + 1e-6)
+
+        # scores_all: [B_tiles * N_per_tile]
+        # reshape to [B_tiles, grid_h, grid_w] for per-tile Gaussian smoothing
+        scores_per_tile = scores_all.view(B_tiles, grid_h, grid_w)
+
+        sigma, ks = 1.0, 3
+        ax     = torch.arange(ks, dtype=torch.float32) - ks // 2
+        g1d    = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+        g1d    = g1d / g1d.sum()
+        kernel = (g1d.unsqueeze(1) * g1d.unsqueeze(0)).view(1, 1, ks, ks)
+
+        smoothed = []
+        for i in range(B_tiles):
+            sm = F.conv2d(scores_per_tile[i].float().view(1, 1, grid_h, grid_w), kernel, padding=ks // 2)
+            sm = sm.view(-1)
+            sm = (sm - sm.min()) / (sm.max() - sm.min() + 1e-6)
+            smoothed.append(sm)
+
+        self._debug_patch_scores = smoothed
+
+        # ---- QVTree navigation + alpha-beta masking ----
+        alpha, beta           = 5.0, 0.5
+        selected_idx_per_tile = []
+        new_embeds_list       = []
+
+        for i in range(B_tiles):
+            tokens = vit_embeds[i]
+            x      = tokens.unsqueeze(0)
+
+            patch_scores = smoothed[i].unsqueeze(0).to(device=device, dtype=dtype)
+
+            built = self.qvtree.builder.build(x, grid_h, grid_w)
+            nodes = built["nodes"]
+
+            sel_nodes_list, _ = self.qvtree.navigator.select_nodes(
+                nodes=nodes, patch_scores=patch_scores, W=grid_w,
+            )
+            selected_idx_per_tile.append(sel_nodes_list[0])
+
+            token_out = self.qvtree.navigator.nodes_to_tokens(
+                nodes, H=grid_h, W=grid_w,
+                selected_node_ids=sel_nodes_list, x=x,
+            )
+            patch_ids = token_out["selected_token_indices"][0]
+
+            if patch_ids.numel() == 0:
+                patch_ids = torch.arange(tokens.size(0), device=device)
+            patch_ids = torch.unique(patch_ids.clamp(0, tokens.size(0) - 1))
+
+            self._debug_patch_ids.append(patch_ids)
+            self._debug_num_selected_tokens.append(int(patch_ids.numel()))
+            self._debug_num_total_tokens.append(int(tokens.size(0)))
+            self._debug_select_ratios.append(patch_ids.numel() / tokens.size(0))
+
+            keep = torch.full((tokens.size(0),), beta, device=device, dtype=dtype)
+            keep[patch_ids] = alpha
+            new_embeds_list.append(torch.nan_to_num(tokens * keep.unsqueeze(-1)))
+
+        self._debug_selected_idx = selected_idx_per_tile
+        return torch.cat(new_embeds_list, dim=0)  # [B_tiles * N_per_tile, D]
 
     # ------------------------------------------------------------------
-    # Override generate — this is where token selection happens
+    # Override generate
     # ------------------------------------------------------------------
     @torch.no_grad()
     def generate(
@@ -121,221 +315,62 @@ class InternVLChatModelWithTree(InternVLChatModel):
             visual_features: Optional[torch.FloatTensor] = None,
             generation_config: Optional[GenerationConfig] = None,
             output_hidden_states: Optional[bool] = None,
+            best_ratio: Optional[Tuple[int, int]] = None,
             **generate_kwargs,
     ) -> torch.LongTensor:
 
         assert self.img_context_token_id is not None
 
         if pixel_values is not None:
-
-            # ===================================================
-            # 1. Extract vision features + grid shape
-            # ===================================================
             if visual_features is not None:
-                # visual_features provided externally: no grid info, fall back to base
                 return super().generate(
-                    pixel_values=None,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    visual_features=visual_features,
+                    pixel_values=None, input_ids=input_ids,
+                    attention_mask=attention_mask, visual_features=visual_features,
                     generation_config=generation_config,
-                    output_hidden_states=output_hidden_states,
-                    **generate_kwargs,
+                    output_hidden_states=output_hidden_states, **generate_kwargs,
                 )
 
-            # vit_embeds: [B_img, N_down, D]
+            # 1. ViT features
             vit_embeds, grid_h, grid_w = self.extract_feature_with_grid(pixel_values)
+            B_tiles = vit_embeds.shape[0]
+            D       = vit_embeds.shape[2]
 
-            # init debug containers
-            self._debug_patch_ids = []
-            self._debug_num_selected_tokens = []
-            self._debug_num_total_tokens = []
-            self._debug_select_ratios = []
+            # infer best_ratio if not provided
+            if best_ratio is None:
+                n  = B_tiles - 1  # exclude thumbnail
+                sq = int(math.isqrt(n))
+                best_ratio = (sq, sq) if sq * sq == n else (n, 1)
 
-            # ===================================================
-            # 2. Build full input_embeds (all image tokens placed)
-            # ===================================================
-            input_embeds = self.language_model.get_input_embeddings()(input_ids)
-            B, N, C = input_embeds.shape
-            input_embeds_flat = input_embeds.reshape(B * N, C)
-            input_ids_flat = input_ids.reshape(B * N)
+            # 2. Build full input_embeds
+            emb      = self.language_model.get_input_embeddings()(input_ids)
+            B, N, C  = emb.shape
+            flat     = emb.reshape(B * N, C)
+            ids_flat = input_ids.reshape(B * N)
+            sel      = (ids_flat == self.img_context_token_id)
+            flat[sel] = vit_embeds.reshape(-1, C).to(flat.device)
+            input_embeds_full = torch.nan_to_num(flat.reshape(B, N, C))
 
-            selected_mask = (input_ids_flat == self.img_context_token_id)
-            input_embeds_flat[selected_mask] = vit_embeds.reshape(-1, C).to(input_embeds_flat.device)
-            input_embeds_full = input_embeds_flat.reshape(B, N, C)
-            input_embeds_full = torch.nan_to_num(input_embeds_full)
-
-            # ===================================================
-            # 3. Relative attention scoring (ViCrop style)
-            # All tiles are concatenated → one global attention pass
-            # ===================================================
-            vis_positions = selected_mask.nonzero(as_tuple=True)[0].cpu()  # all img token positions
-
-            # --- Question-specific pass ---
-            A_q = self._get_attn_scores(input_embeds_full, attention_mask, vis_positions)
-
-            # --- Generic description pass ---
-            if self._generic_token_ids is None:
-                from transformers import AutoTokenizer
-                _tok = AutoTokenizer.from_pretrained(self.config._name_or_path)
-                generic_text = "Write a general description of the image."
-                self._generic_token_ids = _tok(
-                    generic_text, return_tensors="pt", add_special_tokens=False
-                ).input_ids
-
-            generic_ids = self._generic_token_ids.to(input_ids.device)
-
-            img_end = vis_positions[-1].item()
-            prefix_ids = input_ids[:, :img_end + 1]
-            suffix_ids = input_ids[:, -3:]
-            new_input_ids = torch.cat([prefix_ids, generic_ids, suffix_ids], dim=1)
-
-            generic_embeds = self.language_model.get_input_embeddings()(new_input_ids)
-            gB, gN, gC = generic_embeds.shape
-            generic_embeds_flat = generic_embeds.reshape(gB * gN, gC)
-            new_input_ids_flat = new_input_ids.reshape(gB * gN)
-            gen_selected = (new_input_ids_flat == self.img_context_token_id)
-            generic_embeds_flat[gen_selected] = vit_embeds.reshape(-1, gC).to(
-                device=generic_embeds_flat.device, dtype=generic_embeds_flat.dtype
-            )
-            generic_embeds = generic_embeds_flat.reshape(gB, gN, gC)
-            generic_embeds = torch.nan_to_num(generic_embeds)
-
-            generic_attn_mask = torch.ones(
-                1, new_input_ids.shape[1],
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
+            # 3. Score + modulate
+            new_vit = self._score_and_modulate(
+                vit_embeds=vit_embeds,
+                input_embeds_full=input_embeds_full,
+                attention_mask=attention_mask,
+                input_ids=input_ids,
+                grid_h=grid_h,
+                grid_w=grid_w,
+                best_ratio=best_ratio,
             )
 
-            A_generic = self._get_attn_scores(generic_embeds, generic_attn_mask, vis_positions)
-
-            # Relative score + global normalize
-            # A_q and A_generic have length = num_tiles * N_per_tile
-            patch_scores_all = A_q / (A_generic + 1e-8)
-            s_min = patch_scores_all.min()
-            s_max = patch_scores_all.max()
-            patch_scores_all = (patch_scores_all - s_min) / (s_max - s_min + 1e-6)
-
-            # Gaussian smoothing per tile
-            import torch.nn.functional as F
-            B_img = vit_embeds.shape[0]
-            N_per_tile = grid_h * grid_w
-            sigma, ks = 1.0, 3
-            ax = torch.arange(ks, dtype=torch.float32) - ks // 2
-            gauss_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
-            gauss_1d = gauss_1d / gauss_1d.sum()
-            kernel = (gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)).view(1, 1, ks, ks)
-
-            # patch_scores_all: [B_img * N_per_tile] → smooth each tile independently
-            patch_scores_per_tile = patch_scores_all.view(B_img, N_per_tile)  # [B_img, N_per_tile]
-            smoothed_tiles = []
-            for i in range(B_img):
-                score_map = patch_scores_per_tile[i].float().view(1, 1, grid_h, grid_w)
-                score_map = F.conv2d(score_map, kernel, padding=ks // 2)
-                score_tile = score_map.view(-1)
-                s_min_t = score_tile.min()
-                s_max_t = score_tile.max()
-                score_tile = (score_tile - s_min_t) / (s_max_t - s_min_t + 1e-6)
-                smoothed_tiles.append(score_tile)
-
-            self._debug_patch_scores = smoothed_tiles
-
-            # ===================================================
-            # 4. QuadTree navigation — one pass per tile,
-            #    using that tile's own smoothed score slice
-            # ===================================================
-            selected_idx_per_image = []
-            new_vit_embeds_list = []
-
-            for i in range(B_img):
-                tokens = vit_embeds[i]      # [N_per_tile, D]
-                x = tokens.unsqueeze(0)     # [1, N_per_tile, D]
-
-                if N_per_tile != tokens.size(0):
-                    raise ValueError(
-                        f"Grid mismatch at tile {i}: grid_h={grid_h}, grid_w={grid_w}, "
-                        f"H*W={N_per_tile}, tokens={tokens.size(0)}"
-                    )
-
-                # use this tile's smoothed scores
-                patch_scores = smoothed_tiles[i].unsqueeze(0).to(
-                    tokens.device, tokens.dtype
-                )  # [1, N_per_tile]
-
-                built = self.qvtree.builder.build(x, grid_h, grid_w)
-                nodes = built["nodes"]
-
-                sel_nodes_list, _ = self.qvtree.navigator.select_nodes(
-                    nodes=nodes,
-                    patch_scores=patch_scores,
-                    W=grid_w,
-                )
-                selected_idx_per_image.append(sel_nodes_list[0])
-
-                token_out = self.qvtree.navigator.nodes_to_tokens(
-                    nodes,
-                    H=grid_h,
-                    W=grid_w,
-                    selected_node_ids=sel_nodes_list,
-                    x=x,
-                )
-
-                patch_ids = token_out["selected_token_indices"][0]
-
-                # Fallback: empty selection → keep all
-                if patch_ids.numel() == 0:
-                    patch_ids = torch.arange(tokens.size(0), device=tokens.device)
-
-                patch_ids = patch_ids.clamp(min=0, max=tokens.size(0) - 1)
-                patch_ids = torch.unique(patch_ids)
-
-                # Debug
-                self._debug_patch_ids.append(patch_ids)
-                num_selected = int(patch_ids.numel())
-                num_total = int(tokens.size(0))
-                self._debug_num_selected_tokens.append(num_selected)
-                self._debug_num_total_tokens.append(num_total)
-                self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
-
-                # ===================================================
-                # 5. Alpha-beta soft masking
-                # ===================================================
-                alpha = 5.0
-                beta  = 0.5
-
-                keep = torch.full(
-                    (tokens.size(0),), beta,
-                    device=tokens.device, dtype=tokens.dtype,
-                )
-                keep[patch_ids] = alpha
-
-                tokens_modulated = tokens * keep.unsqueeze(-1)
-                tokens_modulated = torch.nan_to_num(tokens_modulated)
-                new_vit_embeds_list.append(tokens_modulated)
-
-            self._debug_selected_idx = selected_idx_per_image
-
-            # ===================================================
-            # 6. Place modulated tokens back into input_embeds
-            # ===================================================
-            new_vit_embeds = torch.cat(new_vit_embeds_list, dim=0)  # [sum_tiles * N_down, D] after reshape
-
-            input_embeds2 = self.language_model.get_input_embeddings()(input_ids)
-            B2, N2, C2 = input_embeds2.shape
-            input_embeds2_flat = input_embeds2.reshape(B2 * N2, C2)
-            input_ids_flat2 = input_ids.reshape(B2 * N2)
-            selected2 = (input_ids_flat2 == self.img_context_token_id)
-            input_embeds2_flat[selected2] = new_vit_embeds.reshape(-1, C2).to(input_embeds2_flat.device)
-            input_embeds_final = input_embeds2_flat.reshape(B2, N2, C2)
-            input_embeds_final = torch.nan_to_num(input_embeds_final)
+            # 4. Place modulated tokens back
+            flat2      = emb.reshape(B * N, C).clone()
+            flat2[sel] = new_vit.reshape(-1, C).to(flat2.device)
+            input_embeds_final = torch.nan_to_num(flat2.reshape(B, N, C))
 
         else:
             input_embeds_final = self.language_model.get_input_embeddings()(input_ids)
 
-        # ===================================================
-        # 7. LLM generate
-        # ===================================================
-        outputs = self.language_model.generate(
+        # 5. LLM generate
+        return self.language_model.generate(
             inputs_embeds=input_embeds_final,
             attention_mask=attention_mask,
             generation_config=generation_config,
@@ -344,4 +379,108 @@ class InternVLChatModelWithTree(InternVLChatModel):
             **generate_kwargs,
         )
 
-        return outputs
+    # ------------------------------------------------------------------
+    # Convenience inference entry point
+    # ------------------------------------------------------------------
+    def infer(
+        self,
+        tokenizer,
+        image_path: str,
+        question: str,
+        max_new_tokens: int = 256,
+        do_sample: bool = False,
+        input_size: int = 448,
+        max_num: int = 6,
+        IMG_START_TOKEN: str = '<img>',
+        IMG_END_TOKEN: str = '</img>',
+        IMG_CONTEXT_TOKEN: str = '<IMG_CONTEXT>',
+    ) -> str:
+        """Single-image inference. Returns response string."""
+        pixel_values, best_ratio = load_image(image_path, input_size=input_size, max_num=max_num)
+        pixel_values = pixel_values.to(dtype=next(self.parameters()).dtype,
+                                       device=next(self.parameters()).device)
+
+        img_context_token_id     = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self.img_context_token_id = img_context_token_id
+
+        num_patches = pixel_values.shape[0]
+
+        template = get_conv_template(self.template)
+        template.system_message = self.system_message
+        template.append_message(template.roles[0], '<image>\n' + question)
+        template.append_message(template.roles[1], None)
+        query = template.get_prompt()
+
+        image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+        query = query.replace('<image>', image_tokens, 1)
+
+        model_inputs   = tokenizer(query, return_tensors='pt')
+        input_ids      = model_inputs['input_ids'].to(next(self.parameters()).device)
+        attention_mask = model_inputs['attention_mask'].to(next(self.parameters()).device)
+        eos_token_id   = tokenizer.convert_tokens_to_ids(template.sep.strip())
+
+        outputs = self.generate(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            best_ratio=best_ratio,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            eos_token_id=eos_token_id,
+        )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        response = response.split(template.sep.strip())[0].strip()
+        return response
+
+    # ------------------------------------------------------------------
+    # Visualisation
+    # ------------------------------------------------------------------
+    def visualize_patches(self, image_path: str, patch_size: int = 14, save: bool = True):
+        """Draw selected patches (red overlay). Call after infer()."""
+        import matplotlib.pyplot as plt
+        from PIL import Image, ImageDraw
+
+        if self._debug_patch_ids is None or self._debug_best_ratio is None:
+            print("No debug info available. Run infer() first.")
+            return
+
+        ratio_w, ratio_h = self._debug_best_ratio
+        num_main = ratio_w * ratio_h
+        grid_hw  = int(self.num_image_token ** 0.5)
+        tile_px  = grid_hw * patch_size
+        full_w   = ratio_w * tile_px
+        full_h   = ratio_h * tile_px
+
+        img     = Image.open(image_path).convert("RGB").resize((full_w, full_h))
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+
+        for tile_idx in range(num_main):
+            patch_ids = self._debug_patch_ids[tile_idx]
+            tile_col  = tile_idx % ratio_w
+            tile_row  = tile_idx // ratio_w
+            ox        = tile_col * tile_px
+            oy        = tile_row * tile_px
+            for idx in patch_ids.tolist():
+                r  = idx // grid_hw
+                c  = idx % grid_hw
+                x0 = ox + c * patch_size
+                y0 = oy + r * patch_size
+                x1 = ox + (c + 1) * patch_size
+                y1 = oy + (r + 1) * patch_size
+                draw.rectangle([x0, y0, x1, y1], fill=(255, 0, 0, 80), outline=(255, 0, 0, 255))
+
+        out = Image.alpha_composite(img.convert("RGBA"), overlay)
+
+        avg_ratio = sum(self._debug_select_ratios[:num_main]) / num_main
+        fig, axes = plt.subplots(1, 2, figsize=(14, 7 * full_h / full_w))
+        axes[0].imshow(img);  axes[0].axis('off');  axes[0].set_title('Original')
+        axes[1].imshow(out);  axes[1].axis('off')
+        axes[1].set_title(f"Selected patches  ratio={self._debug_best_ratio}  avg={avg_ratio:.1%}")
+        plt.tight_layout()
+        if save:
+            out_path = f"{image_path}_selected.png"
+            plt.savefig(out_path, dpi=150, bbox_inches='tight')
+            print(f"Saved to {out_path}")
+        plt.show()
