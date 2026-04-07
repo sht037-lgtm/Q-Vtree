@@ -127,6 +127,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_select_ratios       = None
         self._debug_patch_scores        = None
         self._debug_best_ratio          = None
+        self._debug_full_score_map      = None  # [ratio_h*grid_h, ratio_w*grid_w]
 
     # ------------------------------------------------------------------
     # extract_feature with grid shape
@@ -185,7 +186,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
         return scores
 
     # ------------------------------------------------------------------
-    # Global scoring → per-tile QVTree → modulated embeddings
+    # Global scoring → stitch tiles → smooth → per-tile QVTree → modulate
     # ------------------------------------------------------------------
     def _score_and_modulate(
         self,
@@ -198,6 +199,9 @@ class InternVLChatModelWithTree(InternVLChatModel):
         best_ratio: Tuple[int, int],       # (ratio_w, ratio_h)
     ) -> torch.Tensor:                     # [B_tiles * N_per_tile, D]
         B_tiles, N_per_tile, D = vit_embeds.shape
+        ratio_w, ratio_h       = best_ratio
+        num_content_tiles      = ratio_w * ratio_h
+        has_thumbnail          = B_tiles > num_content_tiles
         device = vit_embeds.device
         dtype  = vit_embeds.dtype
 
@@ -208,15 +212,13 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_select_ratios       = []
         self._debug_best_ratio          = best_ratio
 
-        # vis token positions
+        # ---- relative attention scoring ----
         ids_flat      = input_ids.reshape(-1)
         sel_mask      = (ids_flat == self.img_context_token_id)
         vis_positions = sel_mask.nonzero(as_tuple=True)[0].cpu()
 
-        # ---- question-specific pass ----
         A_q = self._get_attn_scores(input_embeds_full, attention_mask, vis_positions)
 
-        # ---- generic description pass ----
         if self._generic_token_ids is None:
             _tok = AutoTokenizer.from_pretrained(
                 self.config._name_or_path, trust_remote_code=True
@@ -230,35 +232,61 @@ class InternVLChatModelWithTree(InternVLChatModel):
         img_end     = vis_positions[-1].item()
         new_ids     = torch.cat([input_ids[:, :img_end + 1], generic_ids, input_ids[:, -3:]], dim=1)
 
-        gen_emb         = self.language_model.get_input_embeddings()(new_ids)
-        gflat           = gen_emb.reshape(-1, D)
-        gen_sel         = (new_ids.reshape(-1) == self.img_context_token_id)
-        gflat[gen_sel]  = vit_embeds.reshape(-1, D).to(device=gflat.device, dtype=gflat.dtype)
-        gen_emb         = torch.nan_to_num(gflat.reshape(1, -1, D))
-        gen_mask        = torch.ones(1, new_ids.shape[1], dtype=attention_mask.dtype, device=device)
+        gen_emb        = self.language_model.get_input_embeddings()(new_ids)
+        gflat          = gen_emb.reshape(-1, D)
+        gen_sel        = (new_ids.reshape(-1) == self.img_context_token_id)
+        gflat[gen_sel] = vit_embeds.reshape(-1, D).to(device=gflat.device, dtype=gflat.dtype)
+        gen_emb        = torch.nan_to_num(gflat.reshape(1, -1, D))
+        gen_mask       = torch.ones(1, new_ids.shape[1], dtype=attention_mask.dtype, device=device)
 
         A_generic = self._get_attn_scores(gen_emb, gen_mask, vis_positions)
 
-        # ---- relative scores → global normalize ----
+        # global relative scores: [B_tiles * N_per_tile]
         scores_all = A_q / (A_generic + 1e-8)
         scores_all = (scores_all - scores_all.min()) / (scores_all.max() - scores_all.min() + 1e-6)
 
-        # scores_all: [B_tiles * N_per_tile]
-        # reshape to [B_tiles, grid_h, grid_w] for per-tile Gaussian smoothing
-        scores_per_tile = scores_all.view(B_tiles, grid_h, grid_w)
+        # ---- stitch content tiles into full spatial map ----
+        # scores_all: [B_tiles * N_per_tile] → [B_tiles, grid_h, grid_w]
+        scores_tiled = scores_all.view(B_tiles, grid_h, grid_w)
 
+        # stitch: [ratio_h*grid_h, ratio_w*grid_w]
+        rows = []
+        for row in range(ratio_h):
+            cols = [scores_tiled[row * ratio_w + col] for col in range(ratio_w)]
+            rows.append(torch.cat(cols, dim=1))
+        full_map = torch.cat(rows, dim=0).float()  # [ratio_h*grid_h, ratio_w*grid_w]
+
+        # ---- 2-D Gaussian smoothing on full map ----
         sigma, ks = 1.0, 3
         ax     = torch.arange(ks, dtype=torch.float32) - ks // 2
         g1d    = torch.exp(-ax ** 2 / (2 * sigma ** 2))
         g1d    = g1d / g1d.sum()
         kernel = (g1d.unsqueeze(1) * g1d.unsqueeze(0)).view(1, 1, ks, ks)
 
+        full_map_smooth = F.conv2d(
+            full_map.unsqueeze(0).unsqueeze(0), kernel, padding=ks // 2
+        ).squeeze()
+        full_map_smooth = (full_map_smooth - full_map_smooth.min()) / \
+                          (full_map_smooth.max() - full_map_smooth.min() + 1e-6)
+
+        self._debug_full_score_map = full_map_smooth  # store for visualization
+
+        # ---- slice back per content tile ----
         smoothed = []
-        for i in range(B_tiles):
-            sm = F.conv2d(scores_per_tile[i].float().view(1, 1, grid_h, grid_w), kernel, padding=ks // 2)
-            sm = sm.view(-1)
-            sm = (sm - sm.min()) / (sm.max() - sm.min() + 1e-6)
-            smoothed.append(sm)
+        for row in range(ratio_h):
+            for col in range(ratio_w):
+                tile_score = full_map_smooth[
+                    row * grid_h: (row + 1) * grid_h,
+                    col * grid_w: (col + 1) * grid_w,
+                ].reshape(-1)
+                smoothed.append(tile_score)
+
+        # thumbnail: smooth independently (not part of spatial layout)
+        if has_thumbnail:
+            thumb = scores_tiled[-1].float().unsqueeze(0).unsqueeze(0)
+            thumb = F.conv2d(thumb, kernel, padding=ks // 2).view(-1)
+            thumb = (thumb - thumb.min()) / (thumb.max() - thumb.min() + 1e-6)
+            smoothed.append(thumb)
 
         self._debug_patch_scores = smoothed
 
@@ -400,7 +428,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
         pixel_values = pixel_values.to(dtype=next(self.parameters()).dtype,
                                        device=next(self.parameters()).device)
 
-        img_context_token_id     = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        img_context_token_id      = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_context_token_id = img_context_token_id
 
         num_patches = pixel_values.shape[0]
@@ -432,55 +460,3 @@ class InternVLChatModelWithTree(InternVLChatModel):
         response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
         response = response.split(template.sep.strip())[0].strip()
         return response
-
-    # ------------------------------------------------------------------
-    # Visualisation
-    # ------------------------------------------------------------------
-    def visualize_patches(self, image_path: str, patch_size: int = 14, save: bool = True):
-        """Draw selected patches (red overlay). Call after infer()."""
-        import matplotlib.pyplot as plt
-        from PIL import Image, ImageDraw
-
-        if self._debug_patch_ids is None or self._debug_best_ratio is None:
-            print("No debug info available. Run infer() first.")
-            return
-
-        ratio_w, ratio_h = self._debug_best_ratio
-        num_main = ratio_w * ratio_h
-        grid_hw  = int(self.num_image_token ** 0.5)
-        tile_px  = grid_hw * patch_size
-        full_w   = ratio_w * tile_px
-        full_h   = ratio_h * tile_px
-
-        img     = Image.open(image_path).convert("RGB").resize((full_w, full_h))
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw    = ImageDraw.Draw(overlay)
-
-        for tile_idx in range(num_main):
-            patch_ids = self._debug_patch_ids[tile_idx]
-            tile_col  = tile_idx % ratio_w
-            tile_row  = tile_idx // ratio_w
-            ox        = tile_col * tile_px
-            oy        = tile_row * tile_px
-            for idx in patch_ids.tolist():
-                r  = idx // grid_hw
-                c  = idx % grid_hw
-                x0 = ox + c * patch_size
-                y0 = oy + r * patch_size
-                x1 = ox + (c + 1) * patch_size
-                y1 = oy + (r + 1) * patch_size
-                draw.rectangle([x0, y0, x1, y1], fill=(255, 0, 0, 80), outline=(255, 0, 0, 255))
-
-        out = Image.alpha_composite(img.convert("RGBA"), overlay)
-
-        avg_ratio = sum(self._debug_select_ratios[:num_main]) / num_main
-        fig, axes = plt.subplots(1, 2, figsize=(14, 7 * full_h / full_w))
-        axes[0].imshow(img);  axes[0].axis('off');  axes[0].set_title('Original')
-        axes[1].imshow(out);  axes[1].axis('off')
-        axes[1].set_title(f"Selected patches  ratio={self._debug_best_ratio}  avg={avg_ratio:.1%}")
-        plt.tight_layout()
-        if save:
-            out_path = f"{image_path}_selected.png"
-            plt.savefig(out_path, dpi=150, bbox_inches='tight')
-            print(f"Saved to {out_path}")
-        plt.show()
