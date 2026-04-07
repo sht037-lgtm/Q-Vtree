@@ -340,7 +340,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
 
             # infer best_ratio if not provided
             if best_ratio is None:
-                n = B_tiles - 1  # exclude thumbnail
+                n = B_tiles
                 sq = int(math.isqrt(n))
                 best_ratio = (sq, sq) if sq * sq == n else (n, 1)
 
