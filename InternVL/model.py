@@ -16,7 +16,7 @@ from transformers.utils import ModelOutput, logging
 from .configuration_internvl_chat import InternVLChatConfig
 from .conversation import get_conv_template
 from .modeling_intern_vit import InternVisionModel, has_flash_attn
-from ..module import QVTree
+from module import QVTree
 
 logger = logging.get_logger(__name__)
 
