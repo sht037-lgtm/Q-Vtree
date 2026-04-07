@@ -192,7 +192,7 @@ def run_vstar_inference(
                         category_select_ratios[cat].append(sample_select_ratio)
 
                 pred_text = processor.batch_decode(
-                    outputs[:, inputs["input_ids"].shape[1]:],
+                    outputs[:, -max_new_tokens:],
                     skip_special_tokens=True,
                 )[0].strip()
 
@@ -392,7 +392,7 @@ def run_hrbench_inference(
                         cycle_category_select_ratios[cyc].append(sample_select_ratio)
 
                 pred_text = processor.batch_decode(
-                    outputs[:, inputs["input_ids"].shape[1]:],
+                    outputs[:, -max_new_tokens:],
                     skip_special_tokens=True,
                 )[0].strip()
 
