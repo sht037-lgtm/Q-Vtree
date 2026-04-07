@@ -376,6 +376,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             # =============================
             new_pixel_values_list = []  # compact pixel_values to re-encode
             new_grid_thw_list = []      # updated grid_thw after re-encoding
+            selected_idx_per_image = []
 
             for i, tokens in enumerate(image_tokens_list):
                 # infer downsampled grid
@@ -408,6 +409,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     W=grid_w,
                 )
                 sel_nodes = sel_nodes_list[0]
+                selected_idx_per_image.append(sel_nodes)
 
                 token_out = self.qvtree.navigator.nodes_to_tokens(
                     nodes,
@@ -428,6 +430,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # debug store
                 self._debug_patch_ids.append(patch_ids)
+                self._debug_selected_idx = selected_idx_per_image  # update every iteration
 
                 num_selected = int(patch_ids.numel())
                 num_total = int(tokens.size(0))
@@ -540,6 +543,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                                  dtype=image_grid_thw.dtype,
                                  device=image_grid_thw.device)
                 )
+
+            # save selected nodes debug
+            self._debug_selected_idx = selected_idx_per_image
 
             # ── Re-encode all compact images through vision encoder ──────────
             compact_pixel_values = torch.cat(new_pixel_values_list, dim=0)
