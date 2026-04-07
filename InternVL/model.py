@@ -9,9 +9,9 @@ from PIL import Image
 
 from transformers import AutoTokenizer, GenerationConfig
 
-from src.modeling_internvl_chat import InternVLChatModel
-from src.configuration_internvl_chat import InternVLChatConfig
-from src.conversation import get_conv_template
+from .src.modeling_internvl_chat import InternVLChatModel
+from .src.configuration_internvl_chat import InternVLChatConfig
+from .src.conversation import get_conv_template
 from module import QVTree
 
 
