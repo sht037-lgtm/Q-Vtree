@@ -461,13 +461,16 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     image_grid_thw[k][1].item() * image_grid_thw[k][2].item()
                     for k in range(i)
                 )
-                # shape: [n_patches_raw, C, 14, 14]
+                # pixel_values shape: [total_patches, 1176] where 1176 = C*14*14 (flattened)
                 img_patches = pixel_values[
                     patch_offset_raw: patch_offset_raw + n_patches_raw
-                ]  # [H_raw*W_raw, C, 14, 14]
+                ]  # [H_raw*W_raw, C*14*14]
+
+                C = 3
+                # unflatten: [H_raw*W_raw, C, 14, 14]
+                img_patches = img_patches.view(n_patches_raw, C, 14, 14)
 
                 # reshape to image: [C, H_raw*14, W_raw*14]
-                C = img_patches.shape[1]
                 img_tensor = img_patches.view(
                     grid_h_raw, grid_w_raw, C, 14, 14
                 ).permute(2, 0, 3, 1, 4).reshape(C, grid_h_raw * 14, grid_w_raw * 14)
@@ -519,10 +522,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 nH = cH_pad // 14
                 nW = cW_pad // 14
-                # [nH*nW, C, 14, 14]
+                # [nH*nW, C*14*14] to match pixel_values format [N, 1176]
                 compact_patches = compact_tensor.reshape(
                     C, nH, 14, nW, 14
-                ).permute(1, 3, 0, 2, 4).reshape(nH * nW, C, 14, 14)
+                ).permute(1, 3, 0, 2, 4).reshape(nH * nW, C * 14 * 14)
 
                 new_pixel_values_list.append(compact_patches)
                 # grid_thw: (t=1, h=nH, w=nW)
