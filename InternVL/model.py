@@ -173,7 +173,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
         ans_pos = input_embeds.shape[1] - 2
         scores_list = []
         # choose transformer layers
-        for i in [20]:
+        for i in [6, 13, 20, 27]:
             layer_attn = out.attentions[i]
             vp = img_positions.to(layer_attn.device)
             scores_list.append(layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu())
