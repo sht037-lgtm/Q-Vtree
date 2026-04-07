@@ -521,7 +521,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             self._debug_selected_idx = selected_idx_per_image
 
             # ── Re-encode all compact images through vision encoder ──────────
-            print(f"[LPD] compact patches: {sum(p.shape[0] for p in new_pixel_values_list)}, original tokens: {sum(t.shape[0] for t in image_tokens_list)}")
+            compact_tokens = sum(
+                (p.shape[0] // 4)  # 2x2 merge
+                for p in new_pixel_values_list
+            )
+            print(f"[LPD] compact tokens (after merge): {compact_tokens}, original: {sum(t.shape[0] for t in image_tokens_list)}")
             compact_pixel_values = torch.cat(new_pixel_values_list, dim=0)
             compact_grid_thw = torch.stack(new_grid_thw_list, dim=0)
 
