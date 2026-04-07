@@ -98,7 +98,7 @@ def load_image(image_path, input_size=448, max_num=6):
     transform = build_transform(input_size)
     tiles, best_ratio = dynamic_preprocess(
         image, min_num=1, max_num=max_num,
-        image_size=input_size, use_thumbnail=True,
+        image_size=input_size, use_thumbnail=False,  # 改这里
     )
     pixel_values = torch.stack([transform(t) for t in tiles])
     return pixel_values, best_ratio
