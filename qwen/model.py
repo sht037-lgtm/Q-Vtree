@@ -430,7 +430,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 # debug store
                 self._debug_patch_ids.append(patch_ids)
-                self._debug_selected_idx = selected_idx_per_image  # update every iteration
+                self._debug_selected_idx = selected_idx_per_image  # updated each iteration
 
                 num_selected = int(patch_ids.numel())
                 num_total = int(tokens.size(0))
@@ -444,55 +444,33 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 patch_size = 28
                 image_w_px = grid_w * patch_size
                 image_h_px = grid_h * patch_size
+                C = 3
 
-                # reconstruct the image at the resolution the vision encoder saw
-                # pixel_values is a flat tensor of patches; recover via processor
-                # We use the stored pixel_values directly via Qwen's visual encoder
-                # by reconstructing a PIL image from the patch grid.
-                # The processor resizes to (grid_h_raw * 14, grid_w_raw * 14) before
-                # patch extraction, so we resize the original to match that, then
-                # downsample to (grid_h*28, grid_w*28) for LPD pixel operations.
-
-                # Extract the raw pixel patches for image i from pixel_values.
-                # pixel_values: [total_patches, C, 14, 14] (before merge)
-                # After 2x2 merge the vision encoder sees grid_h*grid_w patches.
-                # We reconstruct a (grid_h*28, grid_w*28) image from pixel_values.
-                n_patches_raw = grid_h_raw * grid_w_raw  # before merge
-                # offset into pixel_values for image i
+                # Reconstruct PIL image from pixel_values.
+                # pixel_values: [N, 1176] where 1176 = temporal(2)*C(3)*14*14
+                n_patches_raw = grid_h_raw * grid_w_raw
                 patch_offset_raw = sum(
                     image_grid_thw[k][1].item() * image_grid_thw[k][2].item()
                     for k in range(i)
                 )
-                # pixel_values shape: [total_patches, 1176]
-                # Qwen2.5-VL uses temporal_patch_size=2, so 1176 = 2*C*14*14
                 img_patches = pixel_values[
                     patch_offset_raw: patch_offset_raw + n_patches_raw
-                ]  # [H_raw*W_raw, 2*C*14*14]
+                ]  # [H_raw*W_raw, 1176]
 
-                temporal = 2
-                C = 3
-                # unflatten: [H_raw*W_raw, temporal, C, 14, 14]
-                img_patches = img_patches.view(n_patches_raw, temporal, C, 14, 14)
-                # use first temporal frame for PIL reconstruction
-                img_patches = img_patches[:, 0]  # [H_raw*W_raw, C, 14, 14]
+                # take first temporal frame: [H_raw*W_raw, C, 14, 14]
+                img_patches = img_patches.view(n_patches_raw, 2, C, 14, 14)[:, 0]
 
-                # reshape to image: [C, H_raw*14, W_raw*14]
+                # reshape to [C, H_raw*14, W_raw*14]
                 img_tensor = img_patches.reshape(
                     grid_h_raw, grid_w_raw, C, 14, 14
                 ).permute(2, 0, 3, 1, 4).reshape(C, grid_h_raw * 14, grid_w_raw * 14)
 
-                # denormalize (Qwen uses mean/std from SigLIP)
-                mean = torch.tensor([0.5, 0.5, 0.5],
-                                    device=img_tensor.device,
-                                    dtype=img_tensor.dtype).view(3, 1, 1)
-                std  = torch.tensor([0.5, 0.5, 0.5],
-                                    device=img_tensor.device,
-                                    dtype=img_tensor.dtype).view(3, 1, 1)
-                img_tensor = (img_tensor * std + mean).clamp(0, 1)
+                # SigLIP denormalize: mean=0.5, std=0.5
+                img_tensor = (img_tensor * 0.5 + 0.5).clamp(0, 1)
 
-                # to PIL at (grid_w_raw*14, grid_h_raw*14), then resize to (grid_w*28, grid_h*28)
+                # to PIL, resize to (grid_w*28, grid_h*28)
                 img_np = (img_tensor.cpu().float().numpy() * 255).astype(np.uint8)
-                img_np = np.transpose(img_np, (1, 2, 0))  # [H, W, C]
+                img_np = np.transpose(img_np, (1, 2, 0))
                 pil_img = Image.fromarray(img_np).resize(
                     (image_w_px, image_h_px), Image.BILINEAR
                 )
@@ -506,35 +484,30 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_compact_images.append(compact_img)
                 self._debug_bboxes.append(merged_bboxes)
 
-                # re-encode compact image via vision encoder
-                # normalize back to tensor for pixel_values format
+                # Re-normalize → pixel_values format [N, 2*C*14*14]
                 compact_np = np.array(compact_img).astype(np.float32) / 255.0
-                compact_np = np.transpose(compact_np, (2, 0, 1))  # [C, H, W]
-                compact_tensor = torch.tensor(compact_np,
-                                              device=pixel_values.device,
-                                              dtype=pixel_values.dtype)
-                compact_tensor = (compact_tensor - mean.squeeze(-1).squeeze(-1)[:, None, None]) \
-                                 / std.squeeze(-1).squeeze(-1)[:, None, None]
+                compact_tensor = torch.tensor(
+                    np.transpose(compact_np, (2, 0, 1)),
+                    device=pixel_values.device,
+                    dtype=pixel_values.dtype,
+                )
+                compact_tensor = (compact_tensor - 0.5) / 0.5  # SigLIP normalize
 
-                # split into 14×14 patches
-                cH, cW = compact_tensor.shape[1], compact_tensor.shape[2]
                 # pad to multiple of 14
+                cH, cW = compact_tensor.shape[1], compact_tensor.shape[2]
                 pH = (14 - cH % 14) % 14
                 pW = (14 - cW % 14) % 14
                 if pH > 0 or pW > 0:
                     compact_tensor = F.pad(compact_tensor, (0, pW, 0, pH))
-                cH_pad = compact_tensor.shape[1]
-                cW_pad = compact_tensor.shape[2]
 
-                nH = cH_pad // 14
-                nW = cW_pad // 14
-                # pixel_values format is [N, 2*C*14*14] with temporal_patch_size=2.
-                # We duplicate the frame along the temporal axis to match.
+                nH = compact_tensor.shape[1] // 14
+                nW = compact_tensor.shape[2] // 14
+                # [nH*nW, C*14*14] → duplicate temporal → [nH*nW, 2*C*14*14]
                 compact_patches_frame = compact_tensor.reshape(
                     C, nH, 14, nW, 14
                 ).permute(1, 3, 0, 2, 4).reshape(nH * nW, C * 14 * 14)
-                # duplicate temporal: [nH*nW, 2*C*14*14]
                 compact_patches = compact_patches_frame.repeat(1, 2)
+
 
                 new_pixel_values_list.append(compact_patches)
                 # grid_thw: (t=1, h=nH, w=nW)
@@ -548,6 +521,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             self._debug_selected_idx = selected_idx_per_image
 
             # ── Re-encode all compact images through vision encoder ──────────
+            print(f"[LPD] compact patches: {sum(p.shape[0] for p in new_pixel_values_list)}, original tokens: {sum(t.shape[0] for t in image_tokens_list)}")
             compact_pixel_values = torch.cat(new_pixel_values_list, dim=0)
             compact_grid_thw = torch.stack(new_grid_thw_list, dim=0)
 
@@ -674,6 +648,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         # Recompute cache_position to match the actual inputs_embeds sequence length.
         # After LPD the sequence may be shorter than the original, so the
         # cache_position passed in by generate() would be stale.
+        seq_len = inputs_embeds.shape[1]
+        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(past_len, past_len + seq_len,
+                                      device=inputs_embeds.device)
+
+        # Recompute cache_position to match actual sequence length after LPD
         seq_len = inputs_embeds.shape[1]
         past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
         cache_position = torch.arange(past_len, past_len + seq_len,
