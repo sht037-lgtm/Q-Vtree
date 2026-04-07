@@ -1,5 +1,4 @@
 import math
-import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -9,7 +8,6 @@ from torchvision.transforms.functional import InterpolationMode
 from PIL import Image
 
 from transformers import AutoTokenizer, GenerationConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .modeling_internvl_chat import InternVLChatModel
 from .configuration_internvl_chat import InternVLChatConfig
@@ -21,7 +19,7 @@ from module import QVTree
 # Image loading utilities
 # =========================================================
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def build_transform(input_size=448):
@@ -65,7 +63,7 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
         aspect_ratio, target_ratios, orig_width, orig_height, image_size
     )
 
-    target_width  = image_size * best_ratio[0]
+    target_width = image_size * best_ratio[0]
     target_height = image_size * best_ratio[1]
     blocks = best_ratio[0] * best_ratio[1]
 
@@ -114,20 +112,18 @@ class InternVLChatModelWithTree(InternVLChatModel):
     def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None, use_flash_attn=True):
         super().__init__(config, vision_model=vision_model, language_model=language_model, use_flash_attn=use_flash_attn)
 
-        llm_hidden_size = config.llm_config.hidden_size
-        self.qvtree = QVTree(D=llm_hidden_size)
-
+        self.qvtree = QVTree(D=config.llm_config.hidden_size)
         self._generic_token_ids = None
 
         # debug states
-        self._debug_selected_idx        = None
-        self._debug_patch_ids           = None
+        self._debug_selected_idx = None
+        self._debug_patch_ids = None
         self._debug_num_selected_tokens = None
-        self._debug_num_total_tokens    = None
-        self._debug_select_ratios       = None
-        self._debug_patch_scores        = None
-        self._debug_best_ratio          = None
-        self._debug_full_score_map      = None  # [ratio_h*grid_h, ratio_w*grid_w]
+        self._debug_num_total_tokens = None
+        self._debug_select_ratios = None
+        self._debug_patch_scores = None
+        self._debug_best_ratio = None
+        self._debug_full_score_map = None  # [ratio_h*grid_h, ratio_w*grid_w]
 
     # ------------------------------------------------------------------
     # extract_feature with grid shape
@@ -135,8 +131,8 @@ class InternVLChatModelWithTree(InternVLChatModel):
     def extract_feature_with_grid(self, pixel_values):
         """
         Returns:
-            vit_embeds      : [B_tiles, N_per_tile, D]
-            grid_h, grid_w  : int  (per-tile spatial grid after pixel_shuffle)
+            vit_embeds     : [B_tiles, N_per_tile, D]
+            grid_h, grid_w : int  (per-tile spatial grid after pixel_shuffle)
         """
         if self.select_layer == -1:
             raw = self.vision_model(
@@ -151,25 +147,20 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 return_dict=True,
             ).hidden_states[self.select_layer]
 
-        raw    = raw[:, 1:, :]                          # drop CLS token
-        h = w  = int(raw.shape[1] ** 0.5)
-        x      = raw.reshape(raw.shape[0], h, w, -1)
-        x      = self.pixel_shuffle(x, scale_factor=self.downsample_ratio)
+        raw = raw[:, 1:, :]  # drop CLS token
+        h = w = int(raw.shape[1] ** 0.5)
+        x = raw.reshape(raw.shape[0], h, w, -1)
+        x = self.pixel_shuffle(x, scale_factor=self.downsample_ratio)
         grid_h = x.shape[1]
         grid_w = x.shape[2]
-        x      = x.reshape(x.shape[0], -1, x.shape[-1])
-        x      = self.mlp1(x)
+        x = x.reshape(x.shape[0], -1, x.shape[-1])
+        x = self.mlp1(x)
         return x, grid_h, grid_w
 
     # ------------------------------------------------------------------
     # LLM attention scorer
     # ------------------------------------------------------------------
-    def _get_attn_scores(
-        self,
-        input_embeds: torch.Tensor,    # [1, L, D]
-        attention_mask: torch.Tensor,  # [1, L]
-        img_positions: torch.Tensor,   # [N_img]  cpu indices
-    ) -> torch.Tensor:                 # [N_img]  cpu float32
+    def _get_attn_scores(self, input_embeds, attention_mask, img_positions):
         with torch.no_grad():
             out = self.language_model(
                 inputs_embeds=input_embeds,
@@ -179,65 +170,56 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 return_dict=True,
                 use_cache=False,
             )
-        ans_pos    = input_embeds.shape[1] - 1
-        layer_attn = out.attentions[-1]                         # [1, heads, L, L]
-        vp         = img_positions.to(layer_attn.device)
-        scores     = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
-        return scores
+        ans_pos = input_embeds.shape[1] - 1
+        scores_list = []
+        for i in [6, 13, 20, 27]:
+            layer_attn = out.attentions[i]
+            vp = img_positions.to(layer_attn.device)
+            scores_list.append(layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu())
+        return torch.stack(scores_list).mean(dim=0)
 
     # ------------------------------------------------------------------
     # Global scoring → stitch tiles → smooth → per-tile QVTree → modulate
     # ------------------------------------------------------------------
-    def _score_and_modulate(
-        self,
-        vit_embeds: torch.Tensor,          # [B_tiles, N_per_tile, D]
-        input_embeds_full: torch.Tensor,   # [1, L, D]
-        attention_mask: torch.Tensor,      # [1, L]
-        input_ids: torch.Tensor,           # [1, L]
-        grid_h: int,
-        grid_w: int,
-        best_ratio: Tuple[int, int],       # (ratio_w, ratio_h)
-    ) -> torch.Tensor:                     # [B_tiles * N_per_tile, D]
+    def _score_and_modulate(self, vit_embeds, input_embeds_full, attention_mask, input_ids, grid_h, grid_w, best_ratio):
         B_tiles, N_per_tile, D = vit_embeds.shape
-        ratio_w, ratio_h       = best_ratio
-        num_content_tiles      = ratio_w * ratio_h
-        has_thumbnail          = B_tiles > num_content_tiles
+        ratio_w, ratio_h = best_ratio
+        num_content_tiles = ratio_w * ratio_h
+        has_thumbnail = B_tiles > num_content_tiles
         device = vit_embeds.device
-        dtype  = vit_embeds.dtype
+        dtype = vit_embeds.dtype
 
         # init debug
-        self._debug_patch_ids           = []
+        self._debug_patch_ids = []
         self._debug_num_selected_tokens = []
-        self._debug_num_total_tokens    = []
-        self._debug_select_ratios       = []
-        self._debug_best_ratio          = best_ratio
+        self._debug_num_total_tokens = []
+        self._debug_select_ratios = []
+        self._debug_best_ratio = best_ratio
 
         # ---- relative attention scoring ----
-        ids_flat      = input_ids.reshape(-1)
-        sel_mask      = (ids_flat == self.img_context_token_id)
+        ids_flat = input_ids.reshape(-1)
+        sel_mask = (ids_flat == self.img_context_token_id)
         vis_positions = sel_mask.nonzero(as_tuple=True)[0].cpu()
 
         A_q = self._get_attn_scores(input_embeds_full, attention_mask, vis_positions)
 
         if self._generic_token_ids is None:
-            _tok = AutoTokenizer.from_pretrained(
-                self.config._name_or_path, trust_remote_code=True
-            )
+            _tok = AutoTokenizer.from_pretrained(self.config._name_or_path, trust_remote_code=True)
             self._generic_token_ids = _tok(
                 "Write a general description of the image.",
                 return_tensors="pt", add_special_tokens=False,
             ).input_ids
 
         generic_ids = self._generic_token_ids.to(input_ids.device)
-        img_end     = vis_positions[-1].item()
-        new_ids     = torch.cat([input_ids[:, :img_end + 1], generic_ids, input_ids[:, -3:]], dim=1)
+        img_end = vis_positions[-1].item()
+        new_ids = torch.cat([input_ids[:, :img_end + 1], generic_ids, input_ids[:, -3:]], dim=1)
 
-        gen_emb        = self.language_model.get_input_embeddings()(new_ids)
-        gflat          = gen_emb.reshape(-1, D)
-        gen_sel        = (new_ids.reshape(-1) == self.img_context_token_id)
+        gen_emb = self.language_model.get_input_embeddings()(new_ids)
+        gflat = gen_emb.reshape(-1, D)
+        gen_sel = (new_ids.reshape(-1) == self.img_context_token_id)
         gflat[gen_sel] = vit_embeds.reshape(-1, D).to(device=gflat.device, dtype=gflat.dtype)
-        gen_emb        = torch.nan_to_num(gflat.reshape(1, -1, D))
-        gen_mask       = torch.ones(1, new_ids.shape[1], dtype=attention_mask.dtype, device=device)
+        gen_emb = torch.nan_to_num(gflat.reshape(1, -1, D))
+        gen_mask = torch.ones(1, new_ids.shape[1], dtype=attention_mask.dtype, device=device)
 
         A_generic = self._get_attn_scores(gen_emb, gen_mask, vis_positions)
 
@@ -246,10 +228,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
         scores_all = (scores_all - scores_all.min()) / (scores_all.max() - scores_all.min() + 1e-6)
 
         # ---- stitch content tiles into full spatial map ----
-        # scores_all: [B_tiles * N_per_tile] → [B_tiles, grid_h, grid_w]
         scores_tiled = scores_all.view(B_tiles, grid_h, grid_w)
-
-        # stitch: [ratio_h*grid_h, ratio_w*grid_w]
         rows = []
         for row in range(ratio_h):
             cols = [scores_tiled[row * ratio_w + col] for col in range(ratio_w)]
@@ -258,18 +237,15 @@ class InternVLChatModelWithTree(InternVLChatModel):
 
         # ---- 2-D Gaussian smoothing on full map ----
         sigma, ks = 1.0, 3
-        ax     = torch.arange(ks, dtype=torch.float32) - ks // 2
-        g1d    = torch.exp(-ax ** 2 / (2 * sigma ** 2))
-        g1d    = g1d / g1d.sum()
+        ax = torch.arange(ks, dtype=torch.float32) - ks // 2
+        g1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+        g1d = g1d / g1d.sum()
         kernel = (g1d.unsqueeze(1) * g1d.unsqueeze(0)).view(1, 1, ks, ks)
 
-        full_map_smooth = F.conv2d(
-            full_map.unsqueeze(0).unsqueeze(0), kernel, padding=ks // 2
-        ).squeeze()
-        full_map_smooth = (full_map_smooth - full_map_smooth.min()) / \
-                          (full_map_smooth.max() - full_map_smooth.min() + 1e-6)
+        full_map_smooth = F.conv2d(full_map.unsqueeze(0).unsqueeze(0), kernel, padding=ks // 2).squeeze()
+        full_map_smooth = (full_map_smooth - full_map_smooth.min()) / (full_map_smooth.max() - full_map_smooth.min() + 1e-6)
 
-        self._debug_full_score_map = full_map_smooth  # store for visualization
+        self._debug_full_score_map = full_map_smooth
 
         # ---- slice back per content tile ----
         smoothed = []
@@ -281,7 +257,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 ].reshape(-1)
                 smoothed.append(tile_score)
 
-        # thumbnail: smooth independently (not part of spatial layout)
+        # thumbnail: smooth independently
         if has_thumbnail:
             thumb = scores_tiled[-1].float().unsqueeze(0).unsqueeze(0)
             thumb = F.conv2d(thumb, kernel, padding=ks // 2).view(-1)
@@ -291,14 +267,13 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_patch_scores = smoothed
 
         # ---- QVTree navigation + alpha-beta masking ----
-        alpha, beta           = 5.0, 0.5
+        alpha, beta = 5.0, 0.5
         selected_idx_per_tile = []
-        new_embeds_list       = []
+        new_embeds_list = []
 
         for i in range(B_tiles):
             tokens = vit_embeds[i]
-            x      = tokens.unsqueeze(0)
-
+            x = tokens.unsqueeze(0)
             patch_scores = smoothed[i].unsqueeze(0).to(device=device, dtype=dtype)
 
             built = self.qvtree.builder.build(x, grid_h, grid_w)
@@ -361,20 +336,19 @@ class InternVLChatModelWithTree(InternVLChatModel):
             # 1. ViT features
             vit_embeds, grid_h, grid_w = self.extract_feature_with_grid(pixel_values)
             B_tiles = vit_embeds.shape[0]
-            D       = vit_embeds.shape[2]
 
             # infer best_ratio if not provided
             if best_ratio is None:
-                n  = B_tiles - 1  # exclude thumbnail
+                n = B_tiles - 1  # exclude thumbnail
                 sq = int(math.isqrt(n))
                 best_ratio = (sq, sq) if sq * sq == n else (n, 1)
 
             # 2. Build full input_embeds
-            emb      = self.language_model.get_input_embeddings()(input_ids)
-            B, N, C  = emb.shape
-            flat     = emb.reshape(B * N, C)
+            emb = self.language_model.get_input_embeddings()(input_ids)
+            B, N, C = emb.shape
+            flat = emb.reshape(B * N, C)
             ids_flat = input_ids.reshape(B * N)
-            sel      = (ids_flat == self.img_context_token_id)
+            sel = (ids_flat == self.img_context_token_id)
             flat[sel] = vit_embeds.reshape(-1, C).to(flat.device)
             input_embeds_full = torch.nan_to_num(flat.reshape(B, N, C))
 
@@ -390,7 +364,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
             )
 
             # 4. Place modulated tokens back
-            flat2      = emb.reshape(B * N, C).clone()
+            flat2 = emb.reshape(B * N, C).clone()
             flat2[sel] = new_vit.reshape(-1, C).to(flat2.device)
             input_embeds_final = torch.nan_to_num(flat2.reshape(B, N, C))
 
@@ -425,12 +399,12 @@ class InternVLChatModelWithTree(InternVLChatModel):
     ) -> str:
         """Single-image inference. Returns response string."""
         pixel_values, best_ratio = load_image(image_path, input_size=input_size, max_num=max_num)
-        pixel_values = pixel_values.to(dtype=next(self.parameters()).dtype,
-                                       device=next(self.parameters()).device)
+        pixel_values = pixel_values.to(
+            dtype=next(self.parameters()).dtype,
+            device=next(self.parameters()).device,
+        )
 
-        img_context_token_id      = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-        self.img_context_token_id = img_context_token_id
-
+        self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         num_patches = pixel_values.shape[0]
 
         template = get_conv_template(self.template)
@@ -442,10 +416,10 @@ class InternVLChatModelWithTree(InternVLChatModel):
         image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
         query = query.replace('<image>', image_tokens, 1)
 
-        model_inputs   = tokenizer(query, return_tensors='pt')
-        input_ids      = model_inputs['input_ids'].to(next(self.parameters()).device)
+        model_inputs = tokenizer(query, return_tensors='pt')
+        input_ids = model_inputs['input_ids'].to(next(self.parameters()).device)
         attention_mask = model_inputs['attention_mask'].to(next(self.parameters()).device)
-        eos_token_id   = tokenizer.convert_tokens_to_ids(template.sep.strip())
+        eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
 
         outputs = self.generate(
             pixel_values=pixel_values,
