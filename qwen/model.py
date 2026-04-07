@@ -461,17 +461,21 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     image_grid_thw[k][1].item() * image_grid_thw[k][2].item()
                     for k in range(i)
                 )
-                # pixel_values shape: [total_patches, 1176] where 1176 = C*14*14 (flattened)
+                # pixel_values shape: [total_patches, 1176]
+                # Qwen2.5-VL uses temporal_patch_size=2, so 1176 = 2*C*14*14
                 img_patches = pixel_values[
                     patch_offset_raw: patch_offset_raw + n_patches_raw
-                ]  # [H_raw*W_raw, C*14*14]
+                ]  # [H_raw*W_raw, 2*C*14*14]
 
+                temporal = 2
                 C = 3
-                # unflatten: [H_raw*W_raw, C, 14, 14]
-                img_patches = img_patches.view(n_patches_raw, C, 14, 14)
+                # unflatten: [H_raw*W_raw, temporal, C, 14, 14]
+                img_patches = img_patches.view(n_patches_raw, temporal, C, 14, 14)
+                # use first temporal frame for PIL reconstruction
+                img_patches = img_patches[:, 0]  # [H_raw*W_raw, C, 14, 14]
 
                 # reshape to image: [C, H_raw*14, W_raw*14]
-                img_tensor = img_patches.view(
+                img_tensor = img_patches.reshape(
                     grid_h_raw, grid_w_raw, C, 14, 14
                 ).permute(2, 0, 3, 1, 4).reshape(C, grid_h_raw * 14, grid_w_raw * 14)
 
@@ -522,10 +526,13 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
                 nH = cH_pad // 14
                 nW = cW_pad // 14
-                # [nH*nW, C*14*14] to match pixel_values format [N, 1176]
-                compact_patches = compact_tensor.reshape(
+                # pixel_values format is [N, 2*C*14*14] with temporal_patch_size=2.
+                # We duplicate the frame along the temporal axis to match.
+                compact_patches_frame = compact_tensor.reshape(
                     C, nH, 14, nW, 14
                 ).permute(1, 3, 0, 2, 4).reshape(nH * nW, C * 14 * 14)
+                # duplicate temporal: [nH*nW, 2*C*14*14]
+                compact_patches = compact_patches_frame.repeat(1, 2)
 
                 new_pixel_values_list.append(compact_patches)
                 # grid_thw: (t=1, h=nH, w=nW)
