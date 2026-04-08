@@ -28,7 +28,11 @@ def _extract_attn_scores(full_outputs, text_positions, image_positions, target_l
         vp   = image_positions.to(attn.device)
         qp   = text_positions.to(attn.device)
         a    = attn[0, :, :, vp][:, qp, :]     # [H, Q, N_img]
-        scores.append(a.mean(dim=0).mean(dim=0).cpu().float())
+        a    = a.mean(dim=0)                    # [Q, N_img] mean over heads
+        # per-token normalization: remove causal bias
+        # each token's attention becomes a relative distribution over image patches
+        a    = a / (a.sum(dim=1, keepdim=True) + 1e-8)  # [Q, N_img]
+        scores.append(a.mean(dim=0).cpu().float())       # [N_img] mean over tokens
     return torch.stack(scores).mean(dim=0)      # [N_img]
 
 
