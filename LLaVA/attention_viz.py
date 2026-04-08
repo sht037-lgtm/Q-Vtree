@@ -81,7 +81,7 @@ def get_attention_maps(
 
     # question text positions: after image, before ASSISTANT (last 4 tokens)
     text_start        = img_end + 1
-    text_end          = seq_len - 4
+    text_end          = seq_len - 6   # exclude: \n \n ASS IST ANT :
     if text_end <= text_start:
         text_end = seq_len - 1
     text_positions    = torch.arange(text_start, text_end, dtype=torch.long)
