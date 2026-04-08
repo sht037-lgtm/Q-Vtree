@@ -127,17 +127,22 @@ class QuadTreeNavigator:
     Navigate the tree using a precomputed patch score map.
 
     For each node:
-      1) Prune if max score in region < global mean score (no hyperparameter needed)
+      1) Prune if softmax-pooled score < global softmax-pooled score
+         (softmax pooling is sensitive to local peaks, prevents pruning regions
+          with small but important areas)
       2) Split if coefficient of variation (std/mean) > split_threshold
       3) Otherwise: select this node
 
-    Only one hyperparameter: split_threshold.
-      - Higher value → less splitting → larger, coarser regions selected
-      - Lower value  → more splitting → smaller, finer regions selected
+    Two parameters with decoupled roles:
+      softmax_temperature: controls pruning sensitivity to local high-score patches.
+                           Fixed at a sensible default, not exposed to users.
+      split_threshold:     controls splitting granularity. The only tunable param.
+                           Higher → coarser regions. Lower → finer regions.
     """
 
-    def __init__(self, split_threshold: float = 0.5, eps: float = 1e-6):
+    def __init__(self, split_threshold: float = 0.5, softmax_temperature: float = 0.3, eps: float = 1e-6):
         self.split_threshold = float(split_threshold)
+        self.softmax_temperature = float(softmax_temperature)
         self.eps = float(eps)
 
     @staticmethod
@@ -147,12 +152,17 @@ class QuadTreeNavigator:
         rr, cc = torch.meshgrid(rows, cols, indexing="ij")
         return (rr * W + cc).reshape(-1)
 
+    def _softmax_pool(self, vals: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
+        return torch.sum(weights * vals)
+
     @torch.no_grad()
     def select_nodes(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
         B, N = patch_scores.shape
 
-        # global mean per batch item — used as pruning baseline
-        global_mean = patch_scores.mean(dim=1)  # [B]
+        # global softmax-pooled score per batch item — pruning baseline
+        global_weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
+        global_soft = (global_weights * patch_scores).sum(dim=1)  # [B]
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -167,66 +177,27 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
 
-                children = nodes[pid].children
+                # prune: softmax pool is sensitive to local peaks
+                s_soft = self._softmax_pool(vals)
+                if s_soft < global_soft[b]:
+                    continue
 
-                # split first: if region has internal variation, recurse into children
+                children = nodes[pid].children
+                if not children:
+                    selected[b].append(pid)
+                    continue
+
+                # split: coefficient of variation measures internal score spread
                 mean = vals.mean()
                 std = vals.std()
                 cv = std / (mean + self.eps)
 
-                if children and cv > self.split_threshold:
+                if cv > self.split_threshold:
                     Q.extend(children)
-                    continue
-
-                # prune: if this region (or leaf) is below global mean, discard
-                if mean < global_mean[b]:
-                    continue
-
-                # otherwise: select this node
-                selected[b].append(pid)
+                else:
+                    selected[b].append(pid)
 
         return selected, visited
-
-    @torch.no_grad()
-    def nodes_to_tokens(
-        self,
-        nodes: List[Node],
-        H: int,
-        W: int,
-        selected_node_ids: List[List[int]],
-        x: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Any]:
-        device = x.device if x is not None else torch.device("cpu")
-        B = len(selected_node_ids)
-
-        token_indices: List[torch.Tensor] = []
-        for b in range(B):
-            idxs = [self.region_to_token_indices(nodes[nid].region, W=W, device=device)
-                    for nid in selected_node_ids[b]]
-            token_indices.append(
-                torch.cat(idxs, dim=0).unique(sorted=True) if idxs
-                else torch.empty(0, device=device, dtype=torch.long)
-            )
-
-        out: Dict[str, Any] = {"selected_token_indices": token_indices}
-
-        if x is not None:
-            Bx, N, D = x.shape
-            assert Bx == B and N == H * W, f"x must be [B,H*W,D], got {x.shape}, H*W={H*W}"
-            Mmax = max(int(t.numel()) for t in token_indices) if B > 0 else 0
-            feats = torch.zeros((B, Mmax, D), device=device, dtype=x.dtype)
-            mask = torch.zeros((B, Mmax), device=device, dtype=torch.bool)
-            for b in range(B):
-                idx = token_indices[b]
-                m = int(idx.numel())
-                if m > 0:
-                    feats[b, :m, :] = x[b, idx, :]
-                    mask[b, :m] = True
-            out["selected_feats_padded"] = feats
-            out["selected_mask"] = mask
-
-        return out
-
 
 class QVTree(nn.Module):
     """QuadTree-based visual token selector. Uses builder + navigator; scorer is external.
@@ -241,12 +212,14 @@ class QVTree(nn.Module):
     def __init__(
         self,
         D: int,
-        split_threshold: float = 0.3,
+        split_threshold: float = 0.5,
+        softmax_temperature: float = 0.3,
         eps: float = 1e-6,
     ):
         super().__init__()
         self.builder = QuadTreeBuilder()
         self.navigator = QuadTreeNavigator(
             split_threshold=split_threshold,
+            softmax_temperature=softmax_temperature,
             eps=eps,
         )
