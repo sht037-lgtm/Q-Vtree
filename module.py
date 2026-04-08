@@ -167,25 +167,23 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
 
-                # prune: if even the peak of this region is below global mean, discard
-                if vals.mean() < global_mean[b]:
-                    continue
-
                 children = nodes[pid].children
-                if not children:
-                    selected[b].append(pid)
-                    continue
 
-                # split criterion: coefficient of variation (std / mean)
-                # high CV → scores are spread out → worth splitting for finer detail
+                # split first: if region has internal variation, recurse into children
                 mean = vals.mean()
                 std = vals.std()
                 cv = std / (mean + self.eps)
 
-                if cv > self.split_threshold:
+                if children and cv > self.split_threshold:
                     Q.extend(children)
-                else:
-                    selected[b].append(pid)
+                    continue
+
+                # prune: if this region (or leaf) is below global mean, discard
+                if mean < global_mean[b]:
+                    continue
+
+                # otherwise: select this node
+                selected[b].append(pid)
 
         return selected, visited
 
