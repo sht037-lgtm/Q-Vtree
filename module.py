@@ -257,7 +257,7 @@ class QVTree(nn.Module):
         self,
         D: int,
         split_threshold: float = 0.2,  # bigger split_threshold means less split
-        softmax_temperature: float = 0.5,  # bigger softmax_temperature means more pruning
+        softmax_temperature: float = 1.0,  # bigger softmax_temperature means more pruning
         eps: float = 1e-6,
     ):
         super().__init__()
