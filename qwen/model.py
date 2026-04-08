@@ -60,19 +60,21 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     def cell_has_content(x0, y0, x1, y1):
         return any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1] for b in bboxes)
 
-    new_w, x_map = 0, {0: 0}
+    new_w, x_map = 0, {}
     for i in range(len(x_coords) - 1):
-        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-               for j in range(len(y_coords) - 1)):
+        col_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+                      for j in range(len(y_coords) - 1))
+        if col_has:
+            x_map[i] = new_w  # record start position BEFORE advancing
             new_w += x_coords[i+1] - x_coords[i]
-        x_map[i+1] = new_w
 
-    new_h, y_map = 0, {0: 0}
+    new_h, y_map = 0, {}
     for j in range(len(y_coords) - 1):
-        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-               for i in range(len(x_coords) - 1)):
+        row_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+                      for i in range(len(x_coords) - 1))
+        if row_has:
+            y_map[j] = new_h  # record start position BEFORE advancing
             new_h += y_coords[j+1] - y_coords[j]
-        y_map[j+1] = new_h
 
     if new_w == 0 or new_h == 0:
         return image
@@ -81,6 +83,8 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
+                if i not in x_map or j not in y_map:
+                    continue
                 patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
                 compact.paste(patch, (x_map[i], y_map[j]))
     return compact
@@ -179,15 +183,33 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             )
 
             def get_attn_scores(embeds_in, mask_in, pos_in, query_positions):
-                """Mean attention from query tokens to image patches, averaged over layers [6,13,20,27] and heads."""
-                with torch.no_grad():
-                    out = self.language_model(
-                        input_ids=None, inputs_embeds=embeds_in, attention_mask=mask_in,
-                        position_ids=pos_in, output_attentions=True,
-                        output_hidden_states=False, return_dict=True, use_cache=False,
-                    )
+                """Mean attention from query tokens to image patches.
+                Temporarily switches to eager attention, then restores original impl.
+                """
+                # temporarily switch all layers to eager to get attention weights
+                lm_layers = getattr(self.language_model, "layers", None) or                             getattr(self.language_model, "model", self.language_model).layers
+                orig_impls = []
+                for layer in lm_layers:
+                    orig_impls.append(layer.self_attn.config._attn_implementation)
+                    layer.self_attn.config._attn_implementation = "eager"
+                try:
+                    with torch.no_grad():
+                        out = self.language_model(
+                            input_ids=None, inputs_embeds=embeds_in, attention_mask=mask_in,
+                            position_ids=pos_in, output_attentions=True,
+                            output_hidden_states=False, return_dict=True, use_cache=False,
+                        )
+                finally:
+                    for layer, impl in zip(lm_layers, orig_impls):
+                        layer.self_attn.config._attn_implementation = impl
+
+                n_layers = len(out.attentions)
+                target_layers = sorted(set([
+                    n_layers // 4, n_layers // 2,
+                    n_layers * 3 // 4, n_layers - 1,
+                ]))
                 scores = []
-                for l in [6, 13, 20, 27]:
+                for l in target_layers:
                     layer_attn = out.attentions[l]
                     vp = vis_positions.to(layer_attn.device)
                     qp = query_positions.to(layer_attn.device)
