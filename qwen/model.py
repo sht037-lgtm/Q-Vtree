@@ -60,21 +60,19 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     def cell_has_content(x0, y0, x1, y1):
         return any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1] for b in bboxes)
 
-    new_w, x_map = 0, {}
+    new_w, x_map = 0, {0: 0}
     for i in range(len(x_coords) - 1):
-        col_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-                      for j in range(len(y_coords) - 1))
-        if col_has:
-            x_map[i] = new_w  # record start position BEFORE advancing
+        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+               for j in range(len(y_coords) - 1)):
             new_w += x_coords[i+1] - x_coords[i]
+        x_map[i+1] = new_w
 
-    new_h, y_map = 0, {}
+    new_h, y_map = 0, {0: 0}
     for j in range(len(y_coords) - 1):
-        row_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-                      for i in range(len(x_coords) - 1))
-        if row_has:
-            y_map[j] = new_h  # record start position BEFORE advancing
+        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+               for i in range(len(x_coords) - 1)):
             new_h += y_coords[j+1] - y_coords[j]
+        y_map[j+1] = new_h
 
     if new_w == 0 or new_h == 0:
         return image
@@ -83,8 +81,6 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
-                if i not in x_map or j not in y_map:
-                    continue
                 patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
                 compact.paste(patch, (x_map[i], y_map[j]))
     return compact
@@ -184,38 +180,44 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             def get_attn_scores(embeds_in, mask_in, pos_in, query_positions):
                 """Mean attention from query tokens to image patches.
-                Temporarily switches to eager attention, then restores original impl.
+                Uses a forward hook on layer 27 only to avoid storing all layers' attention weights.
                 """
-                # temporarily switch all layers to eager to get attention weights
-                lm_layers = getattr(self.language_model, "layers", None) or                             getattr(self.language_model, "model", self.language_model).layers
-                orig_impls = []
-                for layer in lm_layers:
-                    orig_impls.append(layer.self_attn.config._attn_implementation)
-                    layer.self_attn.config._attn_implementation = "eager"
+                captured = {}
+
+                # find layer 27
+                lm = self.language_model
+                layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
+                target_layer = layers[27]
+
+                def hook_fn(module, input, output):
+                    # output is (hidden_states, attn_weights, ...)
+                    # attn_weights shape: [B, heads, seq_len, seq_len]
+                    if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                        captured["attn"] = output[1].detach().cpu()
+
+                handle = target_layer.self_attn.register_forward_hook(hook_fn)
                 try:
                     with torch.no_grad():
-                        out = self.language_model(
+                        self.language_model(
                             input_ids=None, inputs_embeds=embeds_in, attention_mask=mask_in,
                             position_ids=pos_in, output_attentions=True,
                             output_hidden_states=False, return_dict=True, use_cache=False,
                         )
                 finally:
-                    for layer, impl in zip(lm_layers, orig_impls):
-                        layer.self_attn.config._attn_implementation = impl
+                    handle.remove()
 
-                n_layers = len(out.attentions)
-                target_layers = sorted(set([
-                    n_layers // 4, n_layers // 2,
-                    n_layers * 3 // 4, n_layers - 1,
-                ]))
-                scores = []
-                for l in target_layers:
-                    layer_attn = out.attentions[l]
-                    vp = vis_positions.to(layer_attn.device)
-                    qp = query_positions.to(layer_attn.device)
-                    attn = layer_attn[0, :, :, vp][:, qp, :]  # [H, Q, N_img]
-                    scores.append(attn.mean(dim=0).mean(dim=0).cpu().float())
-                return torch.stack(scores).mean(dim=0)
+                if "attn" not in captured:
+                    raise RuntimeError("Hook did not capture attention weights. "
+                                       "Ensure model is loaded with attn_implementation='eager'.")
+
+                layer_attn = captured["attn"]  # [B, heads, seq_len, seq_len]
+                vp = vis_positions
+                qp = query_positions
+                attn = layer_attn[0, :, :, vp][:, qp, :]  # [heads, Q, N_img]
+                result = attn.mean(dim=0).mean(dim=0).float()  # [N_img]
+                del captured
+                torch.cuda.empty_cache()
+                return result
 
             # question-specific attention
             A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids, text_positions)
