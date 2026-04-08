@@ -160,9 +160,8 @@ class QuadTreeNavigator:
     def select_nodes(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
         B, N = patch_scores.shape
 
-        # global softmax-pooled score per batch item — pruning baseline
-        global_weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
-        global_soft = (global_weights * patch_scores).sum(dim=1)  # [B]
+        # global mean — pruning baseline
+        global_mean = patch_scores.mean(dim=1)  # [B]
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -177,9 +176,12 @@ class QuadTreeNavigator:
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
 
-                # prune: softmax pool is sensitive to local peaks
+                # prune: local softmax pool vs global mean
+                # softmax_temperature controls sensitivity:
+                #   low temp  → pool dominated by peak → less pruning (sensitive to local highlights)
+                #   high temp → pool approaches mean   → more pruning (stricter)
                 s_soft = self._softmax_pool(vals)
-                if s_soft < global_soft[b]:
+                if s_soft < global_mean[b]:
                     continue
 
                 children = nodes[pid].children
@@ -198,6 +200,48 @@ class QuadTreeNavigator:
                     selected[b].append(pid)
 
         return selected, visited
+
+    @torch.no_grad()
+    def nodes_to_tokens(
+        self,
+        nodes: List[Node],
+        H: int,
+        W: int,
+        selected_node_ids: List[List[int]],
+        x: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        device = x.device if x is not None else torch.device("cpu")
+        B = len(selected_node_ids)
+
+        token_indices: List[torch.Tensor] = []
+        for b in range(B):
+            idxs = [self.region_to_token_indices(nodes[nid].region, W=W, device=device)
+                    for nid in selected_node_ids[b]]
+            token_indices.append(
+                torch.cat(idxs, dim=0).unique(sorted=True) if idxs
+                else torch.empty(0, device=device, dtype=torch.long)
+            )
+
+        out: Dict[str, Any] = {"selected_token_indices": token_indices}
+
+        if x is not None:
+            Bx, N, D = x.shape
+            assert Bx == B and N == H * W, f"x must be [B,H*W,D], got {x.shape}, H*W={H*W}"
+            Mmax = max(int(t.numel()) for t in token_indices) if B > 0 else 0
+            feats = torch.zeros((B, Mmax, D), device=device, dtype=x.dtype)
+            mask = torch.zeros((B, Mmax), device=device, dtype=torch.bool)
+            for b in range(B):
+                idx = token_indices[b]
+                m = int(idx.numel())
+                if m > 0:
+                    feats[b, :m, :] = x[b, idx, :]
+                    mask[b, :m] = True
+            out["selected_feats_padded"] = feats
+            out["selected_mask"] = mask
+
+        return out
+
+
 
 class QVTree(nn.Module):
     """QuadTree-based visual token selector. Uses builder + navigator; scorer is external.
