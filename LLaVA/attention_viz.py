@@ -10,8 +10,8 @@ from PIL import Image
 
 def _extract_attn_scores(full_outputs, text_positions, image_positions, target_layers):
     """
-    Extract attention from text_positions → image_positions.
-    Per-token normalization applied to remove causal bias.
+    Extract mean attention from text_positions → image_positions.
+    Average over heads and target layers.
     """
     scores = []
     for l in target_layers:
@@ -19,10 +19,8 @@ def _extract_attn_scores(full_outputs, text_positions, image_positions, target_l
         vp   = image_positions.to(attn.device)
         qp   = text_positions.to(attn.device)
         a    = attn[0, :, :, vp][:, qp, :]      # [H, Q, N_img]
-        a    = a.mean(dim=0)                     # [Q, N_img] mean over heads
-        # per-token normalization: remove causal bias
-        a    = a / (a.sum(dim=1, keepdim=True) + 1e-8)
-        scores.append(a.mean(dim=0).cpu().float())
+        a    = a.mean(dim=0).mean(dim=0)         # [N_img]
+        scores.append(a.cpu().float())
     return torch.stack(scores).mean(dim=0)       # [N_img]
 
 
@@ -43,11 +41,13 @@ def get_attention_maps(
     """
     Extract question-text→image relative attention from LLaVA-1.5.
 
-    Key design:
-      - Per-token normalization removes causal bias independently per token
-      - Pass 2 generic tokens padded to same length as question tokens
-        so sequence structure is identical → remaining causal bias cancels
-      - Both passes use same text_positions for fair comparison
+    Design:
+      - Pass 1: specific question → A_q
+        use ALL tokens after image tokens as query
+      - Pass 2: generic question  → A_g
+        same structure, generic tokens replace question tokens
+      - relative = A_q / A_g
+        ASSISTANT tokens exist in both passes and cancel out when dividing
     """
     device = next(model.parameters()).device
 
@@ -79,17 +79,12 @@ def get_attention_maps(
 
     img_end = image_positions[-1].item()
 
-    # question text positions: after image, before ASSISTANT (last 4 tokens)
-    text_start        = img_end + 1
-    text_end          = seq_len - 6   # exclude: \n \n ASS IST ANT :
-    if text_end <= text_start:
-        text_end = seq_len - 1
-    text_positions    = torch.arange(text_start, text_end, dtype=torch.long)
-    n_question_tokens = text_end - text_start
+    # ALL tokens after image tokens (including ASSISTANT:)
+    text_positions = torch.arange(img_end + 1, seq_len, dtype=torch.long)
 
     print(f"[DEBUG] answer = '{answer}'")
     print(f"[DEBUG] seq_len={seq_len}, img_end={img_end}")
-    print(f"[DEBUG] question text: pos {text_start}~{text_end-1} ({n_question_tokens} tokens)")
+    print(f"[DEBUG] text tokens: pos {img_end+1}~{seq_len-1} ({seq_len - img_end - 1} tokens)")
 
     # ===== Pass 1: specific question =====
     with torch.inference_mode():
@@ -103,50 +98,36 @@ def get_attention_maps(
     print(f"[DEBUG] A_q  max={A_q.max():.6f}, mean={A_q.mean():.8f}")
 
     if use_relative:
-        # ===== Pass 2: generic question padded to same length =====
-        suffix_ids = full_input_ids[:, seq_len - 4:]
-        prefix_ids = full_input_ids[:, :img_end + 1]
+        # ===== Pass 2: generic question =====
+        suffix_ids = full_input_ids[:, img_end + 1:]   # everything after image
+        prefix_ids = full_input_ids[:, :img_end + 1]   # BOS + USER: + image
 
+        # tokenize generic question
         generic_ids = processor.tokenizer(
             generic_question,
             return_tensors="pt",
             add_special_tokens=False,
         ).input_ids.to(device)
-        n_generic_tokens = generic_ids.shape[1]
 
-        pad_token_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
+        # build: [prefix+image] [generic tokens] [ASSISTANT:]
+        # reuse original ASSISTANT tokens from suffix
+        assistant_ids = full_input_ids[:, seq_len - 6:]   # \n \n ASS IST ANT :
+        generic_input_ids = torch.cat([prefix_ids, generic_ids, assistant_ids], dim=1)
 
-        if n_generic_tokens < n_question_tokens:
-            padding = torch.full(
-                (1, n_question_tokens - n_generic_tokens),
-                pad_token_id, dtype=torch.long, device=device,
-            )
-            generic_padded = torch.cat([generic_ids, padding], dim=1)
-        elif n_generic_tokens > n_question_tokens:
-            generic_padded = generic_ids[:, :n_question_tokens]
-        else:
-            generic_padded = generic_ids
+        # text positions for generic: all tokens after image
+        gen_seq_len = generic_input_ids.shape[1]
+        gen_text_positions = torch.arange(img_end + 1, gen_seq_len, dtype=torch.long)
 
-        generic_input_ids = torch.cat([prefix_ids, generic_padded, suffix_ids], dim=1)
-
-        # attention mask: mask out padding tokens
-        attn_mask = torch.ones_like(generic_input_ids)
-        if n_generic_tokens < n_question_tokens:
-            pad_start = prefix_ids.shape[1] + n_generic_tokens
-            pad_end   = prefix_ids.shape[1] + n_question_tokens
-            attn_mask[:, pad_start:pad_end] = 0
-
-        print(f"[DEBUG] generic: {n_generic_tokens} tokens + {max(0, n_question_tokens-n_generic_tokens)} pad")
+        print(f"[DEBUG] generic text: {generic_ids.shape[1]} tokens, gen_seq_len={gen_seq_len}")
 
         with torch.inference_mode():
             out_g = model(
                 input_ids=generic_input_ids,
                 pixel_values=inputs["pixel_values"],
-                attention_mask=attn_mask,
+                attention_mask=torch.ones_like(generic_input_ids),
                 output_attentions=True,
             )
-        # use same text_positions for fair comparison
-        A_g = _extract_attn_scores(out_g, text_positions, image_positions, target_layers)
+        A_g = _extract_attn_scores(out_g, gen_text_positions, image_positions, target_layers)
         print(f"[DEBUG] A_g  max={A_g.max():.6f}, mean={A_g.mean():.8f}")
 
         patch_scores = A_q / (A_g + 1e-8)
@@ -204,7 +185,7 @@ def visualize_attention(
     mode = "relative" if use_relative else "raw"
     plt.suptitle(
         f"Attention Map  |  answer='{answer[:50]}'\n"
-        f"mode={mode}  layers={list(target_layers)}  per-token-norm",
+        f"mode={mode}  layers={list(target_layers)}",
         fontsize=10, y=1.02,
     )
     plt.tight_layout()
