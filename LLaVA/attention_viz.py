@@ -10,22 +10,8 @@ from PIL import Image
 
 def _extract_attn_scores(full_outputs, text_positions, image_positions, target_layers):
     """
-    Extract per-token-normalized attention from text_positions → image_positions.
-
-    Per-token normalization:
-        Each token's attention over image patches is divided by its sum,
-        converting it to a relative distribution. This removes causal bias
-        (later tokens having systematically higher attention values).
-        Applied to BOTH specific and generic passes for consistent scaling.
-
-    Args:
-        full_outputs    : model output with output_attentions=True
-        text_positions  : LongTensor [Q]
-        image_positions : LongTensor [N_img]
-        target_layers   : tuple of layer indices
-
-    Returns:
-        [N_img] tensor
+    Extract attention from text_positions → image_positions.
+    Per-token normalization applied to remove causal bias.
     """
     scores = []
     for l in target_layers:
@@ -34,14 +20,15 @@ def _extract_attn_scores(full_outputs, text_positions, image_positions, target_l
         qp   = text_positions.to(attn.device)
         a    = attn[0, :, :, vp][:, qp, :]      # [H, Q, N_img]
         a    = a.mean(dim=0)                     # [Q, N_img] mean over heads
+        # per-token normalization: remove causal bias
+        a    = a / (a.sum(dim=1, keepdim=True) + 1e-8)
+        scores.append(a.mean(dim=0).cpu().float())
+    return torch.stack(scores).mean(dim=0)       # [N_img]
 
-        # per-token normalization: each token's attention becomes a relative
-        # distribution over image patches, removing positional causal bias
-        a    = a / (a.sum(dim=1, keepdim=True) + 1e-8)   # [Q, N_img]
 
-        scores.append(a.mean(dim=0).cpu().float())        # [N_img] mean over tokens
-    return torch.stack(scores).mean(dim=0)                # [N_img] mean over layers
-
+# =========================================================
+# ------------- Attention Map Extraction ------------------
+# =========================================================
 
 def get_attention_maps(
     model,
@@ -57,30 +44,10 @@ def get_attention_maps(
     Extract question-text→image relative attention from LLaVA-1.5.
 
     Key design:
-      - Per-token normalization applied to BOTH specific and generic passes
-        so they are on the same scale when dividing A_q / A_g
-      - Two forward passes with padded generic sequence (same length as specific)
-        for consistent causal structure
-      - Only non-padding generic tokens used in attention extraction
-      - generate() called once separately just to display the answer
-
-    Args:
-        model            : LlavaForConditionalGeneration (attn_implementation="eager")
-        processor        : LlavaProcessor
-        image            : PIL.Image
-        question         : specific question string
-        target_layers    : layers to average
-        use_relative     : normalize by generic question attention
-        generic_question : baseline question text
-        grid_size        : 24 for LLaVA-1.5
-
-    Returns:
-        dict with keys:
-            "patch_scores" : [N_img] tensor
-            "answer"       : str
-            "use_relative" : bool
-            "grid_size"    : int
-            "target_layers": tuple
+      - Per-token normalization removes causal bias independently per token
+      - Pass 2 generic tokens padded to same length as question tokens
+        so sequence structure is identical → remaining causal bias cancels
+      - Both passes use same text_positions for fair comparison
     """
     device = next(model.parameters()).device
 
@@ -91,7 +58,7 @@ def get_attention_maps(
         return_tensors="pt",
     ).to(device)
 
-    full_input_ids = inputs["input_ids"]   # [1, N]
+    full_input_ids = inputs["input_ids"]
     seq_len = full_input_ids.shape[1]
 
     # generate answer for display only
@@ -150,7 +117,7 @@ def get_attention_maps(
         pad_token_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
 
         if n_generic_tokens < n_question_tokens:
-            padding        = torch.full(
+            padding = torch.full(
                 (1, n_question_tokens - n_generic_tokens),
                 pad_token_id, dtype=torch.long, device=device,
             )
@@ -162,18 +129,14 @@ def get_attention_maps(
 
         generic_input_ids = torch.cat([prefix_ids, generic_padded, suffix_ids], dim=1)
 
-        # mask out padding tokens
+        # attention mask: mask out padding tokens
         attn_mask = torch.ones_like(generic_input_ids)
         if n_generic_tokens < n_question_tokens:
             pad_start = prefix_ids.shape[1] + n_generic_tokens
             pad_end   = prefix_ids.shape[1] + n_question_tokens
             attn_mask[:, pad_start:pad_end] = 0
 
-        # only use non-padding positions for generic attention extraction
-        n_valid            = min(n_generic_tokens, n_question_tokens)
-        gen_text_positions = torch.arange(text_start, text_start + n_valid, dtype=torch.long)
-
-        print(f"[DEBUG] generic: {n_generic_tokens} tokens, valid: {n_valid}, pad: {max(0, n_question_tokens - n_generic_tokens)}")
+        print(f"[DEBUG] generic: {n_generic_tokens} tokens + {max(0, n_question_tokens-n_generic_tokens)} pad")
 
         with torch.inference_mode():
             out_g = model(
@@ -182,9 +145,8 @@ def get_attention_maps(
                 attention_mask=attn_mask,
                 output_attentions=True,
             )
-
-        # per-token normalization also applied to generic (same scale as specific)
-        A_g = _extract_attn_scores(out_g, gen_text_positions, image_positions, target_layers)
+        # use same text_positions for fair comparison
+        A_g = _extract_attn_scores(out_g, text_positions, image_positions, target_layers)
         print(f"[DEBUG] A_g  max={A_g.max():.6f}, mean={A_g.mean():.8f}")
 
         patch_scores = A_q / (A_g + 1e-8)
@@ -213,8 +175,7 @@ def visualize_attention(
 ):
     """
     Visualize question-text→image attention map overlaid on the image.
-
-    Note: pass clip_image (CLIP's 336x336 view) for best spatial alignment.
+    Note: pass clip_image for best spatial alignment.
     """
     patch_scores  = attn_result["patch_scores"]
     answer        = attn_result.get("answer", "?")
@@ -222,18 +183,14 @@ def visualize_attention(
     grid_size     = attn_result.get("grid_size", 24)
     target_layers = attn_result.get("target_layers", (6, 13, 20, 27))
 
-    # reshape to spatial grid
     attn_map = patch_scores[:grid_size * grid_size].reshape(grid_size, grid_size).numpy()
 
-    # gaussian blur before normalization
     from scipy.ndimage import gaussian_filter
     attn_map = gaussian_filter(attn_map, sigma=1.0)
 
-    # normalize to [0, 1]
     vmin, vmax = attn_map.min(), attn_map.max()
     attn_map = (attn_map - vmin) / (vmax - vmin + 1e-8)
 
-    # resize to image size
     heatmap = Image.fromarray((attn_map * 255).astype(np.uint8)).resize(
         image.size, resample=Image.BILINEAR
     )
@@ -247,7 +204,7 @@ def visualize_attention(
     mode = "relative" if use_relative else "raw"
     plt.suptitle(
         f"Attention Map  |  answer='{answer[:50]}'\n"
-        f"mode={mode}  layers={list(target_layers)}",
+        f"mode={mode}  layers={list(target_layers)}  per-token-norm",
         fontsize=10, y=1.02,
     )
     plt.tight_layout()
