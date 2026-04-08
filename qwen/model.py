@@ -289,7 +289,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         use_cache=False,
                     )
                 ans_pos = inputs_embeds_in.shape[1] - 1
-                target_layers = [27]
+                target_layers = [6, 13, 20, 27]
                 scores = []
                 for i, layer_attn in enumerate(out.attentions):
                     if i not in target_layers:
@@ -298,7 +298,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     vp = vis_positions.to(ld)
                     s = layer_attn[0, :, ans_pos, vp].mean(dim=0).cpu()
                     scores.append(s)
-                return torch.stack(scores).mean(dim=0)  # [N]
+                return torch.stack(scores).max(dim=0).values  # [N]
 
             # First pass: question-specific attention
             A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids)
