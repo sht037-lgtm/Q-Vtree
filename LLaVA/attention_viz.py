@@ -73,7 +73,7 @@ def _get_answer_attention(
     # = everything after image tokens, excluding the final "ASSISTANT:" tokens
     if text_positions is None:
         text_start = img_end + 1
-        text_end   = seq_len - 2   # exclude the last 2 tokens (newline + ':')
+        text_end   = seq_len - 4  # exclude the last 2 tokens (newline + ':')
         if text_end > text_start:
             text_positions = torch.arange(text_start, text_end, dtype=torch.long)
         else:
@@ -125,7 +125,7 @@ def get_attention_maps(
     question: str,
     target_layers: tuple = (6, 13, 20, 27),
     use_relative: bool = True,
-    generic_question: str = "What is the relationship between the objects in the picture.",
+    generic_question: str = "Describe the image in detail.",
     grid_size: int = 24,
 ):
     """
