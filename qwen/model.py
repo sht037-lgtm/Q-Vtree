@@ -277,7 +277,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             vis_positions = is_image.nonzero(as_tuple=True)[0].cpu()
 
             # locate question text token positions
-            # question text = tokens after image end, before last 3 suffix tokens
             img_end = vis_positions[-1].item()
             seq_len = input_ids.shape[1]
             text_start = img_end + 1
@@ -288,6 +287,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 text_positions = torch.tensor([seq_len - 1], dtype=torch.long)
 
             def get_attn_scores(inputs_embeds_in, attention_mask_in, position_ids_in, query_positions):
+                """
+                Extract attention from query_positions tokens to image patches.
+                Filter query tokens by attention sum >= mean, then average over
+                filtered tokens, heads, and target layers.
+                """
                 with torch.no_grad():
                     out = self.language_model(
                         input_ids=None,
@@ -307,14 +311,21 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                     ld = layer_attn.device
                     vp = vis_positions.to(ld)
                     qp = query_positions.to(ld)
-                    # [H, num_query_tokens, N_img] -> mean over heads and query tokens
+                    # attn_to_img: [H, num_query, N_img]
                     attn_to_img = layer_attn[0, :, :, vp]   # [H, seq_len, N_img]
                     attn_to_img = attn_to_img[:, qp, :]      # [H, num_query, N_img]
-                    s = attn_to_img.mean(dim=0).mean(dim=0).cpu().float()  # [N_img]
+                    # attention sum per query token: mean over heads and image patches
+                    token_sum = attn_to_img.mean(dim=0).sum(dim=1)  # [num_query]
+                    # keep tokens with attention sum >= mean
+                    keep_mask = token_sum >= token_sum.mean()
+                    if keep_mask.sum() == 0:
+                        keep_mask = torch.ones_like(keep_mask, dtype=torch.bool)
+                    # mean over filtered tokens and heads -> [N_img]
+                    s = attn_to_img[:, keep_mask, :].mean(dim=0).mean(dim=0).cpu().float()
                     scores.append(s)
                 return torch.stack(scores).mean(dim=0)  # [N_img]
 
-            # First pass: question-specific (all question text tokens)
+            # First pass: question-specific attention (filtered text tokens)
             A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids, text_positions)
 
             # Second pass: generic description attention
