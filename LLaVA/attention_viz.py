@@ -14,20 +14,30 @@ def _get_answer_attention(
     image,
     question,
     target_layers=(6, 13, 20, 27),
+    text_positions=None,   # if None, auto-detect question text positions
 ):
     """
-    Compute last-input-token's attention to image patches.
+    Compute attention from question text tokens to image patches.
 
-    Strategy:
-      - generate() once just to get the model's answer (for display only)
-      - use last input token (':' after ASSISTANT) for attention computation
-      - average attention over target_layers
-      - precisely locate image tokens using image_token_id=32000
+    Key design (inspired by Qwen model.py):
+      - Use ALL question text tokens instead of a single token
+      - Apply rater filter: keep only tokens with attention sum >= mean
+        (removes noise from irrelevant tokens like '(A)', 'directly', etc.)
+      - Average over filtered tokens, heads, and target layers
+      - generate() called separately just to display the model's answer
+
+    Args:
+        model          : LlavaForConditionalGeneration
+        processor      : LlavaProcessor
+        image          : PIL.Image
+        question       : question string
+        target_layers  : layers to average
+        text_positions : optional manual override of query token positions
 
     Returns:
         patch_scores    : [N_img] tensor
-        answer_token    : str  (model's generated answer, e.g. 'A')
-        image_positions : LongTensor
+        answer          : str (model's generated answer, display only)
+        image_positions : LongTensor of image token positions
     """
     device = next(model.parameters()).device
 
@@ -38,17 +48,17 @@ def _get_answer_attention(
         return_tensors="pt",
     ).to(device)
 
-    # generate answer token for display only (not used in attention)
+    # generate full answer for display only
     with torch.inference_mode():
         gen_out = model.generate(**inputs, max_new_tokens=128, do_sample=False)
-    answer_token = processor.batch_decode(
-        gen_out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    answer = processor.batch_decode(
+        gen_out[:, inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True
     )[0].strip()
 
-    # use original input (without appending answer token)
     full_input_ids = inputs["input_ids"]   # [1, N]
 
-    # precisely locate image token positions using image_token_id=32000
+    # precisely locate image token positions (id=32000)
     image_token_id = 32000
     is_image = (full_input_ids[0] == image_token_id)
     image_positions = is_image.nonzero(as_tuple=True)[0]   # [N_img]
@@ -56,17 +66,26 @@ def _get_answer_attention(
     if image_positions.numel() == 0:
         image_positions = torch.arange(576, device=device)
 
-    # last input token is ':' after ASSISTANT
-    ans_pos = full_input_ids.shape[1] - 1
-    last_token = processor.tokenizer.decode(
-        [full_input_ids[0, ans_pos].item()]
-    ).strip()
+    img_end = image_positions[-1].item()
+    seq_len = full_input_ids.shape[1]
 
-    print(f"[DEBUG] model answer     = '{answer_token}'")
-    print(f"[DEBUG] last input token = '{last_token}'")
-    print(f"[DEBUG] seq_len={full_input_ids.shape[1]}, ans_pos={ans_pos}, num_image_tokens={image_positions.numel()}")
+    # locate question text token positions
+    # = everything after image tokens, excluding the final "ASSISTANT:" tokens
+    if text_positions is None:
+        text_start = img_end + 1
+        text_end   = seq_len - 2   # exclude the last 2 tokens (newline + ':')
+        if text_end > text_start:
+            text_positions = torch.arange(text_start, text_end, dtype=torch.long)
+        else:
+            # fallback: just use the last input token
+            text_positions = torch.tensor([seq_len - 1], dtype=torch.long)
 
-    # full forward pass with output_attentions
+    print(f"[DEBUG] model answer     = '{answer}'")
+    print(f"[DEBUG] seq_len={seq_len}, img_end={img_end}")
+    print(f"[DEBUG] text_positions: {text_positions[0].item()} ~ {text_positions[-1].item()} ({len(text_positions)} tokens)")
+    print(f"[DEBUG] num image tokens = {image_positions.numel()}")
+
+    # full forward pass
     with torch.inference_mode():
         full_outputs = model(
             input_ids=full_input_ids,
@@ -75,18 +94,32 @@ def _get_answer_attention(
             output_attentions=True,
         )
 
-    # extract and average attention over target layers
+    # extract attention, rater filter, average over target layers
     layer_scores = []
     for l in target_layers:
         attn = full_outputs.attentions[l]          # [1, H, seq_len, seq_len]
-        ip = image_positions.to(attn.device)
-        s = attn[0, :, ans_pos, ip]                # [H, N_img]
-        s = s.mean(dim=0).cpu().float()            # [N_img]
+        vp = image_positions.to(attn.device)
+        qp = text_positions.to(attn.device)
+
+        # attention from question tokens to image tokens
+        attn_to_img = attn[0, :, :, vp]            # [H, seq_len, N_img]
+        attn_to_img = attn_to_img[:, qp, :]        # [H, num_query, N_img]
+
+        # rater filter: keep query tokens with attention sum >= mean
+        token_sum  = attn_to_img.mean(dim=0).sum(dim=1)   # [num_query]
+        keep_mask  = token_sum >= token_sum.mean()
+        if keep_mask.sum() == 0:
+            keep_mask = torch.ones_like(keep_mask, dtype=torch.bool)
+
+        print(f"[DEBUG] Layer {l}: kept {keep_mask.sum().item()}/{len(keep_mask)} query tokens")
+
+        # mean over filtered tokens and heads → [N_img]
+        s = attn_to_img[:, keep_mask, :].mean(dim=0).mean(dim=0).cpu().float()
         layer_scores.append(s)
 
     patch_scores = torch.stack(layer_scores).mean(dim=0)   # [N_img]
 
-    return patch_scores, answer_token, image_positions.cpu()
+    return patch_scores, answer, image_positions.cpu()
 
 
 # =========================================================
@@ -100,58 +133,57 @@ def get_attention_maps(
     question: str,
     target_layers: tuple = (6, 13, 20, 27),
     use_relative: bool = True,
-    generic_question: str = "Describe the image.",
+    generic_question: str = "Describe the image in detail.",
     grid_size: int = 24,
 ):
     """
-    Extract last-input-token→image attention from LLaVA-1.5.
+    Extract question-text→image attention from LLaVA-1.5.
 
-    When use_relative=True:
-        Runs two forward passes (specific + generic question)
-        relative = A_q / (A_q0 + eps) cancels out fixed attention regions
+    Uses all question text tokens with rater filter (not just last input token),
+    making it robust to multi-subject questions like "what is the relation between
+    the cat and the dog?"
 
     Args:
         model            : LlavaForConditionalGeneration (attn_implementation="eager")
         processor        : LlavaProcessor
         image            : PIL.Image
-        question         : specific question string (MCQ format recommended)
-        target_layers    : layers to average, default (6, 13, 20, 27)
-        use_relative     : use relative attention normalization
+        question         : specific question string
+        target_layers    : layers to average
+        use_relative     : normalize by generic question attention
         generic_question : baseline question for relative attention
-        grid_size        : spatial grid size (24 for LLaVA-1.5)
+        grid_size        : 24 for LLaVA-1.5
 
     Returns:
         dict with keys:
-            "patch_scores"  : [N_img] tensor
-            "answer_token"  : model's generated answer string
-            "use_relative"  : bool
-            "grid_size"     : int
-            "target_layers" : tuple
+            "patch_scores" : [N_img] tensor
+            "answer"       : str
+            "use_relative" : bool
+            "grid_size"    : int
+            "target_layers": tuple
     """
     print(f"[INFO] Forward pass 1: specific question")
-    A_q, answer_token, img_pos = _get_answer_attention(
+    A_q, answer, _ = _get_answer_attention(
         model, processor, image, question, target_layers
     )
-    print(f"[DEBUG] A_q   max={A_q.max():.6f}, mean={A_q.mean():.8f}")
+    print(f"[DEBUG] A_q  max={A_q.max():.6f}, mean={A_q.mean():.8f}")
 
     if use_relative:
         print(f"[INFO] Forward pass 2: generic question")
         A_q0, _, _ = _get_answer_attention(
             model, processor, image, generic_question, target_layers
         )
-        print(f"[DEBUG] A_q0  max={A_q0.max():.6f}, mean={A_q0.mean():.8f}")
-
+        print(f"[DEBUG] A_q0 max={A_q0.max():.6f}, mean={A_q0.mean():.8f}")
         patch_scores = A_q / (A_q0 + 1e-8)
         print(f"[DEBUG] relative max={patch_scores.max():.4f}, mean={patch_scores.mean():.6f}")
     else:
         patch_scores = A_q
 
     return {
-        "patch_scores"  : patch_scores,
-        "answer_token"  : answer_token,
-        "use_relative"  : use_relative,
-        "grid_size"     : grid_size,
-        "target_layers" : target_layers,
+        "patch_scores" : patch_scores,
+        "answer"       : answer,
+        "use_relative" : use_relative,
+        "grid_size"    : grid_size,
+        "target_layers": target_layers,
     }
 
 
@@ -166,16 +198,18 @@ def visualize_attention(
     save_path: str | None = None,
 ):
     """
-    Visualize last-input-token→image attention map overlaid on original image.
+    Visualize question-text→image attention map overlaid on the image.
+
+    Note: pass clip_image (CLIP's 336x336 view) for best spatial alignment.
 
     Args:
-        image       : original PIL.Image
+        image       : PIL.Image to overlay on (recommend using clip_image)
         attn_result : output from get_attention_maps()
         alpha       : heatmap overlay transparency
-        save_path   : optional path to save the figure
+        save_path   : optional save path
     """
     patch_scores  = attn_result["patch_scores"]
-    answer_token  = attn_result.get("answer_token", "?")
+    answer        = attn_result.get("answer", "?")
     use_relative  = attn_result.get("use_relative", False)
     grid_size     = attn_result.get("grid_size", 24)
     target_layers = attn_result.get("target_layers", (6, 13, 20, 27))
@@ -183,7 +217,7 @@ def visualize_attention(
     # reshape to spatial grid
     attn_map = patch_scores[:grid_size * grid_size].reshape(grid_size, grid_size).numpy()
 
-    # apply gaussian blur to smooth sparse hotspots (before normalization)
+    # gaussian blur before normalization (smooth sparse hotspots)
     from scipy.ndimage import gaussian_filter
     attn_map = gaussian_filter(attn_map, sigma=1.0)
 
@@ -191,7 +225,7 @@ def visualize_attention(
     vmin, vmax = attn_map.min(), attn_map.max()
     attn_map = (attn_map - vmin) / (vmax - vmin + 1e-8)
 
-    # resize to original image size
+    # resize to image size
     heatmap = Image.fromarray((attn_map * 255).astype(np.uint8)).resize(
         image.size, resample=Image.BILINEAR
     )
@@ -204,8 +238,9 @@ def visualize_attention(
 
     mode = "relative" if use_relative else "raw"
     plt.suptitle(
-        f"Answer='{answer_token}'  mode={mode}  layers={target_layers}",
-        fontsize=11, y=1.02,
+        f"Attention Map  |  answer='{answer[:40]}'\n"
+        f"mode={mode}  layers={list(target_layers)}  rater_filter",
+        fontsize=10, y=1.02,
     )
     plt.tight_layout()
 
