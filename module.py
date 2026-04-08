@@ -442,7 +442,7 @@ class QVTree(nn.Module):
         Dq: Optional[int] = None,
         use_proj_if_needed: bool = True,
         split_threshold: float = 0.15,
-        softmax_temperature: float = 0.5,
+        softmax_temperature: float = 0.4,
         eps: float = 1e-6,
     ):
         super().__init__()
