@@ -20,6 +20,7 @@ def download_vstar_dataset(
         repo_type="dataset",
         local_dir=save_dir,
         resume_download=True,
+        max_workers=1,
     )
 
     print("[INFO] VStar download complete.")
@@ -40,6 +41,7 @@ def download_hrbench_dataset(
         repo_type="dataset",
         local_dir=save_dir,
         resume_download=True,
+        max_workers=1,
     )
 
     print("[INFO] HR-Bench download complete.")
