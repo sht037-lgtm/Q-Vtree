@@ -241,7 +241,7 @@ class QVTree(nn.Module):
     def __init__(
         self,
         D: int,
-        split_threshold: float = 0.5,
+        split_threshold: float = 0.3,
         eps: float = 1e-6,
     ):
         super().__init__()
