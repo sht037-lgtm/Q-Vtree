@@ -168,7 +168,7 @@ class QuadTreeNavigator:
                 vals = patch_scores[b, idx]
 
                 # prune: if even the peak of this region is below global mean, discard
-                if vals.max() < global_mean[b]:
+                if vals.mean() < global_mean[b]:
                     continue
 
                 children = nodes[pid].children
