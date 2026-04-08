@@ -127,14 +127,17 @@ class QuadTreeNavigator:
     Navigate the tree using a precomputed patch score map.
 
     For each node:
-      1) discard if softmax-pooled score < global softmax-pooled score
-      2) if split_score > split_threshold: recurse into children
-      3) otherwise: select this node
+      1) Prune if max score in region < global mean score (no hyperparameter needed)
+      2) Split if coefficient of variation (std/mean) > split_threshold
+      3) Otherwise: select this node
+
+    Only one hyperparameter: split_threshold.
+      - Higher value → less splitting → larger, coarser regions selected
+      - Lower value  → more splitting → smaller, finer regions selected
     """
 
-    def __init__(self, split_threshold: float, softmax_temperature: float, eps: float = 1e-6):
+    def __init__(self, split_threshold: float = 0.5, eps: float = 1e-6):
         self.split_threshold = float(split_threshold)
-        self.softmax_temperature = float(softmax_temperature)
         self.eps = float(eps)
 
     @staticmethod
@@ -144,15 +147,12 @@ class QuadTreeNavigator:
         rr, cc = torch.meshgrid(rows, cols, indexing="ij")
         return (rr * W + cc).reshape(-1)
 
-    def _softmax_pool(self, vals: torch.Tensor) -> torch.Tensor:
-        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
-        return torch.sum(weights * vals)
-
     @torch.no_grad()
     def select_nodes(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
         B, N = patch_scores.shape
-        weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
-        global_soft = (weights * patch_scores).sum(dim=1)
+
+        # global mean per batch item — used as pruning baseline
+        global_mean = patch_scores.mean(dim=1)  # [B]
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -166,10 +166,9 @@ class QuadTreeNavigator:
                 reg = nodes[pid].region
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
-                s_soft = self._softmax_pool(vals)
-                s_avg = vals.mean()
 
-                if s_soft < global_soft[b]:
+                # prune: if even the peak of this region is below global mean, discard
+                if vals.max() < global_mean[b]:
                     continue
 
                 children = nodes[pid].children
@@ -177,8 +176,13 @@ class QuadTreeNavigator:
                     selected[b].append(pid)
                     continue
 
-                split_score = (s_soft - s_avg) / (s_avg + self.eps)
-                if split_score > self.split_threshold:
+                # split criterion: coefficient of variation (std / mean)
+                # high CV → scores are spread out → worth splitting for finer detail
+                mean = vals.mean()
+                std = vals.std()
+                cv = std / (mean + self.eps)
+
+                if cv > self.split_threshold:
                     Q.extend(children)
                 else:
                     selected[b].append(pid)
@@ -227,19 +231,24 @@ class QuadTreeNavigator:
 
 
 class QVTree(nn.Module):
-    """QuadTree-based visual token selector. Uses builder + navigator; scorer is external."""
+    """QuadTree-based visual token selector. Uses builder + navigator; scorer is external.
+
+    Args:
+        D: hidden dimension (unused here, kept for API compatibility)
+        split_threshold: coefficient of variation threshold for splitting.
+            Higher → coarser selection. Lower → finer selection. Default 0.5.
+        eps: numerical stability epsilon.
+    """
 
     def __init__(
         self,
         D: int,
-        split_threshold: float = 0.1,
-        softmax_temperature: float = 0.3,
+        split_threshold: float = 0.5,
         eps: float = 1e-6,
     ):
         super().__init__()
         self.builder = QuadTreeBuilder()
         self.navigator = QuadTreeNavigator(
             split_threshold=split_threshold,
-            softmax_temperature=softmax_temperature,
             eps=eps,
         )
