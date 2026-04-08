@@ -105,16 +105,8 @@ def _get_answer_attention(
         attn_to_img = attn[0, :, :, vp]            # [H, seq_len, N_img]
         attn_to_img = attn_to_img[:, qp, :]        # [H, num_query, N_img]
 
-        # rater filter: keep query tokens with attention sum >= mean
-        token_sum  = attn_to_img.mean(dim=0).sum(dim=1)   # [num_query]
-        keep_mask  = token_sum >= token_sum.mean()
-        if keep_mask.sum() == 0:
-            keep_mask = torch.ones_like(keep_mask, dtype=torch.bool)
-
-        print(f"[DEBUG] Layer {l}: kept {keep_mask.sum().item()}/{len(keep_mask)} query tokens")
-
-        # mean over filtered tokens and heads → [N_img]
-        s = attn_to_img[:, keep_mask, :].mean(dim=0).mean(dim=0).cpu().float()
+        # mean over all query tokens and heads → [N_img] (no rater filter)
+        s = attn_to_img.mean(dim=0).mean(dim=0).cpu().float()
         layer_scores.append(s)
 
     patch_scores = torch.stack(layer_scores).mean(dim=0)   # [N_img]
