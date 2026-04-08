@@ -125,7 +125,7 @@ def get_attention_maps(
     question: str,
     target_layers: tuple = (6, 13, 20, 27),
     use_relative: bool = True,
-    generic_question: str = "Describe the image in detail.",
+    generic_question: str = "What is the relationship between the objects in the picture.",
     grid_size: int = 24,
 ):
     """
