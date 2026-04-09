@@ -48,14 +48,10 @@ def merge_bboxes(bboxes):
     return merged
 
 
-def build_compact_image(image: Image.Image, bboxes):
-    """LPD: recompose selected regions preserving relative spatial layout.
-    Returns (compact_image, valid_patch_mask) where valid_patch_mask is a
-    bool tensor of shape [nH*nW] marking which 14x14 encoder patches are
-    real content (True) vs white-fill holes (False).
-    """
+def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
+    """LPD: recompose selected regions preserving relative spatial layout."""
     if not bboxes:
-        return image, None
+        return image
 
     img_w, img_h = image.size
     x_coords = sorted(set([0, img_w] + [x for b in bboxes for x in (b[0], b[2])]))
@@ -81,54 +77,17 @@ def build_compact_image(image: Image.Image, bboxes):
             new_h += y_coords[j+1] - y_coords[j]
 
     if new_w == 0 or new_h == 0:
-        return image, None
+        return image
 
     compact = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
-
-    # valid_patch_mask: tracks which 14x14 encoder patches have real content
-    # will be downsampled 2x after SigLIP pooling to match final token count
-    enc_patch = 14
-    nH = (new_h + enc_patch - 1) // enc_patch
-    nW = (new_w + enc_patch - 1) // enc_patch
-    valid_pixel_mask = torch.zeros(new_h, new_w, dtype=torch.bool)
-
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
                 if i not in x_map or j not in y_map:
                     continue
                 patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
-                dst_x, dst_y = x_map[i], y_map[j]
-                compact.paste(patch, (dst_x, dst_y))
-                # mark the destination pixel region as valid
-                cell_w = x_coords[i+1] - x_coords[i]
-                cell_h = y_coords[j+1] - y_coords[j]
-                valid_pixel_mask[dst_y:dst_y+cell_h, dst_x:dst_x+cell_w] = True
-
-    # aggregate pixel mask → 14x14 encoder patch mask (any valid pixel → valid patch)
-    # pad to multiple of enc_patch first
-    pH = (enc_patch - new_h % enc_patch) % enc_patch
-    pW = (enc_patch - new_w % enc_patch) % enc_patch
-    if pH > 0 or pW > 0:
-        valid_pixel_mask = F.pad(valid_pixel_mask.float().unsqueeze(0).unsqueeze(0),
-                                 (0, pW, 0, pH)).squeeze() > 0
-    nH_pad = valid_pixel_mask.shape[0] // enc_patch
-    nW_pad = valid_pixel_mask.shape[1] // enc_patch
-    valid_enc_mask = valid_pixel_mask.float().reshape(nH_pad, enc_patch, nW_pad, enc_patch)
-    valid_enc_mask = (valid_enc_mask.sum(dim=(1, 3)) > 0)  # [nH_pad, nW_pad]
-
-    # SigLIP pooling halves spatial dims (2x2 → 1), so downsample mask by 2
-    # pool: any of the 4 encoder patches valid → pooled patch valid
-    nH2, nW2 = nH_pad // 2, nW_pad // 2
-    if nH2 > 0 and nW2 > 0:
-        valid_pooled = valid_enc_mask[:nH2*2, :nW2*2].float().reshape(nH2, 2, nW2, 2)
-        valid_pooled = (valid_pooled.sum(dim=(1, 3)) > 0)  # [nH2, nW2]
-    else:
-        valid_pooled = valid_enc_mask
-
-    valid_patch_mask = valid_pooled.reshape(-1)  # [nH2*nW2]
-
-    return compact, valid_patch_mask
+                compact.paste(patch, (x_map[i], y_map[j]))
+    return compact
 
 
 class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
@@ -150,7 +109,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         self._debug_patch_scores = None
         self._debug_compact_images = None  # compact PIL Images per image
         self._debug_bboxes = None          # merged bboxes per image
-        self._debug_valid_patch_masks = None  # valid patch masks per image
 
     def forward(
             self,
@@ -189,7 +147,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             self._debug_select_ratios = []
             self._debug_compact_images = []
             self._debug_bboxes = []
-            self._debug_valid_patch_masks = []
 
             # encode image tokens
             image_tokens_list = self.get_image_features(
@@ -223,7 +180,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             img_end = vis_positions[-1].item()
             seq_len = input_ids.shape[1]
             text_start, text_end = img_end + 1, seq_len - 3
-
             text_positions = (
                 torch.arange(text_start, text_end, dtype=torch.long)
                 if text_end > text_start
@@ -234,7 +190,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 """Mean attention from query tokens to image patches.
                 Uses hooks on layers [6, 13, 20, 27] and averages results.
                 """
-                target_layer_ids = [27]
+                target_layer_ids = [20]
                 lm = self.language_model
                 lm_layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
 
@@ -388,12 +344,11 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                         "Use: tree_model.model.raw_images = [pil_image]"
                     )
 
-                # LPD: patch_ids → bboxes → merge → compact image + valid mask
+                # LPD: patch_ids → bboxes → merge → compact image
                 merged_bboxes = merge_bboxes(patch_ids_to_bboxes(patch_ids.cpu(), grid_w, patch_size))
-                compact_img, valid_patch_mask = build_compact_image(pil_img, merged_bboxes)
+                compact_img = build_compact_image(pil_img, merged_bboxes)
                 self._debug_compact_images.append(compact_img)
                 self._debug_bboxes.append(merged_bboxes)
-                self._debug_valid_patch_masks.append(valid_patch_mask)
 
                 # re-encode compact image: normalize → patch format [N, 2*C*14*14]
                 compact_tensor = (
@@ -448,12 +403,9 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 n_compact = int(image_embeds_compact.shape[0])
                 new_ids = original_ids[:vs_pos + 1] + [151655] * n_compact + original_ids[ve_pos:]
                 new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
-
-                # 全1 mask 用于计算 position_ids
                 new_attention_mask = torch.ones(
                     1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
                 )
-
                 new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
                 image_mask_compact, _ = self.get_placeholder_mask(
                     new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_compact,
@@ -461,28 +413,16 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 new_inputs_embeds = torch.nan_to_num(
                     new_inputs_embeds.masked_scatter(image_mask_compact, image_embeds_compact)
                 )
-
-                # 用全1 mask 算 position_ids，避免 shape mismatch
                 position_ids = self.compute_3d_position_ids(
                     input_ids=new_input_ids, image_grid_thw=compact_grid_thw,
                     video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
                     inputs_embeds=new_inputs_embeds, attention_mask=new_attention_mask,
                     past_key_values=past_key_values,
                 )
-
-                # position_ids 算完之后，再把空洞 token 置 0
-                if self._debug_valid_patch_masks and self._debug_valid_patch_masks[0] is not None:
-                    valid_mask = self._debug_valid_patch_masks[0].to(device=attention_mask.device)
-                    if valid_mask.numel() >= n_compact:
-                        valid_mask = valid_mask[:n_compact]
-                    else:
-                        pad = torch.ones(n_compact - valid_mask.numel(), dtype=torch.bool,
-                                         device=attention_mask.device)
-                        valid_mask = torch.cat([valid_mask, pad])
-                    new_attention_mask[0, vs_pos + 1: vs_pos + 1 + n_compact] = valid_mask.long()
-
                 inputs_embeds = new_inputs_embeds
                 attention_mask = new_attention_mask
+            else:
+                inputs_embeds = inputs_embeds_full
 
         if pixel_values_videos is not None:
             video_embeds = torch.cat(
