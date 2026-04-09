@@ -127,22 +127,13 @@ class QuadTreeNavigator:
     Navigate the tree using a precomputed patch score map.
 
     For each node:
-      1) Prune if softmax-pooled score < global softmax-pooled score
-         (softmax pooling is sensitive to local peaks, prevents pruning regions
-          with small but important areas)
-      2) Split if coefficient of variation (std/mean) > split_threshold
-      3) Otherwise: select this node
-
-    Two parameters with decoupled roles:
-      softmax_temperature: controls pruning sensitivity to local high-score patches.
-                           Fixed at a sensible default, not exposed to users.
-      split_threshold:     controls splitting granularity. The only tunable param.
-                           Higher → coarser regions. Lower → finer regions.
+      1) split if split_score > split_threshold: recurse into children
+      2) prune if region mean < global mean
+      3) otherwise: select this node
     """
 
-    def __init__(self, split_threshold: float = 0.5, softmax_temperature: float = 0.3, eps: float = 1e-6):
+    def __init__(self, split_threshold: float, eps: float = 1e-6):
         self.split_threshold = float(split_threshold)
-        self.softmax_temperature = float(softmax_temperature)
         self.eps = float(eps)
 
     @staticmethod
@@ -152,15 +143,10 @@ class QuadTreeNavigator:
         rr, cc = torch.meshgrid(rows, cols, indexing="ij")
         return (rr * W + cc).reshape(-1)
 
-    def _softmax_pool(self, vals: torch.Tensor) -> torch.Tensor:
-        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
-        return torch.sum(weights * vals)
 
     @torch.no_grad()
     def select_nodes(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
         B, N = patch_scores.shape
-
-        # global mean — pruning baseline
         global_mean = patch_scores.mean(dim=1)  # [B]
 
         selected = [[] for _ in range(B)]
@@ -175,29 +161,24 @@ class QuadTreeNavigator:
                 reg = nodes[pid].region
                 idx = self.region_to_token_indices(reg, W, patch_scores.device)
                 vals = patch_scores[b, idx]
-
-                # prune: local softmax pool vs global mean
-                # softmax_temperature controls sensitivity:
-                #   low temp  → pool dominated by peak → less pruning (sensitive to local highlights)
-                #   high temp → pool approaches mean   → more pruning (stricter)
-                s_soft = self._softmax_pool(vals)
-                if s_soft < global_mean[b]:
-                    continue
-
                 children = nodes[pid].children
-                if not children:
-                    selected[b].append(pid)
+
+                # split first: recurse if region has internal score concentration
+                # fixed temperature=1 softmax, decoupled from pruning
+                weights_split = torch.softmax(vals, dim=0)
+                s_soft_split = (weights_split * vals).sum()
+                s_avg = vals.mean()
+                split_score = (s_soft_split - s_avg) / (s_avg + self.eps)
+
+                if children and split_score > self.split_threshold:
+                    Q.extend(children)
                     continue
 
-                # split: coefficient of variation measures internal score spread
-                mean = vals.mean()
-                std = vals.std()
-                cv = std / (mean + self.eps)
+                # prune: discard if region mean < global mean
+                if s_avg < global_mean[b]:
+                    continue
 
-                if cv > self.split_threshold:
-                    Q.extend(children)
-                else:
-                    selected[b].append(pid)
+                selected[b].append(pid)
 
         return selected, visited
 
@@ -242,28 +223,18 @@ class QuadTreeNavigator:
         return out
 
 
-
 class QVTree(nn.Module):
-    """QuadTree-based visual token selector. Uses builder + navigator; scorer is external.
-
-    Args:
-        D: hidden dimension (unused here, kept for API compatibility)
-        split_threshold: coefficient of variation threshold for splitting.
-            Higher → coarser selection. Lower → finer selection. Default 0.5.
-        eps: numerical stability epsilon.
-    """
+    """QuadTree-based visual token selector. Uses builder + navigator; scorer is external."""
 
     def __init__(
         self,
         D: int,
-        split_threshold: float = 0.2,  # bigger split_threshold means less split
-        softmax_temperature: float = 1.0,  # bigger softmax_temperature means more pruning
+        split_threshold: float = 0.1,
         eps: float = 1e-6,
     ):
         super().__init__()
         self.builder = QuadTreeBuilder()
         self.navigator = QuadTreeNavigator(
             split_threshold=split_threshold,
-            softmax_temperature=softmax_temperature,
             eps=eps,
         )

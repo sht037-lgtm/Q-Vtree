@@ -60,19 +60,21 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     def cell_has_content(x0, y0, x1, y1):
         return any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1] for b in bboxes)
 
-    new_w, x_map = 0, {0: 0}
+    new_w, x_map = 0, {}
     for i in range(len(x_coords) - 1):
-        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-               for j in range(len(y_coords) - 1)):
+        col_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+                      for j in range(len(y_coords) - 1))
+        if col_has:
+            x_map[i] = new_w
             new_w += x_coords[i+1] - x_coords[i]
-        x_map[i+1] = new_w
 
-    new_h, y_map = 0, {0: 0}
+    new_h, y_map = 0, {}
     for j in range(len(y_coords) - 1):
-        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-               for i in range(len(x_coords) - 1)):
+        row_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+                      for i in range(len(x_coords) - 1))
+        if row_has:
+            y_map[j] = new_h
             new_h += y_coords[j+1] - y_coords[j]
-        y_map[j+1] = new_h
 
     if new_w == 0 or new_h == 0:
         return image
@@ -81,6 +83,8 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
+                if i not in x_map or j not in y_map:
+                    continue
                 patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
                 compact.paste(patch, (x_map[i], y_map[j]))
     return compact
@@ -91,6 +95,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         super().__init__(config)
         self.qvtree = QVTree(D=config.text_config.hidden_size)
         self._generic_token_ids = None
+
+        # raw PIL images for LPD (set before generate)
+        # usage: tree_model.model.raw_images = [pil_image]
+        self.raw_images = None
 
         # debug states
         self._debug_selected_idx = None
@@ -180,22 +188,25 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             def get_attn_scores(embeds_in, mask_in, pos_in, query_positions):
                 """Mean attention from query tokens to image patches.
-                Uses a forward hook on layer 27 only to avoid storing all layers' attention weights.
+                Uses hooks on layers [6, 13, 20, 27] and averages results.
                 """
-                captured = {}
-
-                # find layer 27
+                target_layer_ids = [20]
                 lm = self.language_model
-                layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
-                target_layer = layers[27]
+                lm_layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
 
-                def hook_fn(module, input, output):
-                    # output is (hidden_states, attn_weights, ...)
-                    # attn_weights shape: [B, heads, seq_len, seq_len]
-                    if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                        captured["attn"] = output[1].detach().cpu()
+                captured = {}
+                handles = []
 
-                handle = target_layer.self_attn.register_forward_hook(hook_fn)
+                for lid in target_layer_ids:
+                    def make_hook(layer_id):
+                        def hook_fn(module, input, output):
+                            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                                captured[layer_id] = output[1].detach().cpu()
+                        return hook_fn
+                    handles.append(
+                        lm_layers[lid].self_attn.register_forward_hook(make_hook(lid))
+                    )
+
                 try:
                     with torch.no_grad():
                         self.language_model(
@@ -204,17 +215,23 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                             output_hidden_states=False, return_dict=True, use_cache=False,
                         )
                 finally:
-                    handle.remove()
+                    for h in handles:
+                        h.remove()
 
-                if "attn" not in captured:
-                    raise RuntimeError("Hook did not capture attention weights. "
+                if not captured:
+                    raise RuntimeError("Hooks did not capture attention weights. "
                                        "Ensure model is loaded with attn_implementation='eager'.")
 
-                layer_attn = captured["attn"]  # [B, heads, seq_len, seq_len]
                 vp = vis_positions
                 qp = query_positions
-                attn = layer_attn[0, :, :, vp][:, qp, :]  # [heads, Q, N_img]
-                result = attn.mean(dim=0).mean(dim=0).float()  # [N_img]
+                scores = []
+                for lid in target_layer_ids:
+                    if lid not in captured:
+                        continue
+                    layer_attn = captured[lid]  # [B, heads, seq_len, seq_len]
+                    attn = layer_attn[0, :, :, vp][:, qp, :]  # [heads, Q, N_img]
+                    scores.append(attn.mean(dim=0).mean(dim=0).float())
+                result = torch.stack(scores).mean(dim=0)  # [N_img]
                 del captured
                 torch.cuda.empty_cache()
                 return result
@@ -312,22 +329,20 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
 
-                # reconstruct PIL image from pixel_values
-                patch_size, C = 28, 3
-                n_patches_raw = grid_h_raw * grid_w_raw
-                patch_offset_raw = sum(
-                    image_grid_thw[k][1].item() * image_grid_thw[k][2].item() for k in range(i)
-                )
-                img_patches = pixel_values[patch_offset_raw: patch_offset_raw + n_patches_raw]
-                img_patches = img_patches.view(n_patches_raw, 2, C, 14, 14)[:, 0]
-                img_tensor = (
-                    img_patches.reshape(grid_h_raw, grid_w_raw, C, 14, 14)
-                    .permute(2, 0, 3, 1, 4)
-                    .reshape(C, grid_h_raw * 14, grid_w_raw * 14)
-                )
-                img_tensor = (img_tensor * 0.5 + 0.5).clamp(0, 1)
-                img_np = np.transpose((img_tensor.cpu().float().numpy() * 255).astype(np.uint8), (1, 2, 0))
-                pil_img = Image.fromarray(img_np).resize((grid_w * patch_size, grid_h * patch_size), Image.BILINEAR)
+                C = 3
+                patch_size = 28
+                image_w_px = grid_w * patch_size
+                image_h_px = grid_h * patch_size
+                raw_images = getattr(self, 'raw_images', None)
+                if raw_images is not None and i < len(raw_images):
+                    pil_img = raw_images[i].convert("RGB").resize(
+                        (image_w_px, image_h_px), Image.BILINEAR
+                    )
+                else:
+                    raise ValueError(
+                        "raw_images must be set before generate(). "
+                        "Use: tree_model.model.raw_images = [pil_image]"
+                    )
 
                 # LPD: patch_ids → bboxes → merge → compact image
                 merged_bboxes = merge_bboxes(patch_ids_to_bboxes(patch_ids.cpu(), grid_w, patch_size))
