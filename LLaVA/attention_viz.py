@@ -195,4 +195,3 @@ def visualize_attention(
         print(f"[INFO] Saved to {save_path}")
 
     plt.show()
-    print("dsadasdas")
