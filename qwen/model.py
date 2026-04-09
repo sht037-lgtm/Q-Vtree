@@ -449,23 +449,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 new_ids = original_ids[:vs_pos + 1] + [151655] * n_compact + original_ids[ve_pos:]
                 new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
 
-                # base attention mask: all ones
+                # 全1 mask 用于计算 position_ids
                 new_attention_mask = torch.ones(
                     1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
                 )
-
-                # mask out white-fill hole tokens using valid_patch_mask
-                if self._debug_valid_patch_masks and self._debug_valid_patch_masks[0] is not None:
-                    valid_mask = self._debug_valid_patch_masks[0].to(device=attention_mask.device)
-                    # align mask length to n_compact (may differ slightly due to padding)
-                    if valid_mask.numel() >= n_compact:
-                        valid_mask = valid_mask[:n_compact]
-                    else:
-                        # pad with True if mask is shorter (shouldn't normally happen)
-                        pad = torch.ones(n_compact - valid_mask.numel(), dtype=torch.bool,
-                                         device=attention_mask.device)
-                        valid_mask = torch.cat([valid_mask, pad])
-                    new_attention_mask[0, vs_pos + 1: vs_pos + 1 + n_compact] = valid_mask.long()
 
                 new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
                 image_mask_compact, _ = self.get_placeholder_mask(
@@ -474,16 +461,28 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 new_inputs_embeds = torch.nan_to_num(
                     new_inputs_embeds.masked_scatter(image_mask_compact, image_embeds_compact)
                 )
+
+                # 用全1 mask 算 position_ids，避免 shape mismatch
                 position_ids = self.compute_3d_position_ids(
                     input_ids=new_input_ids, image_grid_thw=compact_grid_thw,
                     video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
                     inputs_embeds=new_inputs_embeds, attention_mask=new_attention_mask,
                     past_key_values=past_key_values,
                 )
+
+                # position_ids 算完之后，再把空洞 token 置 0
+                if self._debug_valid_patch_masks and self._debug_valid_patch_masks[0] is not None:
+                    valid_mask = self._debug_valid_patch_masks[0].to(device=attention_mask.device)
+                    if valid_mask.numel() >= n_compact:
+                        valid_mask = valid_mask[:n_compact]
+                    else:
+                        pad = torch.ones(n_compact - valid_mask.numel(), dtype=torch.bool,
+                                         device=attention_mask.device)
+                        valid_mask = torch.cat([valid_mask, pad])
+                    new_attention_mask[0, vs_pos + 1: vs_pos + 1 + n_compact] = valid_mask.long()
+
                 inputs_embeds = new_inputs_embeds
                 attention_mask = new_attention_mask
-            else:
-                inputs_embeds = inputs_embeds_full
 
         if pixel_values_videos is not None:
             video_embeds = torch.cat(
