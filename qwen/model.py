@@ -77,7 +77,7 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     if new_w == 0 or new_h == 0:
         return image
 
-    compact = Image.new("RGB", (new_w, new_h), color=(0, 0, 0))
+    compact = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
