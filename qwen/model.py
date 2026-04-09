@@ -77,7 +77,7 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     if new_w == 0 or new_h == 0:
         return image
 
-    compact = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
+    compact = Image.new("RGB", (new_w, new_h), color=(0, 0, 0))
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
@@ -374,40 +374,39 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 torch.cat(image_tokens_compact, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             )
 
-            # rebuild input_ids with updated image placeholder count to match compact tokens
-            original_ids = input_ids[0].tolist()
-            try:
-                vs_pos = original_ids.index(151652)  # vision_start
-                ve_pos = original_ids.index(151653)  # vision_end
-            except ValueError:
-                image_embeds_compact = image_embeds_full
-                compact_grid_thw = image_grid_thw
-                vs_pos = None
+            # Use full image embeddings for inference
+            inputs_embeds = inputs_embeds_full
 
-            if vs_pos is not None:
-                n_compact = int(image_embeds_compact.shape[0])
-                new_ids = original_ids[:vs_pos + 1] + [151655] * n_compact + original_ids[ve_pos:]
-                new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
-                new_attention_mask = torch.ones(
-                    1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
-                )
-                new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
-                image_mask_compact, _ = self.get_placeholder_mask(
-                    new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_compact,
-                )
-                new_inputs_embeds = torch.nan_to_num(
-                    new_inputs_embeds.masked_scatter(image_mask_compact, image_embeds_compact)
-                )
-                position_ids = self.compute_3d_position_ids(
-                    input_ids=new_input_ids, image_grid_thw=compact_grid_thw,
-                    video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
-                    inputs_embeds=new_inputs_embeds, attention_mask=new_attention_mask,
-                    past_key_values=past_key_values,
-                )
-                inputs_embeds = new_inputs_embeds
-                attention_mask = new_attention_mask
-            else:
-                inputs_embeds = inputs_embeds_full
+            # ── Attention bias: guide LLM to focus on selected tokens ────────
+            # Build an additive bias over image token positions:
+            #   selected patches   → +attn_bias_pos
+            #   unselected patches → +attn_bias_neg
+            # Stored as self._attn_bias_mask [1, 1, 1, seq_len] to be added
+            # to the causal mask inside language_model forward.
+            attn_bias_pos =  2.0   # boost for selected tokens
+            attn_bias_neg = -2.0   # suppress for unselected tokens
+
+            seq_len_full = inputs_embeds_full.shape[1]
+            attn_bias = torch.zeros(
+                1, 1, 1, seq_len_full,
+                device=inputs_embeds_full.device,
+                dtype=inputs_embeds_full.dtype,
+            )
+
+            # vis_positions: positions of all image tokens in the sequence
+            # patch_ids: selected patch indices (into the image token block)
+            all_img_pos = vis_positions.to(inputs_embeds_full.device)  # [N_total]
+            sel_patch_ids = self._debug_patch_ids[0].to(inputs_embeds_full.device)  # [N_sel]
+
+            # mark all image positions as unselected first
+            attn_bias[0, 0, 0, all_img_pos] = attn_bias_neg
+
+            # then mark selected patch positions as boosted
+            # patch_ids index into the image token block, map to sequence positions
+            selected_seq_pos = all_img_pos[sel_patch_ids]
+            attn_bias[0, 0, 0, selected_seq_pos] = attn_bias_pos
+
+            self._attn_bias_mask = attn_bias
 
         if pixel_values_videos is not None:
             video_embeds = torch.cat(
@@ -432,10 +431,31 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
         cache_position = torch.arange(past_len, past_len + seq_len, device=inputs_embeds.device)
 
+        # Apply attention bias to guide focus on selected image tokens
+        if hasattr(self, '_attn_bias_mask') and self._attn_bias_mask is not None:
+            # Expand attention_mask to 4D additive format if needed, then add bias
+            # Qwen uses additive causal mask internally; we inject bias via attention_mask
+            # by converting boolean mask to additive and adding the bias
+            if attention_mask.dim() == 2:
+                # convert [1, seq_len] bool mask → [1, 1, seq_len, seq_len] additive
+                additive_mask = torch.zeros(
+                    1, 1, attention_mask.shape[1], attention_mask.shape[1],
+                    device=attention_mask.device, dtype=inputs_embeds.dtype
+                )
+                # add per-column bias (each query attends to keys with bias)
+                additive_mask = additive_mask + self._attn_bias_mask
+                # pass as attention_mask — Qwen accepts 4D additive masks
+                attn_mask_input = additive_mask
+            else:
+                attn_mask_input = attention_mask
+            self._attn_bias_mask = None  # clear after use
+        else:
+            attn_mask_input = attention_mask
+
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
-            attention_mask=attention_mask,
+            attention_mask=attn_mask_input,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
