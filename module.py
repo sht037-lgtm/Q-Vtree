@@ -132,8 +132,9 @@ class QuadTreeNavigator:
       3) otherwise: select this node
     """
 
-    def __init__(self, split_threshold: float, eps: float = 1e-6):
+    def __init__(self, split_threshold: float, softmax_temperature: float = 0.3, eps: float = 1e-6):
         self.split_threshold = float(split_threshold)
+        self.softmax_temperature = float(softmax_temperature)
         self.eps = float(eps)
 
     @staticmethod
@@ -144,10 +145,17 @@ class QuadTreeNavigator:
         return (rr * W + cc).reshape(-1)
 
 
+    def _softmax_pool(self, vals: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(vals / self.softmax_temperature, dim=0)
+        return torch.sum(weights * vals)
+
     @torch.no_grad()
     def select_nodes(self, nodes: List[Node], patch_scores: torch.Tensor, W: int):
         B, N = patch_scores.shape
-        global_mean = patch_scores.mean(dim=1)  # [B]
+        # global softmax-pooled score — adaptive pruning baseline
+        # low softmax_temperature → dominated by high-score patches → stricter pruning
+        global_weights = torch.softmax(patch_scores / self.softmax_temperature, dim=1)
+        global_soft = (global_weights * patch_scores).sum(dim=1)  # [B]
 
         selected = [[] for _ in range(B)]
         visited = [[] for _ in range(B)]
@@ -164,8 +172,8 @@ class QuadTreeNavigator:
                 children = nodes[pid].children
 
                 # split first: recurse if region has internal score concentration
-                # fixed temperature=1 softmax, decoupled from pruning
-                weights_split = torch.softmax(vals, dim=0)
+                # fixed temperature=0.1 softmax, decoupled from pruning
+                weights_split = torch.softmax(vals/0.1, dim=0)
                 s_soft_split = (weights_split * vals).sum()
                 s_avg = vals.mean()
                 split_score = (s_soft_split - s_avg) / (s_avg + self.eps)
@@ -174,8 +182,9 @@ class QuadTreeNavigator:
                     Q.extend(children)
                     continue
 
-                # prune: discard if region mean < global mean
-                if s_avg < global_mean[b]:
+                # prune: discard if local softmax pool < global softmax pool
+                s_soft = self._softmax_pool(vals)
+                if s_soft < global_soft[b]:
                     continue
 
                 selected[b].append(pid)
@@ -229,12 +238,14 @@ class QVTree(nn.Module):
     def __init__(
         self,
         D: int,
-        split_threshold: float = 0.1,
+        split_threshold: float = 0.3,
+        softmax_temperature: float = 0.2,
         eps: float = 1e-6,
     ):
         super().__init__()
         self.builder = QuadTreeBuilder()
         self.navigator = QuadTreeNavigator(
             split_threshold=split_threshold,
+            softmax_temperature=softmax_temperature,
             eps=eps,
         )

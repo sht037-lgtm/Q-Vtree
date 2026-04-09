@@ -169,6 +169,9 @@ def run_vstar_inference(
                     for k, v in inputs.items()
                 }
 
+                if model_type == "tree_qwen" and hasattr(model, "model"):
+                    model.model.raw_images = [image]
+
                 with torch.inference_mode():
                     outputs = model.generate(
                         **inputs,
@@ -192,7 +195,7 @@ def run_vstar_inference(
                         category_select_ratios[cat].append(sample_select_ratio)
 
                 pred_text = processor.batch_decode(
-                    outputs[:, -max_new_tokens:],
+                    outputs[:, inputs["input_ids"].shape[1]:],
                     skip_special_tokens=True,
                 )[0].strip()
 
@@ -364,6 +367,9 @@ def run_hrbench_inference(
                     for k, v in inputs.items()
                 }
 
+                if model_type == "tree_qwen" and hasattr(model, "model"):
+                    model.model.raw_images = [image]
+
                 with torch.inference_mode():
                     outputs = model.generate(
                         **inputs,
@@ -392,7 +398,7 @@ def run_hrbench_inference(
                         cycle_category_select_ratios[cyc].append(sample_select_ratio)
 
                 pred_text = processor.batch_decode(
-                    outputs[:, -max_new_tokens:],
+                    outputs[:, inputs["input_ids"].shape[1]:],
                     skip_special_tokens=True,
                 )[0].strip()
 
