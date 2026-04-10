@@ -60,27 +60,31 @@ def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
     def cell_has_content(x0, y0, x1, y1):
         return any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1] for b in bboxes)
 
-    new_w, x_map = 0, {0: 0}
+    new_w, x_map = 0, {}
     for i in range(len(x_coords) - 1):
-        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-               for j in range(len(y_coords) - 1)):
+        col_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+                      for j in range(len(y_coords) - 1))
+        if col_has:
+            x_map[i] = new_w
             new_w += x_coords[i+1] - x_coords[i]
-        x_map[i+1] = new_w
 
-    new_h, y_map = 0, {0: 0}
+    new_h, y_map = 0, {}
     for j in range(len(y_coords) - 1):
-        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-               for i in range(len(x_coords) - 1)):
+        row_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+                      for i in range(len(x_coords) - 1))
+        if row_has:
+            y_map[j] = new_h
             new_h += y_coords[j+1] - y_coords[j]
-        y_map[j+1] = new_h
 
     if new_w == 0 or new_h == 0:
         return image
 
-    compact = Image.new("RGB", (new_w, new_h), color=(0, 0, 0))
+    compact = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
     for i in range(len(x_coords) - 1):
         for j in range(len(y_coords) - 1):
             if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
+                if i not in x_map or j not in y_map:
+                    continue
                 patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
                 compact.paste(patch, (x_map[i], y_map[j]))
     return compact
@@ -91,6 +95,10 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         super().__init__(config)
         self.qvtree = QVTree(D=config.text_config.hidden_size)
         self._generic_token_ids = None
+
+        # raw PIL images for LPD (set before generate)
+        # usage: tree_model.model.raw_images = [pil_image]
+        self.raw_images = None
 
         # debug states
         self._debug_selected_idx = None
@@ -180,22 +188,25 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             def get_attn_scores(embeds_in, mask_in, pos_in, query_positions):
                 """Mean attention from query tokens to image patches.
-                Uses a forward hook on layer 27 only to avoid storing all layers' attention weights.
+                Uses hooks on layers [6, 13, 20, 27] and averages results.
                 """
-                captured = {}
-
-                # find layer 27
+                target_layer_ids = [20]
                 lm = self.language_model
-                layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
-                target_layer = layers[27]
+                lm_layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
 
-                def hook_fn(module, input, output):
-                    # output is (hidden_states, attn_weights, ...)
-                    # attn_weights shape: [B, heads, seq_len, seq_len]
-                    if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                        captured["attn"] = output[1].detach().cpu()
+                captured = {}
+                handles = []
 
-                handle = target_layer.self_attn.register_forward_hook(hook_fn)
+                for lid in target_layer_ids:
+                    def make_hook(layer_id):
+                        def hook_fn(module, input, output):
+                            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                                captured[layer_id] = output[1].detach().cpu()
+                        return hook_fn
+                    handles.append(
+                        lm_layers[lid].self_attn.register_forward_hook(make_hook(lid))
+                    )
+
                 try:
                     with torch.no_grad():
                         self.language_model(
@@ -204,17 +215,23 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                             output_hidden_states=False, return_dict=True, use_cache=False,
                         )
                 finally:
-                    handle.remove()
+                    for h in handles:
+                        h.remove()
 
-                if "attn" not in captured:
-                    raise RuntimeError("Hook did not capture attention weights. "
+                if not captured:
+                    raise RuntimeError("Hooks did not capture attention weights. "
                                        "Ensure model is loaded with attn_implementation='eager'.")
 
-                layer_attn = captured["attn"]  # [B, heads, seq_len, seq_len]
                 vp = vis_positions
                 qp = query_positions
-                attn = layer_attn[0, :, :, vp][:, qp, :]  # [heads, Q, N_img]
-                result = attn.mean(dim=0).mean(dim=0).float()  # [N_img]
+                scores = []
+                for lid in target_layer_ids:
+                    if lid not in captured:
+                        continue
+                    layer_attn = captured[lid]  # [B, heads, seq_len, seq_len]
+                    attn = layer_attn[0, :, :, vp][:, qp, :]  # [heads, Q, N_img]
+                    scores.append(attn.mean(dim=0).mean(dim=0).float())
+                result = torch.stack(scores).mean(dim=0)  # [N_img]
                 del captured
                 torch.cuda.empty_cache()
                 return result
@@ -312,22 +329,20 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
 
-                # reconstruct PIL image from pixel_values
-                patch_size, C = 28, 3
-                n_patches_raw = grid_h_raw * grid_w_raw
-                patch_offset_raw = sum(
-                    image_grid_thw[k][1].item() * image_grid_thw[k][2].item() for k in range(i)
-                )
-                img_patches = pixel_values[patch_offset_raw: patch_offset_raw + n_patches_raw]
-                img_patches = img_patches.view(n_patches_raw, 2, C, 14, 14)[:, 0]
-                img_tensor = (
-                    img_patches.reshape(grid_h_raw, grid_w_raw, C, 14, 14)
-                    .permute(2, 0, 3, 1, 4)
-                    .reshape(C, grid_h_raw * 14, grid_w_raw * 14)
-                )
-                img_tensor = (img_tensor * 0.5 + 0.5).clamp(0, 1)
-                img_np = np.transpose((img_tensor.cpu().float().numpy() * 255).astype(np.uint8), (1, 2, 0))
-                pil_img = Image.fromarray(img_np).resize((grid_w * patch_size, grid_h * patch_size), Image.BILINEAR)
+                C = 3
+                patch_size = 28
+                image_w_px = grid_w * patch_size
+                image_h_px = grid_h * patch_size
+                raw_images = getattr(self, 'raw_images', None)
+                if raw_images is not None and i < len(raw_images):
+                    pil_img = raw_images[i].convert("RGB").resize(
+                        (image_w_px, image_h_px), Image.BILINEAR
+                    )
+                else:
+                    raise ValueError(
+                        "raw_images must be set before generate(). "
+                        "Use: tree_model.model.raw_images = [pil_image]"
+                    )
 
                 # LPD: patch_ids → bboxes → merge → compact image
                 merged_bboxes = merge_bboxes(patch_ids_to_bboxes(patch_ids.cpu(), grid_w, patch_size))
@@ -362,87 +377,48 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             self._debug_selected_idx = selected_idx_per_image
 
-            # ── Directly pick selected tokens from image_embeds_full ─────────
-            # No LPD, no re-encoding. Just select patch_ids from the full
-            # image embeddings and rebuild input_ids to match.
-            all_patch_ids = self._debug_patch_ids  # List[Tensor] per image
+            compact_tokens = sum(p.shape[0] // 4 for p in new_pixel_values_list)
+            print(f"[LPD] compact tokens: {compact_tokens}, original: {sum(t.shape[0] for t in image_tokens_list)}")
 
-            # concatenate selected embeddings from image_embeds_full
-            # image_embeds_full shape: [total_N, D]
-            offset = 0
-            selected_embeds_list = []
-            for i, tokens in enumerate(image_tokens_list):
-                n_i = tokens.shape[0]
-                sel_ids = all_patch_ids[i].to(image_embeds_full.device)
-                selected_embeds_list.append(image_embeds_full[offset + sel_ids])
-                offset += n_i
-            image_embeds_selected = torch.cat(selected_embeds_list, dim=0)  # [N_sel, D]
-            image_embeds_selected = torch.nan_to_num(image_embeds_selected)
+            compact_pixel_values = torch.cat(new_pixel_values_list, dim=0)
+            compact_grid_thw = torch.stack(new_grid_thw_list, dim=0)
+            image_tokens_compact = self.get_image_features(
+                compact_pixel_values, compact_grid_thw, return_dict=True
+            ).pooler_output
+            image_embeds_compact = torch.nan_to_num(
+                torch.cat(image_tokens_compact, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            )
 
-            n_selected = int(image_embeds_selected.shape[0])
-            print(f"[SEL] selected tokens: {n_selected}, original: {int(image_embeds_full.shape[0])}")
-
+            # rebuild input_ids with updated image placeholder count to match compact tokens
             original_ids = input_ids[0].tolist()
             try:
                 vs_pos = original_ids.index(151652)  # vision_start
                 ve_pos = original_ids.index(151653)  # vision_end
             except ValueError:
+                image_embeds_compact = image_embeds_full
+                compact_grid_thw = image_grid_thw
                 vs_pos = None
 
             if vs_pos is not None:
-                image_token_id = 151655
-                new_ids = (
-                    original_ids[:vs_pos + 1]
-                    + [image_token_id] * n_selected
-                    + original_ids[ve_pos:]
-                )
+                n_compact = int(image_embeds_compact.shape[0])
+                new_ids = original_ids[:vs_pos + 1] + [151655] * n_compact + original_ids[ve_pos:]
                 new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
                 new_attention_mask = torch.ones(
                     1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
                 )
                 new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
-                image_mask_sel, _ = self.get_placeholder_mask(
-                    new_input_ids, inputs_embeds=new_inputs_embeds,
-                    image_features=image_embeds_selected,
+                image_mask_compact, _ = self.get_placeholder_mask(
+                    new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_compact,
                 )
                 new_inputs_embeds = torch.nan_to_num(
-                    new_inputs_embeds.masked_scatter(image_mask_sel, image_embeds_selected)
+                    new_inputs_embeds.masked_scatter(image_mask_compact, image_embeds_compact)
                 )
-
-                # ── Build position_ids by picking selected image positions ──
-                # position_ids shape: [3, orig_seq_len] (t, h, w per token)
-                # vis_positions: indices of image tokens in original sequence
-                # all_patch_ids[0]: selected patch indices into image token block
-                # We pick position_ids for selected image tokens, then concat
-                # with position_ids for non-image tokens (prefix + suffix).
-
-                orig_pos = position_ids  # [3, orig_seq_len]
-
-                # positions of selected image tokens in original sequence
-                sel_patch_ids_global = all_patch_ids[0].to(orig_pos.device)
-                sel_vis_seq_pos = vis_positions.to(orig_pos.device)[sel_patch_ids_global]  # [N_sel]
-
-                # non-image token positions in original sequence
-                all_seq = torch.arange(orig_pos.shape[1], device=orig_pos.device)
-                all_vis = vis_positions.to(orig_pos.device)
-                # mask for non-image positions
-                is_vis = torch.zeros(orig_pos.shape[1], dtype=torch.bool, device=orig_pos.device)
-                is_vis[all_vis] = True
-                non_vis_pos = all_seq[~is_vis]  # prefix + suffix token positions
-
-                # new position_ids: [3, len(non_vis) + N_sel]
-                # order: prefix non-vis, selected image, suffix non-vis
-                # split non_vis into prefix (before image) and suffix (after image)
-                prefix_pos = non_vis_pos[non_vis_pos < all_vis[0]]
-                suffix_pos = non_vis_pos[non_vis_pos > all_vis[-1]]
-
-                new_pos_cols = torch.cat([
-                    orig_pos[:, prefix_pos],      # prefix text
-                    orig_pos[:, sel_vis_seq_pos],  # selected image tokens (original 3D coords)
-                    orig_pos[:, suffix_pos],       # suffix text (question etc.)
-                ], dim=1)  # [3, new_seq_len]
-
-                position_ids = new_pos_cols
+                position_ids = self.compute_3d_position_ids(
+                    input_ids=new_input_ids, image_grid_thw=compact_grid_thw,
+                    video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
+                    inputs_embeds=new_inputs_embeds, attention_mask=new_attention_mask,
+                    past_key_values=past_key_values,
+                )
                 inputs_embeds = new_inputs_embeds
                 attention_mask = new_attention_mask
             else:
