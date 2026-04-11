@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from PIL import Image
+import numpy as np
 from module import QVTree
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,
@@ -106,7 +107,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         self._debug_num_total_tokens = None
         self._debug_select_ratios = None
         self._debug_patch_scores = None
-
+        self._debug_compact_images = None  # compact PIL Images per image
+        self._debug_bboxes = None          # merged bboxes per image
 
     def forward(
             self,
@@ -143,6 +145,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
+            self._debug_compact_images = []
+            self._debug_bboxes = []
 
             # encode image tokens
             image_tokens_list = self.get_image_features(
@@ -288,8 +292,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             self._debug_patch_scores = [patch_scores_global]
 
-            # QuadTree selection: directly index into already-encoded tokens
-            new_image_tokens_list, selected_idx_per_image = [], []
+            # QuadTree selection + LPD per image
+            new_pixel_values_list, new_grid_thw_list, selected_idx_per_image = [], [], []
 
             for i, tokens in enumerate(image_tokens_list):
                 _, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
@@ -325,17 +329,65 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
 
-                # directly index selected tokens from already-encoded features
-                selected_tokens = tokens[patch_ids]  # [M, D]
-                new_image_tokens_list.append(selected_tokens)
+                C = 3
+                patch_size = 28
+                image_w_px = grid_w * patch_size
+                image_h_px = grid_h * patch_size
+                raw_images = getattr(self, 'raw_images', None)
+                if raw_images is not None and i < len(raw_images):
+                    pil_img = raw_images[i].convert("RGB").resize(
+                        (image_w_px, image_h_px), Image.BILINEAR
+                    )
+                else:
+                    raise ValueError(
+                        "raw_images must be set before generate(). "
+                        "Use: tree_model.model.raw_images = [pil_image]"
+                    )
+
+                # LPD: patch_ids → bboxes → merge → compact image
+                merged_bboxes = merge_bboxes(patch_ids_to_bboxes(patch_ids.cpu(), grid_w, patch_size))
+                compact_img = build_compact_image(pil_img, merged_bboxes)
+                self._debug_compact_images.append(compact_img)
+                self._debug_bboxes.append(merged_bboxes)
+
+                # re-encode compact image: normalize → patch format [N, 2*C*14*14]
+                compact_tensor = (
+                    torch.tensor(
+                        np.transpose(np.array(compact_img).astype(np.float32) / 255.0, (2, 0, 1)),
+                        device=pixel_values.device, dtype=pixel_values.dtype,
+                    ) - 0.5
+                ) / 0.5  # SigLIP normalize
+
+                cH, cW = compact_tensor.shape[1], compact_tensor.shape[2]
+                pH, pW = (14 - cH % 14) % 14, (14 - cW % 14) % 14
+                if pH > 0 or pW > 0:
+                    compact_tensor = F.pad(compact_tensor, (0, pW, 0, pH))
+
+                nH, nW = compact_tensor.shape[1] // 14, compact_tensor.shape[2] // 14
+                compact_patches = (
+                    compact_tensor.reshape(C, nH, 14, nW, 14)
+                    .permute(1, 3, 0, 2, 4)
+                    .reshape(nH * nW, C * 14 * 14)
+                    .repeat(1, 2)  # duplicate temporal
+                )
+                new_pixel_values_list.append(compact_patches)
+                new_grid_thw_list.append(
+                    torch.tensor([1, nH, nW], dtype=image_grid_thw.dtype, device=image_grid_thw.device)
+                )
 
             self._debug_selected_idx = selected_idx_per_image
 
-            image_embeds_compact = torch.cat(new_image_tokens_list, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
+            compact_tokens = sum(p.shape[0] // 4 for p in new_pixel_values_list)
+            print(f"[LPD] compact tokens: {compact_tokens}, original: {sum(t.shape[0] for t in image_tokens_list)}")
+
+            compact_pixel_values = torch.cat(new_pixel_values_list, dim=0)
+            compact_grid_thw = torch.stack(new_grid_thw_list, dim=0)
+            image_tokens_compact = self.get_image_features(
+                compact_pixel_values, compact_grid_thw, return_dict=True
+            ).pooler_output
+            image_embeds_compact = torch.nan_to_num(
+                torch.cat(image_tokens_compact, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             )
-            n_compact = int(image_embeds_compact.shape[0])
-            print(f"[DIRECT] selected tokens: {n_compact}, original: {sum(t.shape[0] for t in image_tokens_list)}")
 
             # rebuild input_ids with updated image placeholder count to match compact tokens
             original_ids = input_ids[0].tolist()
@@ -344,6 +396,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 ve_pos = original_ids.index(151653)  # vision_end
             except ValueError:
                 image_embeds_compact = image_embeds_full
+                compact_grid_thw = image_grid_thw
                 vs_pos = None
 
             if vs_pos is not None:
@@ -360,15 +413,12 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 new_inputs_embeds = torch.nan_to_num(
                     new_inputs_embeds.masked_scatter(image_mask_compact, image_embeds_compact)
                 )
-                # reuse position_ids computed on the full image, index selected patch positions
-                # position_ids shape: [3, seq_len] — t/h/w RoPE axes
-                orig_img_pos = position_ids[:, vis_positions.to(position_ids.device)]  # [3, N_total]
-                all_patch_ids = torch.cat([p.to(position_ids.device) for p in self._debug_patch_ids])  # [M]
-                selected_img_pos = orig_img_pos[:, all_patch_ids]                      # [3, M]
-                # stitch: everything before vision_start | selected img pos | everything after last img token
-                prefix_pos = position_ids[:, :vs_pos + 1]             # [3, vs_pos+1]
-                suffix_pos = position_ids[:, vis_positions[-1].item() + 1:]  # [3, suffix_len]
-                position_ids = torch.cat([prefix_pos, selected_img_pos, suffix_pos], dim=1)
+                position_ids = self.compute_3d_position_ids(
+                    input_ids=new_input_ids, image_grid_thw=compact_grid_thw,
+                    video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
+                    inputs_embeds=new_inputs_embeds, attention_mask=new_attention_mask,
+                    past_key_values=past_key_values,
+                )
                 inputs_embeds = new_inputs_embeds
                 attention_mask = new_attention_mask
             else:
