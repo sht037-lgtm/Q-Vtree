@@ -10,95 +10,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 
-def patch_ids_to_bboxes(patch_ids: torch.Tensor, grid_w: int, patch_size: int = 28):
-    bboxes = []
-    for idx in patch_ids.tolist():
-        r, c = int(idx) // grid_w, int(idx) % grid_w
-        x0, y0 = c * patch_size, r * patch_size
-        bboxes.append((x0, y0, x0 + patch_size, y0 + patch_size))
-    return bboxes
-
-
-def merge_bboxes(bboxes):
-    if not bboxes:
-        return []
-
-    def overlaps_or_adjacent(a, b):
-        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
-
-    merged = list(bboxes)
-    changed = True
-    while changed:
-        changed = False
-        result, used = [], [False] * len(merged)
-        for i in range(len(merged)):
-            if used[i]:
-                continue
-            cur = list(merged[i])
-            for j in range(i + 1, len(merged)):
-                if not used[j] and overlaps_or_adjacent(cur, merged[j]):
-                    cur[0] = min(cur[0], merged[j][0])
-                    cur[1] = min(cur[1], merged[j][1])
-                    cur[2] = max(cur[2], merged[j][2])
-                    cur[3] = max(cur[3], merged[j][3])
-                    used[j] = True
-                    changed = True
-            result.append(tuple(cur))
-        merged = result
-    return merged
-
-
-def build_compact_image(image: Image.Image, bboxes) -> Image.Image:
-    """LPD: recompose selected regions preserving relative spatial layout."""
-    if not bboxes:
-        return image
-
-    img_w, img_h = image.size
-    x_coords = sorted(set([0, img_w] + [x for b in bboxes for x in (b[0], b[2])]))
-    y_coords = sorted(set([0, img_h] + [y for b in bboxes for y in (b[1], b[3])]))
-
-    def cell_has_content(x0, y0, x1, y1):
-        return any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1] for b in bboxes)
-
-    new_w, x_map = 0, {}
-    for i in range(len(x_coords) - 1):
-        col_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-                      for j in range(len(y_coords) - 1))
-        if col_has:
-            x_map[i] = new_w
-            new_w += x_coords[i+1] - x_coords[i]
-
-    new_h, y_map = 0, {}
-    for j in range(len(y_coords) - 1):
-        row_has = any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
-                      for i in range(len(x_coords) - 1))
-        if row_has:
-            y_map[j] = new_h
-            new_h += y_coords[j+1] - y_coords[j]
-
-    if new_w == 0 or new_h == 0:
-        return image
-
-    compact = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
-    for i in range(len(x_coords) - 1):
-        for j in range(len(y_coords) - 1):
-            if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
-                if i not in x_map or j not in y_map:
-                    continue
-                patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
-                compact.paste(patch, (x_map[i], y_map[j]))
-    return compact
-
-
 class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
     def __init__(self, config):
         super().__init__(config)
         self.qvtree = QVTree(D=config.text_config.hidden_size)
         self._generic_token_ids = None
-
-        # raw PIL images for LPD (set before generate)
-        # usage: tree_model.model.raw_images = [pil_image]
-        self.raw_images = None
 
         # debug states
         self._debug_selected_idx = None
@@ -107,8 +23,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
         self._debug_num_total_tokens = None
         self._debug_select_ratios = None
         self._debug_patch_scores = None
-        self._debug_compact_images = None  # compact PIL Images per image
-        self._debug_bboxes = None          # merged bboxes per image
 
     def forward(
             self,
@@ -145,8 +59,6 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             self._debug_num_selected_tokens = []
             self._debug_num_total_tokens = []
             self._debug_select_ratios = []
-            self._debug_compact_images = []
-            self._debug_bboxes = []
 
             # encode image tokens
             image_tokens_list = self.get_image_features(
@@ -180,6 +92,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             img_end = vis_positions[-1].item()
             seq_len = input_ids.shape[1]
             text_start, text_end = img_end + 1, seq_len - 3
+
             text_positions = (
                 torch.arange(text_start, text_end, dtype=torch.long)
                 if text_end > text_start
@@ -188,7 +101,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             def get_attn_scores(embeds_in, mask_in, pos_in, query_positions):
                 """Mean attention from query tokens to image patches.
-                Uses hooks on layers [6, 13, 20, 27] and averages results.
+                Uses hooks on layer 20 and averages results.
                 """
                 target_layer_ids = [20]
                 lm = self.language_model
@@ -292,8 +205,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             self._debug_patch_scores = [patch_scores_global]
 
-            # QuadTree selection + LPD per image
-            new_pixel_values_list, new_grid_thw_list, selected_idx_per_image = [], [], []
+            # QuadTree selection: directly index already-encoded tokens
+            selected_tokens_list, selected_idx_per_image = [], []
 
             for i, tokens in enumerate(image_tokens_list):
                 _, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
@@ -329,92 +242,41 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
 
-                C = 3
-                patch_size = 28
-                image_w_px = grid_w * patch_size
-                image_h_px = grid_h * patch_size
-                raw_images = getattr(self, 'raw_images', None)
-                if raw_images is not None and i < len(raw_images):
-                    pil_img = raw_images[i].convert("RGB").resize(
-                        (image_w_px, image_h_px), Image.BILINEAR
-                    )
-                else:
-                    raise ValueError(
-                        "raw_images must be set before generate(). "
-                        "Use: tree_model.model.raw_images = [pil_image]"
-                    )
-
-                # LPD: patch_ids → bboxes → merge → compact image
-                merged_bboxes = merge_bboxes(patch_ids_to_bboxes(patch_ids.cpu(), grid_w, patch_size))
-                compact_img = build_compact_image(pil_img, merged_bboxes)
-                self._debug_compact_images.append(compact_img)
-                self._debug_bboxes.append(merged_bboxes)
-
-                # re-encode compact image: normalize → patch format [N, 2*C*14*14]
-                compact_tensor = (
-                    torch.tensor(
-                        np.transpose(np.array(compact_img).astype(np.float32) / 255.0, (2, 0, 1)),
-                        device=pixel_values.device, dtype=pixel_values.dtype,
-                    ) - 0.5
-                ) / 0.5  # SigLIP normalize
-
-                cH, cW = compact_tensor.shape[1], compact_tensor.shape[2]
-                pH, pW = (14 - cH % 14) % 14, (14 - cW % 14) % 14
-                if pH > 0 or pW > 0:
-                    compact_tensor = F.pad(compact_tensor, (0, pW, 0, pH))
-
-                nH, nW = compact_tensor.shape[1] // 14, compact_tensor.shape[2] // 14
-                compact_patches = (
-                    compact_tensor.reshape(C, nH, 14, nW, 14)
-                    .permute(1, 3, 0, 2, 4)
-                    .reshape(nH * nW, C * 14 * 14)
-                    .repeat(1, 2)  # duplicate temporal
-                )
-                new_pixel_values_list.append(compact_patches)
-                new_grid_thw_list.append(
-                    torch.tensor([1, nH, nW], dtype=image_grid_thw.dtype, device=image_grid_thw.device)
-                )
+                # directly select tokens from already-encoded features
+                selected_tokens_list.append(tokens[patch_ids])
 
             self._debug_selected_idx = selected_idx_per_image
 
-            compact_tokens = sum(p.shape[0] // 4 for p in new_pixel_values_list)
-            print(f"[LPD] compact tokens: {compact_tokens}, original: {sum(t.shape[0] for t in image_tokens_list)}")
-
-            compact_pixel_values = torch.cat(new_pixel_values_list, dim=0)
-            compact_grid_thw = torch.stack(new_grid_thw_list, dim=0)
-            image_tokens_compact = self.get_image_features(
-                compact_pixel_values, compact_grid_thw, return_dict=True
-            ).pooler_output
-            image_embeds_compact = torch.nan_to_num(
-                torch.cat(image_tokens_compact, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            # concat selected tokens across all images
+            image_embeds_selected = torch.cat(selected_tokens_list, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
             )
+            n_selected = int(image_embeds_selected.shape[0])
+            print(f"[TREE] selected tokens: {n_selected}, original: {sum(t.shape[0] for t in image_tokens_list)}")
 
-            # rebuild input_ids with updated image placeholder count to match compact tokens
+            # rebuild input_ids with updated placeholder count
             original_ids = input_ids[0].tolist()
             try:
                 vs_pos = original_ids.index(151652)  # vision_start
                 ve_pos = original_ids.index(151653)  # vision_end
             except ValueError:
-                image_embeds_compact = image_embeds_full
-                compact_grid_thw = image_grid_thw
                 vs_pos = None
 
             if vs_pos is not None:
-                n_compact = int(image_embeds_compact.shape[0])
-                new_ids = original_ids[:vs_pos + 1] + [151655] * n_compact + original_ids[ve_pos:]
+                new_ids = original_ids[:vs_pos + 1] + [151655] * n_selected + original_ids[ve_pos:]
                 new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
                 new_attention_mask = torch.ones(
                     1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
                 )
                 new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
-                image_mask_compact, _ = self.get_placeholder_mask(
-                    new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_compact,
+                image_mask_selected, _ = self.get_placeholder_mask(
+                    new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_selected,
                 )
                 new_inputs_embeds = torch.nan_to_num(
-                    new_inputs_embeds.masked_scatter(image_mask_compact, image_embeds_compact)
+                    new_inputs_embeds.masked_scatter(image_mask_selected, image_embeds_selected)
                 )
                 position_ids = self.compute_3d_position_ids(
-                    input_ids=new_input_ids, image_grid_thw=compact_grid_thw,
+                    input_ids=new_input_ids, image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
                     inputs_embeds=new_inputs_embeds, attention_mask=new_attention_mask,
                     past_key_values=past_key_values,
@@ -442,7 +304,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 past_key_values=past_key_values,
             )
 
-        # recompute cache_position after LPD (sequence length may have changed)
+        # recompute cache_position after token selection (sequence length may have changed)
         seq_len = inputs_embeds.shape[1]
         past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
         cache_position = torch.arange(past_len, past_len + seq_len, device=inputs_embeds.device)
