@@ -143,7 +143,7 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 return result
 
             # question-specific attention
-            A_q = get_attn_scores(inputs_embeds_full, attention_mask, position_ids, text_positions)
+            A_q = get_attn_scores(inputs_embeds_full.bfloat16(), attention_mask, position_ids, text_positions)
 
             # generic attention (baseline for relative normalization)
             if self._generic_token_ids is None:
@@ -175,10 +175,15 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
             generic_text_positions = torch.arange(
                 img_end + 1, img_end + 1 + generic_ids.shape[1], dtype=torch.long
             )
-            A_generic = get_attn_scores(generic_embeds, generic_attn_mask, generic_pos_ids, generic_text_positions)
+            A_generic = get_attn_scores(generic_embeds.bfloat16(), generic_attn_mask, generic_pos_ids, generic_text_positions)
+
+            # 释放 scoring 阶段不再需要的中间变量
+            del generic_embeds, image_embeds_full
+            torch.cuda.empty_cache()
 
             # relative attention + normalize
             patch_scores_global = A_q / (A_generic + 1e-8)
+            del A_q, A_generic
             s_min, s_max = patch_scores_global.min(), patch_scores_global.max()
             patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
 
@@ -198,9 +203,8 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
 
             self._debug_patch_scores = [patch_scores_global]
 
-            # QuadTree selection
-            selected_idx_per_image = []
-            all_patch_ids_list = []
+            # QuadTree selection: directly index already-encoded tokens
+            selected_tokens_list, selected_idx_per_image = [], []
 
             for i, tokens in enumerate(image_tokens_list):
                 _, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
@@ -235,21 +239,55 @@ class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
                 self._debug_num_selected_tokens.append(num_selected)
                 self._debug_num_total_tokens.append(num_total)
                 self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
-                all_patch_ids_list.append(patch_ids)
+
+                selected_tokens_list.append(tokens[patch_ids])  # [M, D]
 
             self._debug_selected_idx = selected_idx_per_image
 
-            # mask out unselected image tokens in inputs_embeds_full
-            all_patch_ids = torch.cat(all_patch_ids_list)
-            unselected_mask = torch.ones(len(vis_positions), dtype=torch.bool)
-            unselected_mask[all_patch_ids] = False
-            unselected_positions = vis_positions[unselected_mask].to(inputs_embeds_full.device)
-            inputs_embeds_full[0, unselected_positions] = 0.0
+            # 释放 image_tokens_list 和 patch_scores_global
+            n_original = sum(t.shape[0] for t in image_tokens_list)
+            del image_tokens_list, patch_scores_global
+            torch.cuda.empty_cache()
 
-            n_selected = int(all_patch_ids.shape[0])
-            print(f"[TREE] selected tokens: {n_selected}, original: {sum(t.shape[0] for t in image_tokens_list)}")
+            image_embeds_selected = torch.cat(selected_tokens_list, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            n_selected = int(image_embeds_selected.shape[0])
+            print(f"[TREE] selected tokens: {n_selected}, original: {n_original}")
 
-            inputs_embeds = inputs_embeds_full
+            # rebuild input_ids with updated placeholder count
+            original_ids = input_ids[0].tolist()
+            try:
+                vs_pos = original_ids.index(151652)  # vision_start
+                ve_pos = original_ids.index(151653)  # vision_end
+            except ValueError:
+                vs_pos = None
+
+            if vs_pos is not None:
+                new_ids = original_ids[:vs_pos + 1] + [151655] * n_selected + original_ids[ve_pos:]
+                new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
+                new_attention_mask = torch.ones(
+                    1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
+                )
+                new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
+                image_mask_selected, _ = self.get_placeholder_mask(
+                    new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_selected,
+                )
+                new_inputs_embeds = torch.nan_to_num(
+                    new_inputs_embeds.masked_scatter(image_mask_selected, image_embeds_selected)
+                )
+                # index position_ids from full-image computation
+                all_patch_ids = torch.cat([p.to(position_ids.device) for p in self._debug_patch_ids])
+                orig_img_pos = position_ids[:, :, vis_positions.to(position_ids.device)]  # [4, 1, N_total]
+                selected_img_pos = orig_img_pos[:, :, all_patch_ids]                       # [4, 1, M]
+                prefix_pos = position_ids[:, :, :vs_pos + 1]
+                suffix_pos = position_ids[:, :, vis_positions[-1].item() + 1:]
+                position_ids = torch.cat([prefix_pos, selected_img_pos, suffix_pos], dim=2)
+                self.rope_deltas = None  # 序列长度已改变，强制 decode 阶段重新计算 rope_deltas
+                inputs_embeds = new_inputs_embeds
+                attention_mask = new_attention_mask
+            else:
+                inputs_embeds = inputs_embeds_full
 
         if pixel_values_videos is not None:
             video_embeds = torch.cat(
