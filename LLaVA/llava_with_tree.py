@@ -13,13 +13,14 @@ The notebook only calls the public functions defined here.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
-# Make project root importable so `module.py` can be found
+# Make project root importable so module.py can be found
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
@@ -32,11 +33,28 @@ from module import QVTree
 # Constants
 # =========================================================
 
-IMAGE_TOKEN_ID = 32000       # <image> special token id in LLaVA-1.5
+IMAGE_TOKEN_ID = 32000
 GRID_SIZE      = 24          # 24 x 24 = 576 patches  (336 / 14)
 PATCH_SIZE     = 14          # CLIP ViT-L/14 patch size in pixels
 HIDDEN_DIM     = 4096        # LLaVA-1.5-7b language model hidden dim
 GENERIC_PROMPT = "Write a general description of the image."
+
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def _clean_question(question: str) -> str:
+    """
+    Strip multiple-choice options and instruction suffix from question text.
+
+    V-Star format:
+        "What is the color of the van?\n(A) red\n(B) white\n...\nAnswer with..."
+
+    Returns only the question part:
+        "What is the color of the van?"
+    """
+    return re.split(r'\n\(A\)', question)[0].strip()
 
 
 # =========================================================
@@ -61,7 +79,7 @@ def load_model(model_id: str, device: str = "auto"):
         model_id,
         torch_dtype=torch.float16,
         device_map=device,
-        attn_implementation="eager",   # required to get attention weights
+        attn_implementation="eager",
     )
     model.eval()
     return model, processor
@@ -107,15 +125,19 @@ def compute_patch_scores(
     Compute relative patch attention scores for one image/question pair.
 
     Pipeline (aligned with qwen/model.py):
-      Pass 1 : forward with the specific question          -> A_q
-      Pass 2 : forward with a generic description          -> A_g
-      scores  = A_q / A_g   (relative salience)
+      Pass 1 : forward with clean question only (no options)  -> A_q
+      Pass 2 : forward with generic description               -> A_g
+      scores  = A_q / A_g
       -> normalize [0,1] -> Gaussian smooth -> normalize [0,1]
+
+    Note: only the pure question text (before options) is used for
+    attention scoring. The full question+options text is used only
+    for final inference, not here.
 
     Args:
         model, processor : loaded LLaVA model and processor
         image            : original PIL image
-        question         : question string
+        question         : full question string (including options)
         target_layers    : transformer layer indices to average over
         gaussian_sigma   : smoothing kernel sigma
         gaussian_ks      : smoothing kernel size
@@ -125,9 +147,12 @@ def compute_patch_scores(
     """
     device = next(model.parameters()).device
 
-    # ---- Pass 1: specific question ----
-    prompt_q  = f"USER: <image>\n{question}\nASSISTANT:"
-    inputs_q  = processor(
+    # strip options/instruction, keep only the question itself
+    clean_q = _clean_question(question)
+
+    # ---- Pass 1: clean question only ----
+    prompt_q = "USER: <image>\n{}\nASSISTANT:".format(clean_q)
+    inputs_q = processor(
         text=prompt_q,
         images=image.convert("RGB"),
         return_tensors="pt",
@@ -181,10 +206,10 @@ def compute_patch_scores(
     patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
 
     # ---- Gaussian smoothing ----
-    n    = GRID_SIZE * GRID_SIZE
-    ax   = torch.arange(gaussian_ks, dtype=torch.float32) - gaussian_ks // 2
-    g1d  = torch.exp(-ax ** 2 / (2 * gaussian_sigma ** 2))
-    g1d /= g1d.sum()
+    n      = GRID_SIZE * GRID_SIZE
+    ax     = torch.arange(gaussian_ks, dtype=torch.float32) - gaussian_ks // 2
+    g1d    = torch.exp(-ax ** 2 / (2 * gaussian_sigma ** 2))
+    g1d   /= g1d.sum()
     kernel = (g1d.unsqueeze(1) * g1d.unsqueeze(0)).view(1, 1, gaussian_ks, gaussian_ks)
     patch_scores = F.conv2d(
         patch_scores[:n].view(1, 1, GRID_SIZE, GRID_SIZE),
@@ -254,7 +279,7 @@ def select_patches(
 def _patch_ids_to_bboxes(patch_ids: torch.Tensor) -> list:
     bboxes = []
     for idx in patch_ids.tolist():
-        r, c = int(idx) // GRID_SIZE, int(idx) % GRID_SIZE
+        r, c   = int(idx) // GRID_SIZE, int(idx) % GRID_SIZE
         x0, y0 = c * PATCH_SIZE, r * PATCH_SIZE
         bboxes.append((x0, y0, x0 + PATCH_SIZE, y0 + PATCH_SIZE))
     return bboxes
@@ -278,10 +303,10 @@ def _merge_bboxes(bboxes: list) -> list:
             cur = list(merged[i])
             for j in range(i + 1, len(merged)):
                 if not used[j] and overlaps_or_adjacent(cur, merged[j]):
-                    cur[0] = min(cur[0], merged[j][0])
-                    cur[1] = min(cur[1], merged[j][1])
-                    cur[2] = max(cur[2], merged[j][2])
-                    cur[3] = max(cur[3], merged[j][3])
+                    cur[0]  = min(cur[0], merged[j][0])
+                    cur[1]  = min(cur[1], merged[j][1])
+                    cur[2]  = max(cur[2], merged[j][2])
+                    cur[3]  = max(cur[3], merged[j][3])
                     used[j] = True
                     changed = True
             result.append(tuple(cur))
@@ -292,7 +317,7 @@ def _merge_bboxes(bboxes: list) -> list:
 def _build_compact_image(image: Image.Image, bboxes: list) -> Image.Image:
     """
     Recompose selected regions while preserving relative spatial layout.
-    Identical logic to qwen/model.py::build_compact_image.
+    Identical logic to qwen/model.py build_compact_image.
     """
     if not bboxes:
         return image
@@ -308,15 +333,15 @@ def _build_compact_image(image: Image.Image, bboxes: list) -> Image.Image:
     for i in range(len(x_coords) - 1):
         if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
                for j in range(len(y_coords) - 1)):
-            x_map[i] = new_w
-            new_w += x_coords[i+1] - x_coords[i]
+            x_map[i]  = new_w
+            new_w    += x_coords[i+1] - x_coords[i]
 
     new_h, y_map = 0, {}
     for j in range(len(y_coords) - 1):
         if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
                for i in range(len(x_coords) - 1)):
-            y_map[j] = new_h
-            new_h += y_coords[j+1] - y_coords[j]
+            y_map[j]  = new_h
+            new_h    += y_coords[j+1] - y_coords[j]
 
     if new_w == 0 or new_h == 0:
         return image
@@ -361,7 +386,7 @@ def recover_clip_image(processor, image: Image.Image, question: str) -> Image.Im
     """
     import torchvision.transforms.functional as TF
 
-    prompt = f"USER: <image>\n{question}\nASSISTANT:"
+    prompt = "USER: <image>\n{}\nASSISTANT:".format(question)
     inputs = processor(text=prompt, images=image.convert("RGB"), return_tensors="pt")
 
     pv   = inputs["pixel_values"][0].cpu().float()
@@ -383,7 +408,7 @@ def run_baseline_inference(
 ) -> str:
     """Standard LLaVA inference without any token selection."""
     device = next(model.parameters()).device
-    prompt = f"USER: <image>\n{question}\nASSISTANT:"
+    prompt = "USER: <image>\n{}\nASSISTANT:".format(question)
     inputs = processor(
         text=prompt, images=image.convert("RGB"), return_tensors="pt"
     ).to(device)
@@ -405,7 +430,7 @@ def run_tree_inference(
 ) -> str:
     """LLaVA inference using the LPD compact image as visual input."""
     device = next(model.parameters()).device
-    prompt = f"USER: <image>\n{question}\nASSISTANT:"
+    prompt = "USER: <image>\n{}\nASSISTANT:".format(question)
     inputs = processor(
         text=prompt, images=compact_image.convert("RGB"), return_tensors="pt"
     ).to(device)
