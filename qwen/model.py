@@ -91,51 +91,54 @@ def compute_patch_scores(
         else torch.tensor([seq_len - 1], dtype=torch.long)
     )
 
-    def _get_attn_scores(model_inputs, query_positions):
+    def _get_cosine_scores(model_inputs, vis_pos, txt_pos):
+        """
+        Cosine similarity between visual and text hidden states after target_layer.
+        """
         lm = model.model.language_model
         lm_layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
+        layer = lm_layers[target_layers[0]]
 
-        captured = {}
-        handles  = []
+        captured_h = {}
+        handles = []
 
-        def make_hook(layer_id):
-            def hook_fn(module, input, output):
-                if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                    captured[layer_id] = output[1].detach().cpu()
-            return hook_fn
+        def hook_fn(module, input, output):
+            # capture OUTPUT of this layer
+            h = output[0] if isinstance(output, tuple) else output
+            captured_h["hidden"] = h.detach().cpu()
 
-        for lid in target_layers:
-            handles.append(lm_layers[lid].self_attn.register_forward_hook(make_hook(lid)))
+        handles.append(layer.register_forward_hook(hook_fn))
 
         try:
             with torch.no_grad():
-                model(**model_inputs, output_attentions=True, return_dict=True)
+                model(**model_inputs, return_dict=True)
         finally:
             for h in handles:
                 h.remove()
 
-        if not captured:
-            raise RuntimeError("Hook did not capture attention. "
-                               "Ensure attn_implementation='eager'.")
+        if "hidden" not in captured_h:
+            raise RuntimeError("Hook did not capture hidden states.")
 
-        vp = vis_positions
-        qp = query_positions
-        scores = []
-        for lid in target_layers:
-            if lid not in captured:
-                continue
-            layer_attn = captured[lid]
-            attn = layer_attn[0, :, :, vp][:, qp, :]
-            scores.append(attn.mean(0).mean(0).float())
-        result = torch.stack(scores).mean(0)
-        del captured
+        hidden = captured_h["hidden"]            # [1, seq, D]
+        h_vis = hidden[0, vis_pos, :].float()    # [N_img, D]
+        h_txt = hidden[0, txt_pos, :].float()    # [N_txt, D]
+
+        # cosine similarity
+        h_vis_norm = F.normalize(h_vis, dim=-1)  # [N_img, D]
+        h_txt_norm = F.normalize(h_txt, dim=-1)  # [N_txt, D]
+        sim = h_vis_norm @ h_txt_norm.T          # [N_img, N_txt]
+
+        # mean over text positions -> [N_img]
+        result = sim.mean(dim=-1).cpu()
+
+        del captured_h, hidden, h_vis, h_txt, sim
         torch.cuda.empty_cache()
         return result
 
-    # Pass 1: question-specific
-    A_q = _get_attn_scores(inputs, text_positions)
+    # Pass 1: question-specific cosine similarity
+    A_q = _get_cosine_scores(inputs, vis_positions, text_positions)
 
-    # Pass 2: generic
+    # Pass 2: generic cosine similarity
     generic_ids = processor.tokenizer(
         GENERIC_PROMPT, return_tensors="pt", add_special_tokens=False
     ).input_ids.to(device)
@@ -152,7 +155,7 @@ def compute_patch_scores(
         img_end + 1, img_end + 1 + generic_ids.shape[1], dtype=torch.long
     )
 
-    A_g = _get_attn_scores(generic_inputs, generic_text_positions)
+    A_g = _get_cosine_scores(generic_inputs, vis_positions, generic_text_positions)
     del generic_inputs
     torch.cuda.empty_cache()
 
