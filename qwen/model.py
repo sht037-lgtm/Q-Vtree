@@ -1,343 +1,428 @@
+from __future__ import annotations
+
+import os
+import sys
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+from qwen_vl_utils import process_vision_info
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 from module import QVTree
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLModel,
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen2_5_VLModelOutputWithPast
-)
 
 
-class Qwen2_5_VLModelWithTree(Qwen2_5_VLModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.qvtree = QVTree(D=config.text_config.hidden_size)
-        self._generic_token_ids = None
+# =========================================================
+# Constants
+# =========================================================
 
-        self._debug_selected_idx = None
-        self._debug_patch_ids = None
-        self._debug_num_selected_tokens = None
-        self._debug_num_total_tokens = None
-        self._debug_select_ratios = None
-        self._debug_patch_scores = None
-
-    def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-            pixel_values=None,
-            pixel_values_videos=None,
-            image_grid_thw=None,
-            video_grid_thw=None,
-            rope_deltas=None,
-            mm_token_type_ids=None,
-            cache_position=None,
-            second_per_grid_ts=None,
-            **kwargs,
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None:
-            self._debug_patch_ids = []
-            self._debug_num_selected_tokens = []
-            self._debug_num_total_tokens = []
-            self._debug_select_ratios = []
-
-            # encode image tokens
-            image_tokens_list = self.get_image_features(
-                pixel_values, image_grid_thw, return_dict=True
-            ).pooler_output
-
-            # build full inputs_embeds for attention scoring
-            image_embeds_full = torch.nan_to_num(
-                torch.cat(image_tokens_list, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            )
-            inputs_embeds_full = torch.nan_to_num(inputs_embeds.clone())
-            image_mask_full, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds_full, image_features=image_embeds_full,
-            )
-            inputs_embeds_full = torch.nan_to_num(
-                inputs_embeds_full.masked_scatter(image_mask_full, image_embeds_full)
-            )
-
-            if position_ids is None:
-                position_ids = self.compute_3d_position_ids(
-                    input_ids=input_ids,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    second_per_grid_ts=second_per_grid_ts,
-                    inputs_embeds=inputs_embeds_full,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                )
-
-            vis_positions = (input_ids[0] == 151655).nonzero(as_tuple=True)[0].cpu()
-            img_end = vis_positions[-1].item()
-            seq_len = input_ids.shape[1]
-            text_start, text_end = img_end + 1, seq_len - 3
-
-            text_positions = (
-                torch.arange(text_start, text_end, dtype=torch.long)
-                if text_end > text_start
-                else torch.tensor([seq_len - 1], dtype=torch.long)
-            )
-
-            def get_attn_scores(embeds_in, mask_in, pos_in, query_positions):
-                target_layer_ids = [20]
-                lm = self.language_model
-                lm_layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
-
-                captured = {}
-                handles = []
-                for lid in target_layer_ids:
-                    def make_hook(layer_id):
-                        def hook_fn(module, input, output):
-                            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                                captured[layer_id] = output[1].detach().cpu()
-                        return hook_fn
-                    handles.append(
-                        lm_layers[lid].self_attn.register_forward_hook(make_hook(lid))
-                    )
-
-                try:
-                    with torch.no_grad():
-                        self.language_model(
-                            input_ids=None, inputs_embeds=embeds_in, attention_mask=mask_in,
-                            position_ids=pos_in, output_attentions=True,
-                            output_hidden_states=False, return_dict=True, use_cache=False,
-                        )
-                finally:
-                    for h in handles:
-                        h.remove()
-
-                if not captured:
-                    raise RuntimeError("Hooks did not capture attention weights. "
-                                       "Ensure model is loaded with attn_implementation='eager'.")
-
-                vp = vis_positions
-                qp = query_positions
-                scores = []
-                for lid in target_layer_ids:
-                    if lid not in captured:
-                        continue
-                    layer_attn = captured[lid]  # [B, heads, seq_len, seq_len]
-                    attn = layer_attn[0, :, :, vp][:, qp, :]  # [heads, Q, N_img]
-                    scores.append(attn.mean(dim=0).mean(dim=0).float())
-                result = torch.stack(scores).mean(dim=0)  # [N_img]
-                del captured
-                torch.cuda.empty_cache()
-                return result
-
-            # question-specific attention
-            A_q = get_attn_scores(inputs_embeds_full.bfloat16(), attention_mask, position_ids, text_positions)
-
-            # generic attention (baseline for relative normalization)
-            if self._generic_token_ids is None:
-                from transformers import AutoTokenizer
-                tok = AutoTokenizer.from_pretrained(self.config._name_or_path)
-                self._generic_token_ids = tok(
-                    "Write a general description of the image.",
-                    return_tensors="pt", add_special_tokens=False
-                ).input_ids
-            generic_ids = self._generic_token_ids.to(input_ids.device)
-            new_input_ids = torch.cat(
-                [input_ids[:, :img_end + 1], generic_ids, input_ids[:, -3:]], dim=1
-            )
-            generic_embeds = self.get_input_embeddings()(new_input_ids)
-            image_mask_g, _ = self.get_placeholder_mask(
-                new_input_ids, inputs_embeds=generic_embeds, image_features=image_embeds_full,
-            )
-            generic_embeds = torch.nan_to_num(
-                generic_embeds.masked_scatter(image_mask_g, image_embeds_full)
-            )
-            generic_attn_mask = torch.ones(
-                1, new_input_ids.shape[1], dtype=attention_mask.dtype, device=attention_mask.device
-            )
-            generic_pos_ids = self.compute_3d_position_ids(
-                input_ids=new_input_ids, image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
-                inputs_embeds=generic_embeds, attention_mask=generic_attn_mask, past_key_values=None,
-            )
-            generic_text_positions = torch.arange(
-                img_end + 1, img_end + 1 + generic_ids.shape[1], dtype=torch.long
-            )
-            A_generic = get_attn_scores(generic_embeds.bfloat16(), generic_attn_mask, generic_pos_ids, generic_text_positions)
-
-            # 释放 scoring 阶段不再需要的中间变量
-            del generic_embeds, image_embeds_full
-            torch.cuda.empty_cache()
-
-            # relative attention + normalize
-            patch_scores_global = A_q / (A_generic + 1e-8)
-            del A_q, A_generic
-            s_min, s_max = patch_scores_global.min(), patch_scores_global.max()
-            patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
-
-            # Gaussian smoothing (sigma=1.0, ks=3)
-            _, grid_h0_raw, grid_w0_raw = image_grid_thw[0].tolist()
-            grid_h0, grid_w0 = grid_h0_raw // 2, grid_w0_raw // 2
-            if patch_scores_global.shape[0] == grid_h0 * grid_w0:
-                sigma, ks = 1.0, 3
-                ax = torch.arange(ks, dtype=torch.float32) - ks // 2
-                g1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
-                g1d /= g1d.sum()
-                kernel = (g1d.unsqueeze(1) * g1d.unsqueeze(0)).view(1, 1, ks, ks)
-                score_map = F.conv2d(patch_scores_global.float().view(1, 1, grid_h0, grid_w0), kernel, padding=ks // 2)
-                patch_scores_global = score_map.view(-1)
-                s_min, s_max = patch_scores_global.min(), patch_scores_global.max()
-                patch_scores_global = (patch_scores_global - s_min) / (s_max - s_min + 1e-6)
-
-            self._debug_patch_scores = [patch_scores_global]
-
-            # QuadTree selection: directly index already-encoded tokens
-            selected_tokens_list, selected_idx_per_image = [], []
-
-            for i, tokens in enumerate(image_tokens_list):
-                _, grid_h_raw, grid_w_raw = image_grid_thw[i].tolist()
-                grid_h, grid_w = grid_h_raw // 2, grid_w_raw // 2
-
-                if grid_h * grid_w != tokens.size(0):
-                    raise ValueError(
-                        f"Downsampled grid mismatch: raw=({grid_h_raw},{grid_w_raw}), "
-                        f"down=({grid_h},{grid_w}), H*W={grid_h*grid_w}, tokens={tokens.size(0)}"
-                    )
-
-                x = tokens.unsqueeze(0)
-                patch_scores = patch_scores_global.unsqueeze(0).to(tokens.device, tokens.dtype)
-
-                built = self.qvtree.builder.build(x, grid_h, grid_w)
-                nodes = built["nodes"]
-                sel_nodes_list, _ = self.qvtree.navigator.select_nodes(
-                    nodes=nodes, patch_scores=patch_scores, W=grid_w,
-                )
-                selected_idx_per_image.append(sel_nodes_list[0])
-
-                token_out = self.qvtree.navigator.nodes_to_tokens(
-                    nodes, H=grid_h, W=grid_w, selected_node_ids=sel_nodes_list, x=x,
-                )
-                patch_ids = token_out["selected_token_indices"][0]
-                if patch_ids.numel() == 0:
-                    patch_ids = torch.arange(tokens.size(0), device=tokens.device)
-                patch_ids = torch.unique(patch_ids.clamp(min=0, max=tokens.size(0) - 1))
-
-                self._debug_patch_ids.append(patch_ids)
-                num_selected, num_total = int(patch_ids.numel()), int(tokens.size(0))
-                self._debug_num_selected_tokens.append(num_selected)
-                self._debug_num_total_tokens.append(num_total)
-                self._debug_select_ratios.append(num_selected / num_total if num_total > 0 else 0.0)
-
-                selected_tokens_list.append(tokens[patch_ids])  # [M, D]
-
-            self._debug_selected_idx = selected_idx_per_image
-
-            # 释放 image_tokens_list 和 patch_scores_global
-            n_original = sum(t.shape[0] for t in image_tokens_list)
-            del image_tokens_list, patch_scores_global
-            torch.cuda.empty_cache()
-
-            image_embeds_selected = torch.cat(selected_tokens_list, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
-            n_selected = int(image_embeds_selected.shape[0])
-            print(f"[TREE] selected tokens: {n_selected}, original: {n_original}")
-
-            # rebuild input_ids with updated placeholder count
-            original_ids = input_ids[0].tolist()
-            try:
-                vs_pos = original_ids.index(151652)  # vision_start
-                ve_pos = original_ids.index(151653)  # vision_end
-            except ValueError:
-                vs_pos = None
-
-            if vs_pos is not None:
-                new_ids = original_ids[:vs_pos + 1] + [151655] * n_selected + original_ids[ve_pos:]
-                new_input_ids = torch.tensor([new_ids], dtype=input_ids.dtype, device=input_ids.device)
-                new_attention_mask = torch.ones(
-                    1, len(new_ids), dtype=attention_mask.dtype, device=attention_mask.device
-                )
-                new_inputs_embeds = torch.nan_to_num(self.get_input_embeddings()(new_input_ids))
-                image_mask_selected, _ = self.get_placeholder_mask(
-                    new_input_ids, inputs_embeds=new_inputs_embeds, image_features=image_embeds_selected,
-                )
-                new_inputs_embeds = torch.nan_to_num(
-                    new_inputs_embeds.masked_scatter(image_mask_selected, image_embeds_selected)
-                )
-                # index position_ids from full-image computation
-                all_patch_ids = torch.cat([p.to(position_ids.device) for p in self._debug_patch_ids])
-                orig_img_pos = position_ids[:, :, vis_positions.to(position_ids.device)]  # [4, 1, N_total]
-                selected_img_pos = orig_img_pos[:, :, all_patch_ids]                       # [4, 1, M]
-                prefix_pos = position_ids[:, :, :vs_pos + 1]
-                suffix_pos = position_ids[:, :, vis_positions[-1].item() + 1:]
-                position_ids = torch.cat([prefix_pos, selected_img_pos, suffix_pos], dim=2)
-                self.rope_deltas = None  # 序列长度已改变，强制 decode 阶段重新计算 rope_deltas
-                inputs_embeds = new_inputs_embeds
-                attention_mask = new_attention_mask
-            else:
-                inputs_embeds = inputs_embeds_full
-
-        if pixel_values_videos is not None:
-            video_embeds = torch.cat(
-                self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True).pooler_output,
-                dim=0
-            ).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-
-        if position_ids is None:
-            position_ids = self.compute_3d_position_ids(
-                input_ids=input_ids, image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw, second_per_grid_ts=second_per_grid_ts,
-                inputs_embeds=inputs_embeds, attention_mask=attention_mask,
-                past_key_values=past_key_values,
-            )
-
-        seq_len = inputs_embeds.shape[1]
-        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(past_len, past_len + seq_len, device=inputs_embeds.device)
-
-        outputs = self.language_model(
-            input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-        output = Qwen2_5_VLModelOutputWithPast(
-            last_hidden_state=outputs.last_hidden_state,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
-        )
-        return output if return_dict else output.to_tuple()
+IMAGE_TOKEN_ID = 151655      # vision patch token id in Qwen2.5-VL
+VISION_START   = 151652
+VISION_END     = 151653
+PATCH_SIZE     = 28          # Qwen2.5-VL patch size in pixels
+GENERIC_PROMPT = "Write a general description of the image."
 
 
-class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGeneration):
-    def __init__(self, config):
-        super().__init__(config)
-        old_state_dict = self.model.state_dict()
-        self.model = Qwen2_5_VLModelWithTree(config)
-        self.model.load_state_dict(old_state_dict, strict=False)
+# =========================================================
+# Attention scoring
+# =========================================================
+
+def compute_patch_scores(
+    model,
+    processor,
+    image: Image.Image,
+    question: str,
+    target_layers: tuple = (20,),
+    gaussian_sigma: float = 1.0,
+    gaussian_ks: int = 3,
+) -> tuple[torch.Tensor, int, int]:
+    """
+    Compute relative patch attention scores for one image/question pair.
+
+    Pipeline:
+      Pass 1 : forward with the specific question          -> A_q
+      Pass 2 : forward with a generic description          -> A_g
+      scores  = A_q / A_g
+      -> normalize [0,1] -> Gaussian smooth -> normalize [0,1]
+
+    Args:
+        model, processor : loaded Qwen2.5-VL model and processor
+        image            : PIL image
+        question         : question string
+        target_layers    : transformer layer indices to hook
+        gaussian_sigma   : smoothing kernel sigma
+        gaussian_ks      : smoothing kernel size
+
+    Returns:
+        patch_scores : [grid_h * grid_w] float32 CPU tensor
+        grid_h       : patch grid height
+        grid_w       : patch grid width
+    """
+    device = next(model.parameters()).device
+
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text",  "text": question},
+    ]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
+    )
+    inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+
+    input_ids = inputs["input_ids"]
+    _, grid_h_raw, grid_w_raw = inputs["image_grid_thw"][0].tolist()
+    grid_h, grid_w = grid_h_raw // 2, grid_w_raw // 2
+
+    vis_positions = (input_ids[0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0].cpu()
+    img_end   = vis_positions[-1].item()
+    seq_len   = input_ids.shape[1]
+    text_start, text_end = img_end + 1, seq_len
+    text_positions = (
+        torch.arange(text_start, text_end, dtype=torch.long)
+        if text_end > text_start
+        else torch.tensor([seq_len - 1], dtype=torch.long)
+    )
+
+    def _get_attn_scores(model_inputs, query_positions):
+        lm = model.model.language_model
+        lm_layers = getattr(lm, "layers", None) or getattr(lm, "model", lm).layers
+
+        captured = {}
+        handles  = []
+
+        def make_hook(layer_id):
+            def hook_fn(module, input, output):
+                if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                    captured[layer_id] = output[1].detach().cpu()
+            return hook_fn
+
+        for lid in target_layers:
+            handles.append(lm_layers[lid].self_attn.register_forward_hook(make_hook(lid)))
+
+        try:
+            with torch.no_grad():
+                model(**model_inputs, output_attentions=True, return_dict=True)
+        finally:
+            for h in handles:
+                h.remove()
+
+        if not captured:
+            raise RuntimeError("Hook did not capture attention. "
+                               "Ensure attn_implementation='eager'.")
+
+        vp = vis_positions
+        qp = query_positions
+        scores = []
+        for lid in target_layers:
+            if lid not in captured:
+                continue
+            layer_attn = captured[lid]
+            attn = layer_attn[0, :, :, vp][:, qp, :]
+            scores.append(attn.mean(0).mean(0).float())
+        result = torch.stack(scores).mean(0)
+        del captured
+        torch.cuda.empty_cache()
+        return result
+
+    # Pass 1: question-specific
+    A_q = _get_attn_scores(inputs, text_positions)
+
+    # Pass 2: generic
+    generic_ids = processor.tokenizer(
+        GENERIC_PROMPT, return_tensors="pt", add_special_tokens=False
+    ).input_ids.to(device)
+    generic_input_ids = torch.cat(
+        [input_ids[:, :img_end + 1], generic_ids, input_ids[:, -3:]], dim=1
+    )
+    generic_inputs = {k: v for k, v in inputs.items()
+                      if k not in ("input_ids", "attention_mask", "position_ids", "mm_token_type_ids")}
+    generic_inputs["input_ids"] = generic_input_ids
+    generic_inputs["attention_mask"] = torch.ones(
+        1, generic_input_ids.shape[1], dtype=inputs["attention_mask"].dtype, device=device
+    )
+    generic_text_positions = torch.arange(
+        img_end + 1, img_end + 1 + generic_ids.shape[1], dtype=torch.long
+    )
+
+    A_g = _get_attn_scores(generic_inputs, generic_text_positions)
+    del generic_inputs
+    torch.cuda.empty_cache()
+
+    # relative salience + normalize
+    patch_scores = A_q / (A_g + 1e-8)
+    s_min, s_max = patch_scores.min(), patch_scores.max()
+    patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
+
+    # Gaussian smoothing
+    if patch_scores.shape[0] == grid_h * grid_w:
+        ax   = torch.arange(gaussian_ks, dtype=torch.float32) - gaussian_ks // 2
+        g1d  = torch.exp(-ax ** 2 / (2 * gaussian_sigma ** 2))
+        g1d /= g1d.sum()
+        kernel = (g1d.unsqueeze(1) * g1d.unsqueeze(0)).view(1, 1, gaussian_ks, gaussian_ks)
+        patch_scores = F.conv2d(
+            patch_scores.float().view(1, 1, grid_h, grid_w),
+            kernel, padding=gaussian_ks // 2,
+        ).view(-1)
+        s_min, s_max = patch_scores.min(), patch_scores.max()
+        patch_scores = (patch_scores - s_min) / (s_max - s_min + 1e-6)
+
+    return patch_scores, grid_h, grid_w
+
+
+# =========================================================
+# QuadTree selection
+# =========================================================
+
+def select_patches(
+    patch_scores: torch.Tensor,
+    grid_h: int,
+    grid_w: int,
+    hidden_dim: int,
+    split_threshold: float = 0.3,
+    softmax_temperature: float = 0.2,
+) -> torch.Tensor:
+    """
+    Run QuadTree builder + navigator to select salient patches.
+
+    Returns:
+        patch_ids : [M] sorted unique selected patch indices
+    """
+    n      = grid_h * grid_w
+    qvtree = QVTree(
+        D=hidden_dim,
+        split_threshold=split_threshold,
+        softmax_temperature=softmax_temperature,
+    )
+
+    x_dummy = torch.zeros(1, n, hidden_dim)
+    ps      = patch_scores.unsqueeze(0).float()
+
+    built  = qvtree.builder.build(x_dummy, grid_h, grid_w)
+    nodes  = built["nodes"]
+    sel, _ = qvtree.navigator.select_nodes(nodes=nodes, patch_scores=ps, W=grid_w)
+
+    token_out = qvtree.navigator.nodes_to_tokens(
+        nodes, H=grid_h, W=grid_w, selected_node_ids=sel, x=x_dummy,
+    )
+    patch_ids = token_out["selected_token_indices"][0]
+
+    if patch_ids.numel() == 0:
+        patch_ids = torch.arange(n)
+
+    return torch.unique(patch_ids.clamp(0, n - 1))
+
+
+# =========================================================
+# LPD (Layout-Preserving Downsample)
+# =========================================================
+
+def _patch_ids_to_bboxes(patch_ids: torch.Tensor, grid_w: int, patch_size: int) -> list:
+    bboxes = []
+    for idx in patch_ids.tolist():
+        r, c = int(idx) // grid_w, int(idx) % grid_w
+        x0, y0 = c * patch_size, r * patch_size
+        bboxes.append((x0, y0, x0 + patch_size, y0 + patch_size))
+    return bboxes
+
+
+def _merge_bboxes(bboxes: list) -> list:
+    if not bboxes:
+        return []
+
+    def overlaps_or_adjacent(a, b):
+        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+    merged, changed = list(bboxes), True
+    while changed:
+        changed = False
+        result  = []
+        used    = [False] * len(merged)
+        for i in range(len(merged)):
+            if used[i]:
+                continue
+            cur = list(merged[i])
+            for j in range(i + 1, len(merged)):
+                if not used[j] and overlaps_or_adjacent(cur, merged[j]):
+                    cur[0] = min(cur[0], merged[j][0])
+                    cur[1] = min(cur[1], merged[j][1])
+                    cur[2] = max(cur[2], merged[j][2])
+                    cur[3] = max(cur[3], merged[j][3])
+                    used[j] = True
+                    changed = True
+            result.append(tuple(cur))
+        merged = result
+    return merged
+
+
+def _build_compact_image(image: Image.Image, bboxes: list) -> Image.Image:
+    if not bboxes:
+        return image
+
+    img_w, img_h = image.size
+    x_coords = sorted(set([0, img_w] + [x for b in bboxes for x in (b[0], b[2])]))
+    y_coords = sorted(set([0, img_h] + [y for b in bboxes for y in (b[1], b[3])]))
+
+    def cell_has_content(x0, y0, x1, y1):
+        return any(x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1] for b in bboxes)
+
+    new_w, x_map = 0, {}
+    for i in range(len(x_coords) - 1):
+        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+               for j in range(len(y_coords) - 1)):
+            x_map[i] = new_w
+            new_w += x_coords[i+1] - x_coords[i]
+
+    new_h, y_map = 0, {}
+    for j in range(len(y_coords) - 1):
+        if any(cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1])
+               for i in range(len(x_coords) - 1)):
+            y_map[j] = new_h
+            new_h += y_coords[j+1] - y_coords[j]
+
+    if new_w == 0 or new_h == 0:
+        return image
+
+    compact = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
+    for i in range(len(x_coords) - 1):
+        for j in range(len(y_coords) - 1):
+            if cell_has_content(x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]):
+                if i not in x_map or j not in y_map:
+                    continue
+                patch = image.crop((x_coords[i], y_coords[j], x_coords[i+1], y_coords[j+1]))
+                compact.paste(patch, (x_map[i], y_map[j]))
+    return compact
+
+
+def run_lpd(
+    patch_ids: torch.Tensor,
+    image: Image.Image,
+    grid_h: int,
+    grid_w: int,
+) -> tuple[Image.Image, list]:
+    """
+    Full LPD pipeline.
+
+    Args:
+        patch_ids : [M] selected patch indices
+        image     : original PIL image (will be resized to grid pixel size)
+        grid_h    : patch grid height
+        grid_w    : patch grid width
+
+    Returns:
+        compact_image : PIL.Image
+        merged_bboxes : list of (x0, y0, x1, y1)
+    """
+    pil_img = image.convert("RGB").resize(
+        (grid_w * PATCH_SIZE, grid_h * PATCH_SIZE), Image.BILINEAR
+    )
+    raw_bboxes    = _patch_ids_to_bboxes(patch_ids.cpu(), grid_w, PATCH_SIZE)
+    merged_bboxes = _merge_bboxes(raw_bboxes)
+    compact_image = _build_compact_image(pil_img, merged_bboxes)
+    return compact_image, merged_bboxes
+
+
+# =========================================================
+# Inference
+# =========================================================
+
+def run_baseline_inference(
+    model,
+    processor,
+    image: Image.Image,
+    question: str,
+    max_new_tokens: int = 16,
+) -> str:
+    """Standard Qwen2.5-VL inference without any token selection."""
+    device = next(model.parameters()).device
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text",  "text": question},
+    ]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
+    )
+    inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+
+    with torch.inference_mode():
+        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+    return processor.batch_decode(
+        out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )[0].strip()
+
+
+def run_tree_inference(
+    model,
+    processor,
+    image: Image.Image,
+    question: str,
+    split_threshold: float = 0.3,
+    softmax_temperature: float = 0.2,
+    max_new_tokens: int = 16,
+) -> tuple[str, torch.Tensor, Image.Image, list, int, int, float]:
+    """
+    Full Q-VTree inference pipeline for Qwen2.5-VL.
+
+    Returns:
+        pred_text     : decoded prediction string
+        patch_scores  : [grid_h * grid_w] attention scores
+        compact_image : PIL.Image after LPD
+        merged_bboxes : list of merged bboxes
+        n_selected    : number of selected tokens
+        n_total       : total number of tokens
+        select_ratio  : n_selected / n_total
+    """
+    device = next(model.parameters()).device
+    hidden_dim = model.config.text_config.hidden_size
+
+    # Step 1: compute patch scores
+    patch_scores, grid_h, grid_w = compute_patch_scores(
+        model, processor, image, question
+    )
+
+    # Step 2: QuadTree selection
+    patch_ids = select_patches(
+        patch_scores, grid_h, grid_w, hidden_dim,
+        split_threshold=split_threshold,
+        softmax_temperature=softmax_temperature,
+    )
+    n_selected = int(patch_ids.numel())
+    n_total    = grid_h * grid_w
+    select_ratio = n_selected / n_total if n_total > 0 else 0.0
+    print(f"[TREE] selected tokens: {n_selected}, original: {n_total}")
+
+    # Step 3: LPD → compact image
+    compact_image, merged_bboxes = run_lpd(patch_ids, image, grid_h, grid_w)
+
+    # Step 4: inference with compact image
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": compact_image},
+        {"type": "text",  "text": question},
+    ]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
+    )
+    inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+
+    with torch.inference_mode():
+        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+    pred_text = processor.batch_decode(
+        out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )[0].strip()
+
+    return pred_text, patch_scores, compact_image, merged_bboxes, n_selected, n_total, select_ratio

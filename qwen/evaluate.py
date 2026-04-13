@@ -9,9 +9,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 from qwen_vl_utils import process_vision_info
-
-import os, json, re
-from tqdm import tqdm
+from .model import run_tree_inference
 
 
 # =========================================================
@@ -61,14 +59,6 @@ def evaluate_mcq_predictions(pred_file: str) -> float:
 # =========================================================
 # ---------------------- V-Star ---------------------------
 # =========================================================
-import os
-import json
-from tqdm import tqdm
-from PIL import Image
-import torch
-from qwen_vl_utils import process_vision_info
-
-
 def run_vstar_inference(
     model,
     processor,
@@ -78,26 +68,8 @@ def run_vstar_inference(
     max_samples: int | None = None,
     max_new_tokens: int = 16,
     model_type: str = "base_qwen",   # "base_qwen" or "tree_qwen"
-    run_name: str | None = None,     # optional custom tag for output naming
+    run_name: str | None = None,
 ):
-    """
-    Run inference on V-Star.
-
-    Args:
-        model: loaded model
-        processor: corresponding processor
-        dataset_dir: dataset root
-        anno_file: annotation jsonl
-        output_file: optional explicit output filename
-        max_samples: optional subset size
-        max_new_tokens: generation length
-        model_type: type tag for experiment tracking
-                    supported: "base_qwen", "tree_qwen"
-        run_name: optional custom run tag, e.g. "tree_alpha05_beta02"
-
-    Returns:
-        output_path: saved jsonl prediction path
-    """
     print("[DEBUG] model class =", model.__class__.__name__)
 
     if model_type not in ["base_qwen", "tree_qwen"]:
@@ -119,7 +91,6 @@ def run_vstar_inference(
 
     device = next(model.parameters()).device
 
-    # ===== selection statistics =====
     all_select_ratios = []
     all_num_selected = []
     all_num_total = []
@@ -130,7 +101,6 @@ def run_vstar_inference(
             img_path = os.path.join(dataset_dir, sample["image"])
             question = sample["text"]
 
-            # default stats for this sample
             sample_num_selected = None
             sample_num_total = None
             sample_select_ratio = None
@@ -138,66 +108,41 @@ def run_vstar_inference(
             try:
                 image = Image.open(img_path).convert("RGB")
 
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": question},
-                        ],
-                    }
-                ]
+                if model_type == "tree_qwen":
+                    pred_text, _, _, _, sample_num_selected, sample_num_total, sample_select_ratio = \
+                        run_tree_inference(model, processor, image, question,
+                                          max_new_tokens=max_new_tokens)
 
-                text = processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                    all_num_selected.append(sample_num_selected)
+                    all_num_total.append(sample_num_total)
+                    all_select_ratios.append(sample_select_ratio)
 
-                image_inputs, video_inputs = process_vision_info(messages)
+                    cat = sample["category"]
+                    if cat not in category_select_ratios:
+                        category_select_ratios[cat] = []
+                    category_select_ratios[cat].append(sample_select_ratio)
 
-                inputs = processor(
-                    text=[text],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
-
-                inputs = {
-                    k: (v.to(device) if torch.is_tensor(v) else v)
-                    for k, v in inputs.items()
-                }
-
-                if model_type == "tree_qwen" and hasattr(model, "model"):
-                    model.model.raw_images = [image]
-
-                with torch.inference_mode():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
+                else:  # base_qwen
+                    messages = [{"role": "user", "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": question},
+                    ]}]
+                    text = processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
                     )
-
-                # ===== read selection stats from tree model =====
-                if hasattr(model, "model") and hasattr(model.model, "_debug_num_selected_tokens"):
-                    if model.model._debug_num_selected_tokens is not None and len(model.model._debug_num_selected_tokens) > 0:
-                        sample_num_selected = int(model.model._debug_num_selected_tokens[0])
-                        sample_num_total = int(model.model._debug_num_total_tokens[0])
-                        sample_select_ratio = float(model.model._debug_select_ratios[0])
-
-                        all_num_selected.append(sample_num_selected)
-                        all_num_total.append(sample_num_total)
-                        all_select_ratios.append(sample_select_ratio)
-
-                        cat = sample["category"]
-                        if cat not in category_select_ratios:
-                            category_select_ratios[cat] = []
-                        category_select_ratios[cat].append(sample_select_ratio)
-
-                pred_text = processor.batch_decode(
-                    outputs[:, inputs["input_ids"].shape[1]:],
-                    skip_special_tokens=True,
-                )[0].strip()
+                    image_inputs, video_inputs = process_vision_info(messages)
+                    inputs = processor(
+                        text=[text], images=image_inputs, videos=video_inputs,
+                        padding=True, return_tensors="pt",
+                    )
+                    inputs = {k: (v.to(device) if torch.is_tensor(v) else v)
+                              for k, v in inputs.items()}
+                    with torch.inference_mode():
+                        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+                    pred_text = processor.batch_decode(
+                        outputs[:, inputs["input_ids"].shape[1]:],
+                        skip_special_tokens=True,
+                    )[0].strip()
 
                 pred_option = extract_option_letter(pred_text)
 
@@ -223,23 +168,15 @@ def run_vstar_inference(
                 "num_total_tokens": sample_num_total,
                 "select_ratio": sample_select_ratio,
             }
-
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-    # ===== print summary stats =====
     if len(all_select_ratios) > 0:
-        mean_ratio = sum(all_select_ratios) / len(all_select_ratios)
-        mean_selected = sum(all_num_selected) / len(all_num_selected)
-        mean_total = sum(all_num_total) / len(all_num_total)
-
-        print(f"[STATS] mean selected tokens = {mean_selected:.2f}")
-        print(f"[STATS] mean total tokens    = {mean_total:.2f}")
-        print(f"[STATS] mean select ratio    = {mean_ratio:.4f}")
-
+        print(f"[STATS] mean selected tokens = {sum(all_num_selected)/len(all_num_selected):.2f}")
+        print(f"[STATS] mean total tokens    = {sum(all_num_total)/len(all_num_total):.2f}")
+        print(f"[STATS] mean select ratio    = {sum(all_select_ratios)/len(all_select_ratios):.4f}")
         print("[STATS] select ratio by category:")
         for cat, vals in sorted(category_select_ratios.items()):
-            cat_mean = sum(vals) / len(vals)
-            print(f"  - {cat}: {cat_mean:.4f} (n={len(vals)})")
+            print(f"  - {cat}: {sum(vals)/len(vals):.4f} (n={len(vals)})")
 
     print(f"[INFO] Saved predictions to: {output_path}")
     return output_path
@@ -252,14 +189,6 @@ def evaluate_vstar_predictions(pred_file: str) -> float:
 # =========================================================
 # --------------------- HR-Bench --------------------------
 # =========================================================
-import os
-import json
-import pandas as pd
-from tqdm import tqdm
-import torch
-from qwen_vl_utils import process_vision_info
-
-
 def run_hrbench_inference(
     model,
     processor,
@@ -268,27 +197,9 @@ def run_hrbench_inference(
     output_file: str | None = None,
     max_samples: int | None = None,
     max_new_tokens: int = 16,
-    model_type: str = "base_qwen",   # "base_qwen" or "tree_qwen"
-    run_name: str | None = None,     # optional custom tag
+    model_type: str = "base_qwen",
+    run_name: str | None = None,
 ):
-    """
-    Run inference on HR-Bench.
-
-    Args:
-        model: loaded model
-        processor: corresponding processor
-        split: "4k" or "8k"
-        dataset_dir: dataset root
-        output_file: optional explicit output filename
-        max_samples: optional subset size
-        max_new_tokens: generation length
-        model_type: type tag for experiment tracking
-                    supported: "base_qwen", "tree_qwen"
-        run_name: optional custom run tag, e.g. "tree_alpha05_beta02"
-
-    Returns:
-        output_path: saved jsonl prediction path
-    """
     print("[DEBUG] model class =", model.__class__.__name__)
 
     if split not in ["4k", "8k"]:
@@ -311,7 +222,6 @@ def run_hrbench_inference(
 
     device = next(model.parameters()).device
 
-    # ===== selection statistics =====
     all_select_ratios = []
     all_num_selected = []
     all_num_total = []
@@ -326,7 +236,6 @@ def run_hrbench_inference(
 
             try:
                 image = decode_base64_image(row["image"])
-
                 question_text = (
                     f"{row['question']}\n"
                     f"(A) {row['A']}\n"
@@ -336,71 +245,46 @@ def run_hrbench_inference(
                     f"Answer with the option's letter from the given choices directly."
                 )
 
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": question_text},
-                        ],
-                    }
-                ]
+                if model_type == "tree_qwen":
+                    pred_text, _, _, _, sample_num_selected, sample_num_total, sample_select_ratio = \
+                        run_tree_inference(model, processor, image, question_text,
+                                          max_new_tokens=max_new_tokens)
 
-                text = processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                    all_num_selected.append(sample_num_selected)
+                    all_num_total.append(sample_num_total)
+                    all_select_ratios.append(sample_select_ratio)
 
-                image_inputs, video_inputs = process_vision_info(messages)
+                    cat = row["category"]
+                    if cat not in category_select_ratios:
+                        category_select_ratios[cat] = []
+                    category_select_ratios[cat].append(sample_select_ratio)
 
-                inputs = processor(
-                    text=[text],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
+                    cyc = row["cycle_category"]
+                    if cyc not in cycle_category_select_ratios:
+                        cycle_category_select_ratios[cyc] = []
+                    cycle_category_select_ratios[cyc].append(sample_select_ratio)
 
-                inputs = {
-                    k: (v.to(device) if torch.is_tensor(v) else v)
-                    for k, v in inputs.items()
-                }
-
-                if model_type == "tree_qwen" and hasattr(model, "model"):
-                    model.model.raw_images = [image]
-
-                with torch.inference_mode():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
+                else:  # base_qwen
+                    messages = [{"role": "user", "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": question_text},
+                    ]}]
+                    text = processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
                     )
-
-                # ===== read selection stats from tree model =====
-                if hasattr(model, "model") and hasattr(model.model, "_debug_num_selected_tokens"):
-                    if model.model._debug_num_selected_tokens is not None and len(model.model._debug_num_selected_tokens) > 0:
-                        sample_num_selected = int(model.model._debug_num_selected_tokens[0])
-                        sample_num_total = int(model.model._debug_num_total_tokens[0])
-                        sample_select_ratio = float(model.model._debug_select_ratios[0])
-
-                        all_num_selected.append(sample_num_selected)
-                        all_num_total.append(sample_num_total)
-                        all_select_ratios.append(sample_select_ratio)
-
-                        cat = row["category"]
-                        if cat not in category_select_ratios:
-                            category_select_ratios[cat] = []
-                        category_select_ratios[cat].append(sample_select_ratio)
-
-                        cyc = row["cycle_category"]
-                        if cyc not in cycle_category_select_ratios:
-                            cycle_category_select_ratios[cyc] = []
-                        cycle_category_select_ratios[cyc].append(sample_select_ratio)
-
-                pred_text = processor.batch_decode(
-                    outputs[:, inputs["input_ids"].shape[1]:],
-                    skip_special_tokens=True,
-                )[0].strip()
+                    image_inputs, video_inputs = process_vision_info(messages)
+                    inputs = processor(
+                        text=[text], images=image_inputs, videos=video_inputs,
+                        padding=True, return_tensors="pt",
+                    )
+                    inputs = {k: (v.to(device) if torch.is_tensor(v) else v)
+                              for k, v in inputs.items()}
+                    with torch.inference_mode():
+                        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+                    pred_text = processor.batch_decode(
+                        outputs[:, inputs["input_ids"].shape[1]:],
+                        skip_special_tokens=True,
+                    )[0].strip()
 
                 pred_option = extract_option_letter(pred_text)
 
@@ -431,28 +315,18 @@ def run_hrbench_inference(
                 "num_total_tokens": sample_num_total,
                 "select_ratio": sample_select_ratio,
             }
-
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-    # ===== print summary stats =====
     if len(all_select_ratios) > 0:
-        mean_ratio = sum(all_select_ratios) / len(all_select_ratios)
-        mean_selected = sum(all_num_selected) / len(all_num_selected)
-        mean_total = sum(all_num_total) / len(all_num_total)
-
-        print(f"[STATS] mean selected tokens = {mean_selected:.2f}")
-        print(f"[STATS] mean total tokens    = {mean_total:.2f}")
-        print(f"[STATS] mean select ratio    = {mean_ratio:.4f}")
-
+        print(f"[STATS] mean selected tokens = {sum(all_num_selected)/len(all_num_selected):.2f}")
+        print(f"[STATS] mean total tokens    = {sum(all_num_total)/len(all_num_total):.2f}")
+        print(f"[STATS] mean select ratio    = {sum(all_select_ratios)/len(all_select_ratios):.4f}")
         print("[STATS] select ratio by category:")
         for cat, vals in sorted(category_select_ratios.items()):
-            cat_mean = sum(vals) / len(vals)
-            print(f"  - {cat}: {cat_mean:.4f} (n={len(vals)})")
-
+            print(f"  - {cat}: {sum(vals)/len(vals):.4f} (n={len(vals)})")
         print("[STATS] select ratio by cycle_category:")
         for cyc, vals in sorted(cycle_category_select_ratios.items()):
-            cyc_mean = sum(vals) / len(vals)
-            print(f"  - {cyc}: {cyc_mean:.4f} (n={len(vals)})")
+            print(f"  - {cyc}: {sum(vals)/len(vals):.4f} (n={len(vals)})")
 
     print(f"[INFO] Saved predictions to: {output_path}")
     return output_path
