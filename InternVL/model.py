@@ -631,6 +631,11 @@ class InternVLChatModelWithTree(InternVLChatModel):
         n_tot = global_h * global_w
         print(f"[TREE] selected tokens: {n_sel}, original: {n_tot}, ratio: {n_sel / n_tot:.1%}")
 
+        # update debug stats to reflect global selection
+        self._debug_num_selected_tokens = [n_sel]
+        self._debug_num_total_tokens    = [n_tot]
+        self._debug_select_ratios       = [n_sel / n_tot if n_tot > 0 else 0.0]
+
         # ── Pass 2: inference with compact image ──
         import tempfile, os as _os
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)

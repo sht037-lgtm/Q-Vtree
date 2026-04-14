@@ -183,7 +183,32 @@ def run_vstar_inference(
 
 
 def evaluate_vstar_predictions(pred_file: str) -> float:
-    return evaluate_mcq_predictions(pred_file)
+    total, correct = 0, 0
+    category_stats = {}
+
+    with open(pred_file, "r", encoding="utf-8") as f:
+        for line in f:
+            item = json.loads(line)
+            pred  = str(item["prediction_option"]).strip().upper()
+            label = str(item["label"]).strip().upper()
+            cat   = item.get("category", "unknown")
+
+            total += 1
+            if pred == label:
+                correct += 1
+
+            if cat not in category_stats:
+                category_stats[cat] = {"total": 0, "correct": 0}
+            category_stats[cat]["total"] += 1
+            if pred == label:
+                category_stats[cat]["correct"] += 1
+
+    acc = correct / total if total > 0 else 0.0
+    print(f"Accuracy: {acc:.4f} ({correct}/{total})")
+    for cat, s in sorted(category_stats.items()):
+        cat_acc = s["correct"] / s["total"] if s["total"] > 0 else 0.0
+        print(f"  - {cat}: {cat_acc:.4f} ({s['correct']}/{s['total']})")
+    return acc
 
 
 # =========================================================
