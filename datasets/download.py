@@ -26,6 +26,28 @@ def download_vstar_dataset(
     print("[INFO] VStar download complete.")
     return save_dir
 
+
+def download_pope_dataset(
+    save_dir: str = "./pope",
+    repo_id: str = "lmms-lab/POPE",
+) -> str:
+    if os.path.exists(save_dir) and len(os.listdir(save_dir)) > 0:
+        print(f"[INFO] POPE dataset already exists at {save_dir}")
+        return save_dir
+
+    print(f"[INFO] Downloading POPE from: {repo_id}")
+
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=save_dir,
+        resume_download=True,
+        max_workers=1,
+    )
+
+    print("[INFO] POPE download complete.")
+    return save_dir
+
 def download_hrbench_dataset(
     save_dir: str = "./hr_bench",
     repo_id: str = "DreamMr/HR-Bench",
@@ -48,4 +70,4 @@ def download_hrbench_dataset(
     return save_dir
 
 if __name__ == '__main__':
-    download_vstar_dataset()
+    download_hrbench_dataset()
