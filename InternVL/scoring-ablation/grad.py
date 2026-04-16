@@ -246,75 +246,49 @@ class InternVLChatModelWithTree(InternVLChatModel):
     # ------------------------------------------------------------------
     # LLM attention scorer
     # ------------------------------------------------------------------
-    # ablation layers to probe
-    ABLATION_LAYERS = [3, 7, 11, 15, 19, 23, 27]
+    ATT_LAYER = 27
+    ABLATION_LAYERS = [ATT_LAYER]
 
 
     def _compute_grad_cam_scores(self, input_embeds, attention_mask,
                                   img_positions, text_positions):
         """
-        Grad-CAM via torch.autograd.grad(loss, attention) per layer.
+        LLaVA-style gradient-weighted attention on a single LLM layer.
 
-        Follows the LLaVA implementation pattern:
-          - Hook the target layer to capture attention weights (output_attentions=True
-            only for that layer via patched forward)
-          - Use autograd.grad instead of .backward() to avoid accumulating
-            gradients across the whole model
-          - Score = attention * relu(grad), mean over heads, last text token → vision tokens
-
-        One forward+grad per layer to keep peak memory bounded.
+        This mirrors the implementation in mllms_know-main:
+          1. Run the LLM with output_attentions=True
+          2. Pick one attention layer tensor [1, heads, S, S]
+          3. Differentiate the final-token logit w.r.t. that tensor
+          4. Compute attention * relu(grad)
+          5. Take the final text position to image-token slice
         """
         device = input_embeds.device
         vp = img_positions.to(device)
-        # use only the last text token (consistent with LLaVA impl)
-        last_q = text_positions[-1:].to(device)
+        last_text_pos = text_positions[-1].item()
 
         layer_scores = {}
 
         for layer_idx in self.ABLATION_LAYERS:
             torch.cuda.empty_cache()
+            out = self.language_model(
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+            zero_logit = out.logits[:, last_text_pos, :]
+            true_class = torch.argmax(zero_logit, dim=1)
+            loss = -F.cross_entropy(zero_logit, true_class)
 
-            attn_ref = {}
+            attention = out.attentions[layer_idx]
+            grads = torch.autograd.grad(loss, attention, retain_graph=False)[0]
+            grad_att = attention * F.relu(grads)
+            scores = grad_att[0, :, last_text_pos, vp].mean(dim=0)
+            layer_scores[layer_idx] = scores.to(torch.float32).detach().cpu()
 
-            original_forward = self.language_model.model.layers[layer_idx].self_attn.forward
-
-            def patched_forward(*args, _idx=layer_idx, **kwargs):
-                kwargs['output_attentions'] = True
-                result = original_forward(*args, **kwargs)
-                if isinstance(result, tuple) and len(result) > 1 and result[1] is not None:
-                    attn_ref[_idx] = result[1].float()   # [1, heads, S, S]  — no retain_grad needed
-                    result = (result[0], attn_ref[_idx]) + result[2:]
-                return result
-
-            self.language_model.model.layers[layer_idx].self_attn.forward = patched_forward
-
-            try:
-                out = self.language_model(
-                    inputs_embeds=input_embeds,
-                    attention_mask=attention_mask,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True,
-                    use_cache=False,
-                )
-                last_text_pos = last_q[-1].item()
-                target_token = out.logits[0, last_text_pos].argmax()
-                loss = -out.logits[0, last_text_pos, target_token]   # match LLaVA sign convention
-
-                attention = attn_ref.get(layer_idx)
-                if attention is not None:
-                    grads = torch.autograd.grad(loss, attention, retain_graph=False)[0]
-                    grad_att = attention * F.relu(grads)   # [1, heads, S, S]
-                    # last text token attending to vision tokens, mean over heads
-                    scores = grad_att[0, :, last_text_pos, vp].mean(dim=0)   # [N_img]
-                    layer_scores[layer_idx] = scores.cpu().float()
-                else:
-                    layer_scores[layer_idx] = torch.zeros(vp.numel())
-
-            finally:
-                self.language_model.model.layers[layer_idx].self_attn.forward = original_forward
-
-            del attn_ref, out
+            del out, zero_logit, loss, attention, grads, grad_att
             torch.cuda.empty_cache()
 
         return layer_scores
@@ -406,10 +380,10 @@ class InternVLChatModelWithTree(InternVLChatModel):
             self._debug_layer_score_maps[layer_idx] = smooth_map
             layer_smoothed_tiles[layer_idx] = per_tile
 
-        # ---- final scoring: mean of layers [19, 27] grad-cam ----
-        mean_scores = (layer_scores[19] + layer_scores[27]) / 2
-        mean_scores = (mean_scores - mean_scores.min()) / (mean_scores.max() - mean_scores.min() + 1e-6)
-        full_map_smooth, smoothed = _stitch_and_smooth(mean_scores)
+        # ---- final scoring: single LLaVA-style Grad-CAM layer ----
+        final_scores = layer_scores[self.ATT_LAYER]
+        final_scores = (final_scores - final_scores.min()) / (final_scores.max() - final_scores.min() + 1e-6)
+        full_map_smooth, smoothed = _stitch_and_smooth(final_scores)
         self._debug_full_score_map = full_map_smooth
         self._debug_patch_scores = smoothed
 
