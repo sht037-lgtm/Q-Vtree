@@ -46,6 +46,19 @@ def download_internvl3():
     print("Model path:", model_path)
     return model_path
 
+def download_instructblip_vicuna7b():
+    model_path = snapshot_download(
+        repo_id="Salesforce/instructblip-vicuna-7b",
+        allow_patterns=[
+            "*.json",
+            "*.model",
+            "*.txt",
+            "*.safetensors",
+            "*.py",
+        ],
+    )
+    print("Model path:", model_path)
+    return model_path
 
 if __name__ == '__main__':
-    download_internvl3()
+    download_instructblip_vicuna7b()
