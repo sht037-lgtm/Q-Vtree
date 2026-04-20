@@ -246,8 +246,10 @@ def _tree_inference(model, processor, image, question):
     select_ratio     = num_selected / BASELINE_TOKENS
     _, meta          = pad_resize_with_meta(image)
     compact_image, _ = run_lpd_on_original(patch_ids, image, meta)
+    # dual-image: original image tokens + compact image tokens -> LLM
     pred_text        = run_tree_inference(model, processor, compact_image, question,
-                                         max_new_tokens=MAX_NEW_TOKENS)
+                                         max_new_tokens=MAX_NEW_TOKENS,
+                                         original_image=image)
     return pred_text, num_selected, select_ratio
 
 
@@ -501,7 +503,7 @@ def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree):
             for _, row in tqdm(df.iterrows(), total=len(df), desc="TextVQA Baseline"):
                 try:
                     img       = load_image_from_row(row["image"])
-                    question  = str(row["question"])
+                    question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
                     pred_text = run_baseline_inference(model, processor, img, question,
                                                        max_new_tokens=32)
                     answers   = list(row["answers"])
@@ -525,7 +527,7 @@ def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree):
             for _, row in tqdm(df.iterrows(), total=len(df), desc="TextVQA Tree"):
                 try:
                     img      = load_image_from_row(row["image"])
-                    question = str(row["question"])
+                    question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
                     pred_text, num_sel, sel_ratio = _tree_inference(
                         model, processor, img, question)
                     answers  = list(row["answers"])
