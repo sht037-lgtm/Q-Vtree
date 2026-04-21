@@ -30,7 +30,11 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+
+
 from module import QVTree
+#from InternVL.module import QVTree
+
 
 
 # =========================================================

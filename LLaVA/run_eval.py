@@ -234,7 +234,7 @@ def print_delta(b, t):
 # Tree inference (shared)
 # ---------------------------------------------------------------------------
 
-def _tree_inference(model, processor, image, question):
+def _tree_inference(model, processor, image, question, dual=True):
     from llava_with_tree import (
         compute_patch_scores, select_patches,
         pad_resize_with_meta, run_lpd_on_original, run_tree_inference,
@@ -246,10 +246,11 @@ def _tree_inference(model, processor, image, question):
     select_ratio     = num_selected / BASELINE_TOKENS
     _, meta          = pad_resize_with_meta(image)
     compact_image, _ = run_lpd_on_original(patch_ids, image, meta)
-    # dual-image: original image tokens + compact image tokens -> LLM
+    # dual=True : original (576 tokens) + compact (576 tokens) + question
+    # dual=False: compact only (576 tokens) + question
     pred_text        = run_tree_inference(model, processor, compact_image, question,
                                          max_new_tokens=MAX_NEW_TOKENS,
-                                         original_image=image)
+                                         original_image=image if dual else None)
     return pred_text, num_selected, select_ratio
 
 
@@ -257,7 +258,7 @@ def _tree_inference(model, processor, image, question):
 # V-Star
 # ---------------------------------------------------------------------------
 
-def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree):
+def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree, dual=True):
     from llava_with_tree import run_baseline_inference
 
     anno = os.path.join(VSTAR_DIR, "test_questions.jsonl")
@@ -296,7 +297,7 @@ def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree):
                 try:
                     image    = Image.open(os.path.join(VSTAR_DIR, s["image"])).convert("RGB")
                     pred_text, num_sel, sel_ratio = _tree_inference(
-                        model, processor, image, s["text"])
+                        model, processor, image, s["text"], dual=dual)
                     pred_opt = extract_option_letter(pred_text)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
@@ -328,7 +329,7 @@ def _hrbench_question(row) -> str:
     ).format(row["question"], row["A"], row["B"], row["C"], row["D"])
 
 
-def run_hrbench(model, processor, split, mode, max_samples, out_baseline, out_tree):
+def run_hrbench(model, processor, split, mode, max_samples, out_baseline, out_tree, dual=True):
     from llava_with_tree import run_baseline_inference
 
     tsv_path = os.path.join(HRBENCH_DIR, "hr_bench_{}.tsv".format(split))
@@ -369,7 +370,7 @@ def run_hrbench(model, processor, split, mode, max_samples, out_baseline, out_tr
                     image    = decode_base64_image(row["image"])
                     question = _hrbench_question(row)
                     pred_text, num_sel, sel_ratio = _tree_inference(
-                        model, processor, image, question)
+                        model, processor, image, question, dual=dual)
                     pred_opt = extract_option_letter(pred_text)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
@@ -413,7 +414,7 @@ def _pope_question(row) -> str:
     return "{} Please answer yes or no.".format(row["question"])
 
 
-def run_pope(model, processor, split, mode, max_samples, out_baseline, out_tree):
+def run_pope(model, processor, split, mode, max_samples, out_baseline, out_tree, dual=True):
     from llava_with_tree import run_baseline_inference
 
     df = _load_pope_split(split)
@@ -453,7 +454,7 @@ def run_pope(model, processor, split, mode, max_samples, out_baseline, out_tree)
                     img       = load_image_from_row(row["image"])
                     question  = _pope_question(row)
                     pred_text, num_sel, sel_ratio = _tree_inference(
-                        model, processor, img, question)
+                        model, processor, img, question, dual=dual)
                     prediction = extract_yes_no(pred_text)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
@@ -487,7 +488,7 @@ def _load_textvqa(split="validation"):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree):
+def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual=True):
     from llava_with_tree import run_baseline_inference
 
     df = _load_textvqa(split="validation")
@@ -529,7 +530,7 @@ def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree):
                     img      = load_image_from_row(row["image"])
                     question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
                     pred_text, num_sel, sel_ratio = _tree_inference(
-                        model, processor, img, question)
+                        model, processor, img, question, dual=dual)
                     answers  = list(row["answers"])
                     vqa_acc  = _vqa_accuracy(pred_text, answers)
                     select_ratios.append(sel_ratio)
@@ -577,7 +578,7 @@ def _docvqa_accuracy(prediction: str, answers: list) -> float:
             return 1.0
     return 0.0
 
-def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree):
+def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual=True):
     from llava_with_tree import run_baseline_inference
     df = _load_docvqa(split="validation")
     if max_samples:
@@ -615,7 +616,7 @@ def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree):
                     img      = load_image_from_row(row["image"])
                     question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
                     pred_text, num_sel, sel_ratio = _tree_inference(
-                        model, processor, img, question)
+                        model, processor, img, question, dual=dual)
                     answers  = list(row["answers"])
                     vqa_acc  = _docvqa_accuracy(pred_text, answers)
                     select_ratios.append(sel_ratio)
@@ -651,6 +652,9 @@ def main():
     parser.add_argument("--split",   default="4k",
                         help="hrbench: 4k/8k  |  pope: adversarial/popular/random")
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--dual",    action="store_true", default=False,
+                        help="Tree mode: use dual-image inference (original + compact). "
+                             "Default: compact image only.")
     args = parser.parse_args()
 
     if args.dataset == "vstar":
@@ -686,6 +690,7 @@ def main():
     from transformers import LlavaForConditionalGeneration, AutoProcessor
 
     print("Loading model: " + MODEL_ID)
+    print("Tree mode: {}".format("dual-image (original + compact)" if args.dual else "single-image (compact only)"))
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = LlavaForConditionalGeneration.from_pretrained(
         MODEL_ID, torch_dtype=torch.float16,
@@ -696,19 +701,24 @@ def main():
 
     if args.dataset == "vstar":
         baseline_results, tree_results = run_vstar(
-            model, processor, args.mode, args.max_samples, out_baseline, out_tree)
+            model, processor, args.mode, args.max_samples, out_baseline, out_tree,
+            dual=args.dual)
     elif args.dataset == "hrbench":
         baseline_results, tree_results = run_hrbench(
-            model, processor, args.split, args.mode, args.max_samples, out_baseline, out_tree)
+            model, processor, args.split, args.mode, args.max_samples, out_baseline, out_tree,
+            dual=args.dual)
     elif args.dataset == "pope":
         baseline_results, tree_results = run_pope(
-            model, processor, args.split, args.mode, args.max_samples, out_baseline, out_tree)
+            model, processor, args.split, args.mode, args.max_samples, out_baseline, out_tree,
+            dual=args.dual)
     elif args.dataset == "textvqa":
         baseline_results, tree_results = run_textvqa(
-            model, processor, args.mode, args.max_samples, out_baseline, out_tree)
+            model, processor, args.mode, args.max_samples, out_baseline, out_tree,
+            dual=args.dual)
     else:
         baseline_results, tree_results = run_docvqa(
-            model, processor, args.mode, args.max_samples, out_baseline, out_tree)
+            model, processor, args.mode, args.max_samples, out_baseline, out_tree,
+            dual=args.dual)
 
     b = print_fn(baseline_results, "Baseline") if baseline_results else None
     t = print_fn(tree_results,     "Tree")     if tree_results     else None
