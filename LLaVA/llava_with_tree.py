@@ -10,7 +10,8 @@ Pipeline:
   QuadTree -> patch_ids (in 336x336 space)
   patch_ids mapped back to original image coordinates via PadResizeMeta
   LPD crops selected regions from original high-res image -> compact image
-  Pass 3 : compact image -> final inference
+  Pass 3 : [original image tokens] + [compact image tokens] + question -> answer
+           total 2N image tokens, original first then compact
 """
 
 from __future__ import annotations
@@ -29,7 +30,11 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+
+
 from module import QVTree
+#from InternVL.module import QVTree
+
 
 
 # =========================================================
@@ -384,7 +389,7 @@ def run_lpd(patch_ids: torch.Tensor, clip_image: Image.Image):
 
 def _generate(model, processor, image: Image.Image, prompt: str,
               max_new_tokens: int) -> str:
-    """Shared generate helper."""
+    """Single-image generate helper (used by baseline)."""
     device  = next(model.parameters()).device
     inputs  = processor(text=prompt, images=image.convert("RGB"),
                         return_tensors="pt").to(device)
@@ -397,13 +402,67 @@ def _generate(model, processor, image: Image.Image, prompt: str,
 
 def run_baseline_inference(model, processor, image: Image.Image, question: str,
                            max_new_tokens: int = 32) -> str:
-    """Baseline: pad-resize original image, standard inference."""
+    """Baseline: pad-resize original image, standard single-image inference."""
     return _generate(model, processor, pad_resize(image),
                      "USER: <image>\n{}\nASSISTANT:".format(question), max_new_tokens)
 
 
-def run_tree_inference(model, processor, compact_image: Image.Image, question: str,
-                       max_new_tokens: int = 32) -> str:
-    """Tree second-pass: compact image is already high-res, no extra pad_resize."""
-    return _generate(model, processor, compact_image,
-                     "USER: <image>\n{}\nASSISTANT:".format(question), max_new_tokens)
+def run_tree_inference(
+    model,
+    processor,
+    compact_image: Image.Image,
+    question: str,
+    original_image: Image.Image = None,
+    max_new_tokens: int = 32,
+) -> str:
+    """
+    Tree second-pass inference.
+
+    If original_image is provided (dual-image mode):
+      - Encode original_image (pad-resized) -> N image tokens
+      - Encode compact_image (pad-resized)  -> N image tokens
+      - Concatenate: [orig tokens][compact tokens][question tokens] -> answer
+      - Prompt uses two <image> placeholders: "USER: <image><image>\n{question}\nASSISTANT:"
+
+    If original_image is None (legacy single-image mode):
+      - Only compact_image is used (original behavior preserved)
+      - Prompt: "USER: <image>\n{question}\nASSISTANT:"
+    """
+    device = next(model.parameters()).device
+
+    if original_image is None:
+        # legacy single-image mode
+        return _generate(model, processor, compact_image,
+                         "USER: <image>\n{}\nASSISTANT:".format(question), max_new_tokens)
+
+    # ---- dual-image mode ----
+    orig_padded    = pad_resize(original_image)
+    compact_padded = pad_resize(compact_image)
+
+    # encode both images to get pixel_values, then stack along batch dim
+    enc_orig    = processor(text="dummy", images=orig_padded,
+                            return_tensors="pt").to(device)
+    enc_compact = processor(text="dummy", images=compact_padded,
+                            return_tensors="pt").to(device)
+
+    # pixel_values shape: [1, C, H, W] each -> cat to [2, C, H, W]
+    pixel_values = torch.cat([enc_orig["pixel_values"],
+                               enc_compact["pixel_values"]], dim=0)
+
+    # build input_ids with two <image> tokens in the prompt
+    prompt = "USER: <image><image>\n{}\nASSISTANT:".format(question)
+    inputs = processor(text=prompt, images=[orig_padded, compact_padded],
+                       return_tensors="pt").to(device)
+
+    with torch.inference_mode():
+        out_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=pixel_values,
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+
+    return processor.batch_decode(
+        out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )[0].strip()
