@@ -182,7 +182,6 @@ def run_lpd_on_tile(tile_pil: Image.Image, patch_ids: torch.Tensor,
                     grid_h: int = GRID_SIZE, grid_w: int = GRID_SIZE,
                     patch_size: int = PATCH_SIZE) -> Tuple[Image.Image, list]:
     """Apply LPD to a single tile PIL image."""
-    # ensure tile is at the right size
     tile = tile_pil.convert("RGB").resize((grid_w * patch_size, grid_h * patch_size), Image.BILINEAR)
     raw_bboxes = _patch_ids_to_bboxes(patch_ids.cpu(), grid_w, patch_size)
     merged_bboxes = _merge_bboxes(raw_bboxes)
@@ -209,10 +208,14 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_select_ratios = None
         self._debug_patch_scores = None
         self._debug_best_ratio = None
-        self._debug_full_score_map = None    # thumbnail attention score map
-        self._debug_selected_map = None      # binary selected patches map
-        self._debug_compact_tiles = None     # compact PIL image
-        self._debug_merged_bboxes = None     # merged bboxes in original image coords
+        self._debug_full_score_map = None
+        self._debug_selected_map = None
+        self._debug_compact_tiles = None
+        self._debug_merged_bboxes = None
+        self._debug_baseline_gpu_time = None
+        self._debug_baseline_peak_memory = None
+        self._debug_tree_gpu_time = None
+        self._debug_tree_peak_memory = None
         self._debug_pass1_gpu_time = None
         self._debug_pass1_peak_memory = None
         self._debug_pass2_gpu_time = None
@@ -236,7 +239,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 return_dict=True,
             ).hidden_states[self.select_layer]
 
-        raw = raw[:, 1:, :]  # drop CLS token
+        raw = raw[:, 1:, :]
         h = w = int(raw.shape[1] ** 0.5)
         x = raw.reshape(raw.shape[0], h, w, -1)
         x = self.pixel_shuffle(x, scale_factor=self.downsample_ratio)
@@ -280,20 +283,17 @@ class InternVLChatModelWithTree(InternVLChatModel):
         device = vit_embeds.device
         dtype = vit_embeds.dtype
 
-        # init debug
         self._debug_patch_ids = []
         self._debug_num_selected_tokens = []
         self._debug_num_total_tokens = []
         self._debug_select_ratios = []
         self._debug_best_ratio = best_ratio
 
-        # ---- token positions ----
         ids_flat = input_ids.reshape(-1)
         sel_mask = (ids_flat == self.img_context_token_id)
         vis_positions_all = sel_mask.nonzero(as_tuple=True)[0].cpu()
         n_content_tokens = num_content_tiles * N_per_tile
 
-        # use thumbnail token positions for scoring
         if has_thumbnail:
             vis_positions = vis_positions_all[n_content_tokens: n_content_tokens + N_per_tile]
         else:
@@ -302,7 +302,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         img_end = vis_positions_all[-1].item()
         text_positions = torch.arange(img_end + 1, input_ids.shape[1], dtype=torch.long)
 
-        # ---- single forward pass ----
         if self._generic_token_ids is None:
             _tok = AutoTokenizer.from_pretrained(self.config._name_or_path, trust_remote_code=True)
             self._generic_token_ids = _tok(
@@ -324,7 +323,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         lm_out_q = self._run_lm_forward(input_embeds_full, attention_mask)
         lm_out_g = self._run_lm_forward(gen_emb, gen_mask)
 
-        # ---- relative attention on thumbnail, mean of SCORE_LAYERS ----
         scores = sum(
             self._extract_layer_attn(lm_out_q, li, vis_positions, text_positions) /
             (self._extract_layer_attn(lm_out_g, li, vis_positions, generic_text_positions) + 1e-8)
@@ -332,7 +330,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         ) / len(self.SCORE_LAYERS)
         scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-6)
 
-        # ---- gaussian smooth ----
         sigma, ks = 1.0, 3
         ax = torch.arange(ks, dtype=torch.float32) - ks // 2
         g1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
@@ -342,9 +339,8 @@ class InternVLChatModelWithTree(InternVLChatModel):
         score_map = F.conv2d(score_map.unsqueeze(0).unsqueeze(0), kernel, padding=ks // 2).squeeze()
         score_map = (score_map - score_map.min()) / (score_map.max() - score_map.min() + 1e-6)
         self._debug_full_score_map = score_map
-        self._debug_patch_scores = [score_map.reshape(-1)]  # single thumbnail score
+        self._debug_patch_scores = [score_map.reshape(-1)]
 
-        # ---- QVTree selection on thumbnail space (16×16) ----
         thumb_tokens = vit_embeds[-1] if has_thumbnail else vit_embeds[0]
         x_thumb = thumb_tokens.unsqueeze(0)
         ps_thumb = score_map.reshape(1, -1).to(device=device, dtype=dtype)
@@ -361,13 +357,11 @@ class InternVLChatModelWithTree(InternVLChatModel):
             thumb_patch_ids = torch.arange(grid_h * grid_w, device=device)
         thumb_patch_ids = torch.unique(thumb_patch_ids.clamp(0, grid_h * grid_w - 1))
 
-        # selected map in thumbnail space
         selected_map = torch.zeros(grid_h, grid_w)
         for pid in thumb_patch_ids.tolist():
             selected_map[int(pid) // grid_w, int(pid) % grid_w] = 1.0
         self._debug_selected_map = selected_map
 
-        # store debug stats
         self._debug_patch_ids = [thumb_patch_ids]
         n_sel = int(thumb_patch_ids.numel())
         n_tot = grid_h * grid_w
@@ -375,7 +369,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_num_total_tokens = [n_tot]
         self._debug_select_ratios = [n_sel / n_tot]
 
-        # return dummy patch_ids_per_tile (LPD done in infer via thumbnail coords)
         patch_ids_per_tile = [torch.arange(vit_embeds[i].size(0), device=device)
                               for i in range(B_tiles)]
         return patch_ids_per_tile
@@ -407,7 +400,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
                     output_hidden_states=output_hidden_states, **generate_kwargs,
                 )
 
-            # 1. ViT features
             vit_embeds, grid_h, grid_w = self.extract_feature_with_grid(pixel_values)
             B_tiles = vit_embeds.shape[0]
 
@@ -416,7 +408,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 sq = int(math.isqrt(n))
                 best_ratio = (sq, sq) if sq * sq == n else (n, 1)
 
-            # 2. Build full input_embeds for scoring
             emb = self.language_model.get_input_embeddings()(input_ids)
             B, N, C = emb.shape
             flat = emb.reshape(B * N, C)
@@ -425,7 +416,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
             flat[sel] = vit_embeds.reshape(-1, C).to(flat.device)
             input_embeds_full = torch.nan_to_num(flat.reshape(B, N, C))
 
-            # 3. Score + QVTree selection (stores debug info)
             self._score_and_select(
                 vit_embeds=vit_embeds,
                 input_embeds_full=input_embeds_full,
@@ -436,7 +426,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 best_ratio=best_ratio,
             )
 
-            # 4. Use original embeddings for generation (LPD handled in infer)
             input_embeds_final = input_embeds_full
 
         else:
@@ -472,6 +461,14 @@ class InternVLChatModelWithTree(InternVLChatModel):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self._debug_baseline_gpu_time = None
+        self._debug_baseline_peak_memory = None
+        self._debug_tree_gpu_time = None
+        self._debug_tree_peak_memory = None
+        self._debug_pass1_gpu_time = None
+        self._debug_pass1_peak_memory = None
+        self._debug_pass2_gpu_time = None
+        self._debug_pass2_peak_memory = None
 
         image = Image.open(image_path).convert('RGB')
         transform = build_transform(input_size)
@@ -500,19 +497,29 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
             )
-
-            return self.chat(
+            torch.cuda.reset_peak_memory_stats()
+            _s0 = torch.cuda.Event(enable_timing=True)
+            _e0 = torch.cuda.Event(enable_timing=True)
+            _s0.record()
+            response = super(InternVLChatModelWithTree, self).chat(
                 tokenizer=tokenizer,
                 pixel_values=pixel_values,
                 question=question,
                 generation_config=generation_config,
             )
+            _e0.record()
+            torch.cuda.synchronize()
+            self._debug_baseline_gpu_time = _s0.elapsed_time(_e0) / 1000.0
+            self._debug_baseline_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
+            return response
 
         # =========================================================
         # TREE MODE: original pipeline below
         # =========================================================
-
-        # ===== 原 tree pipeline 从这里继续 =====
+        torch.cuda.reset_peak_memory_stats()
+        _st = torch.cuda.Event(enable_timing=True)
+        _et = torch.cuda.Event(enable_timing=True)
+        _st.record()
 
         def _build_query(n_patches):
             template = get_conv_template(self.template)
@@ -525,7 +532,7 @@ class InternVLChatModelWithTree(InternVLChatModel):
             eos = tokenizer.convert_tokens_to_ids(template.sep.strip())
             return q, eos
 
-        # ── Pass 1: scoring on thumbnail (single 448×448 tile, no dynamic tiling) ──
+        # ── Pass 1: scoring on thumbnail ──
         thumb_image = image.resize((input_size, input_size))
         thumb_pv = transform(thumb_image).unsqueeze(0).to(dtype=dtype, device=device)
         thumb_ratio = (1, 1)
@@ -557,7 +564,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_pass1_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
 
         if not use_lpd or self._debug_patch_ids is None:
-            # base inference: re-run with original image
             outputs = self.language_model.generate(
                 inputs_embeds=None, input_ids=input_ids1,
                 attention_mask=attention_mask1,
@@ -566,11 +572,14 @@ class InternVLChatModelWithTree(InternVLChatModel):
                 eos_token_id=eos_token_id,
                 use_cache=True,
             )
+            _et.record()
+            torch.cuda.synchronize()
+            self._debug_tree_gpu_time = _st.elapsed_time(_et) / 1000.0
+            self._debug_tree_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
             response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
             return response.split(tokenizer.decode([eos_token_id]).strip())[0].strip()
 
-        # ── LPD: map thumbnail patch_ids to original image coords ──
-        # thumbnail is 16×16, each patch covers (orig_w/16 × orig_h/16) of original image
+        # ── LPD ──
         orig_w, orig_h = image.size
         thumb_patch_ids = self._debug_patch_ids[0]
         patch_pixel_w = orig_w / GRID_SIZE
@@ -587,16 +596,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         merged_bboxes = _merge_bboxes(raw_bboxes)
         compact_image = _build_compact_image(image.convert("RGB"), merged_bboxes)
 
-        # change
-        """
-        # scale up compact image
-        cw, ch = compact_image.size
-        if cw > 0 and ch > 0:
-            scale = min(orig_w / cw, orig_h / ch)
-            compact_image = compact_image.resize((int(cw * scale), int(ch * scale)), Image.BILINEAR)
-        """
-
-        # store debug
         self._debug_compact_tiles = [compact_image]
         self._debug_merged_bboxes = merged_bboxes
 
@@ -631,7 +630,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
 
         _os.unlink(tmp.name)
 
-        # use parent generate (no scoring) for compact image
         torch.cuda.reset_peak_memory_stats()
         _s2 = torch.cuda.Event(enable_timing=True)
         _e2 = torch.cuda.Event(enable_timing=True)
@@ -650,6 +648,8 @@ class InternVLChatModelWithTree(InternVLChatModel):
         torch.cuda.synchronize()
         self._debug_pass2_gpu_time = _s2.elapsed_time(_e2) / 1000.0
         self._debug_pass2_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
+        self._debug_tree_gpu_time = _st.elapsed_time(_e2) / 1000.0
+        self._debug_tree_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
         response = response.split(tokenizer.decode([eos_token_id]).strip())[0].strip()

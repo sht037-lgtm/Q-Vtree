@@ -96,14 +96,9 @@ def run_vstar_inference_internvl(
     all_num_selected = []
     all_num_total = []
     category_select_ratios = {}
-    # baseline: total time
+    # unified total time
     total_gpu_times = []
     total_peak_memories = []
-    # tree: pass1 and pass2 separately
-    pass1_gpu_times = []
-    pass1_peak_memories = []
-    pass2_gpu_times = []
-    pass2_peak_memories = []
 
     with open(output_path, "w", encoding="utf-8") as fout:
         for i, sample in enumerate(tqdm(samples, desc=f"Running V-Star [{model_type}]", miniters=10)):
@@ -116,10 +111,11 @@ def run_vstar_inference_internvl(
 
             try:
                 if model_type == "base_internvl":
-                    torch.cuda.reset_peak_memory_stats()
-                    starter = torch.cuda.Event(enable_timing=True)
-                    ender   = torch.cuda.Event(enable_timing=True)
-                    starter.record()
+                    model._debug_baseline_gpu_time = None
+                    model._debug_baseline_peak_memory = None
+                elif model_type == "tree_internvl":
+                    model._debug_tree_gpu_time = None
+                    model._debug_tree_peak_memory = None
 
                 pred_text = model.infer(
                     tokenizer=tokenizer,
@@ -130,20 +126,16 @@ def run_vstar_inference_internvl(
                 )
 
                 if model_type == "base_internvl":
-                    ender.record()
-                    torch.cuda.synchronize()
                     if i >= warmup:
-                        total_gpu_times.append(starter.elapsed_time(ender) / 1000.0)
-                        total_peak_memories.append(torch.cuda.max_memory_allocated() / 1024 ** 3)
+                        if getattr(model, '_debug_baseline_gpu_time', None) is not None:
+                            total_gpu_times.append(model._debug_baseline_gpu_time)
+                            total_peak_memories.append(model._debug_baseline_peak_memory)
 
                 elif model_type == "tree_internvl":
                     if i >= warmup:
-                        if getattr(model, '_debug_pass1_gpu_time', None) is not None:
-                            pass1_gpu_times.append(model._debug_pass1_gpu_time)
-                            pass1_peak_memories.append(model._debug_pass1_peak_memory)
-                        if getattr(model, '_debug_pass2_gpu_time', None) is not None:
-                            pass2_gpu_times.append(model._debug_pass2_gpu_time)
-                            pass2_peak_memories.append(model._debug_pass2_peak_memory)
+                        if getattr(model, '_debug_tree_gpu_time', None) is not None:
+                            total_gpu_times.append(model._debug_tree_gpu_time)
+                            total_peak_memories.append(model._debug_tree_peak_memory)
 
                     if hasattr(model, '_debug_num_selected_tokens') and model._debug_num_selected_tokens:
                         sample_num_selected = sum(model._debug_num_selected_tokens)
@@ -185,13 +177,6 @@ def run_vstar_inference_internvl(
     if total_gpu_times:
         print(f"[TIME]   mean GPU time    = {sum(total_gpu_times)/len(total_gpu_times):.3f}s  (n={len(total_gpu_times)})")
         print(f"[MEMORY] mean peak memory = {sum(total_peak_memories)/len(total_peak_memories):.2f}GB")
-
-    if pass1_gpu_times:
-        print(f"[TIME] Pass1 mean GPU time    = {sum(pass1_gpu_times)/len(pass1_gpu_times):.3f}s  (n={len(pass1_gpu_times)})")
-        print(f"[TIME] Pass2 mean GPU time    = {sum(pass2_gpu_times)/len(pass2_gpu_times):.3f}s  (n={len(pass2_gpu_times)})")
-        print(f"[TIME] Total mean GPU time    = {(sum(pass1_gpu_times)+sum(pass2_gpu_times))/len(pass1_gpu_times):.3f}s")
-        print(f"[MEMORY] Pass1 mean peak memory = {sum(pass1_peak_memories)/len(pass1_peak_memories):.2f}GB")
-        print(f"[MEMORY] Pass2 mean peak memory = {sum(pass2_peak_memories)/len(pass2_peak_memories):.2f}GB")
 
     if all_select_ratios:
         print(f"[STATS] mean selected tokens = {sum(all_num_selected)/len(all_num_selected):.2f}")
