@@ -44,7 +44,7 @@ POPE_DIR    = os.path.join(_PROJECT_ROOT, "datasets", "pope")
 TEXTVQA_DIR = os.path.join(_PROJECT_ROOT, "datasets", "textvqa")
 DOCVQA_DIR  = os.path.join(_PROJECT_ROOT, "datasets", "docvqa")
 
-SPLIT_THRESHOLD     = 0.3
+SPLIT_THRESHOLD     = 0.25
 SOFTMAX_TEMPERATURE = 0.2
 TARGET_LAYERS       = (14, 15, 16, 17)
 MAX_NEW_TOKENS      = 16
