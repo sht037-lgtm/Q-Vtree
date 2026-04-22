@@ -543,7 +543,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
         attention_mask1 = inputs1['attention_mask'].to(device)
 
         import time as _time
-        torch.cuda.reset_peak_memory_stats()
         _s1 = torch.cuda.Event(enable_timing=True)
         _e1 = torch.cuda.Event(enable_timing=True)
         _s1.record()
@@ -630,7 +629,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
 
         _os.unlink(tmp.name)
 
-        torch.cuda.reset_peak_memory_stats()
         _s2 = torch.cuda.Event(enable_timing=True)
         _e2 = torch.cuda.Event(enable_timing=True)
         _s2.record()
@@ -647,10 +645,11 @@ class InternVLChatModelWithTree(InternVLChatModel):
         _e2.record()
         torch.cuda.synchronize()
         self._debug_pass2_gpu_time = _s2.elapsed_time(_e2) / 1000.0
-        self._debug_pass2_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
+        self._debug_pass2_peak_memory = torch.cuda.memory_allocated() / 1024 ** 3
         self._debug_tree_gpu_time = _st.elapsed_time(_e2) / 1000.0
         self._debug_tree_peak_memory = torch.cuda.max_memory_allocated() / 1024 ** 3
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
         response = response.split(tokenizer.decode([eos_token_id]).strip())[0].strip()
         return response
+        
