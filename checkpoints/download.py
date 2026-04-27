@@ -60,5 +60,12 @@ def download_instructblip_vicuna7b():
     print("Model path:", model_path)
     return model_path
 
+def download_llava_onevision_7b():
+    model_path = download_hf_model(
+        repo_id="lmms-lab/llava-onevision-qwen2-7b-ov",
+    )
+    print("Model path:", model_path)
+    return model_path
+
 if __name__ == '__main__':
-    download_instructblip_vicuna7b()
+    download_llava_onevision_7b()

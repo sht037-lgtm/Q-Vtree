@@ -1,18 +1,25 @@
 """
-run_eval.py
+run_eval_onevision.py
 
-Evaluates LLaVA-1.5-7B on V-Star, HR-Bench, POPE, or TextVQA benchmark.
+Evaluates LLaVA-OneVision-Qwen2-7B on V-Star, HR-Bench, POPE, TextVQA, or DocVQA.
 
 Usage:
-    python run_eval.py --mode baseline
-    python run_eval.py --mode tree
-    python run_eval.py --mode both
-    python run_eval.py --mode report
+    python run_eval_onevision.py --mode baseline
+    python run_eval_onevision.py --mode tree
+    python run_eval_onevision.py --mode both
+    python run_eval_onevision.py --mode report
 
-    python run_eval.py --dataset hrbench --split 4k --mode both
-    python run_eval.py --dataset pope --split adversarial --mode both
-    python run_eval.py --dataset textvqa --mode both
-    python run_eval.py --dataset textvqa --mode both --max_samples 100
+    python run_eval_onevision.py --dataset hrbench --split 4k --mode both
+    python run_eval_onevision.py --dataset pope --split adversarial --mode both
+    python run_eval_onevision.py --dataset textvqa --mode both
+    python run_eval_onevision.py --dataset textvqa --mode both --max_samples 100
+    python run_eval_onevision.py --dataset docvqa  --mode both
+
+    # dual mode: original (anyres) + compact (anyres)
+    python run_eval_onevision.py --mode both --dual
+
+    # local-only mode (default): compact image only
+    python run_eval_onevision.py --mode both
 """
 
 import os
@@ -28,34 +35,33 @@ from PIL import Image
 
 _HERE         = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
-_LLAVA_DIR    = os.path.join(_PROJECT_ROOT, "LLaVA")
 
-for p in [_PROJECT_ROOT, _LLAVA_DIR]:
+for p in [_PROJECT_ROOT, _HERE]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MODEL_ID    = os.path.join(_PROJECT_ROOT, "checkpoints", "llava-1.5-7b-hf")
+MODEL_ID    = os.path.join(_PROJECT_ROOT, "checkpoints", "llava-onevision-qwen2-7b-ov")
 VSTAR_DIR   = os.path.join(_PROJECT_ROOT, "datasets", "vstar_bench")
 HRBENCH_DIR = os.path.join(_PROJECT_ROOT, "datasets", "hr_bench")
 POPE_DIR    = os.path.join(_PROJECT_ROOT, "datasets", "pope")
 TEXTVQA_DIR = os.path.join(_PROJECT_ROOT, "datasets", "textvqa")
 DOCVQA_DIR  = os.path.join(_PROJECT_ROOT, "datasets", "docvqa")
 
-SPLIT_THRESHOLD     = 0.3
+SPLIT_THRESHOLD     = 0.25
 SOFTMAX_TEMPERATURE = 0.2
-TARGET_LAYERS       = (14,15)
+TARGET_LAYERS       = (14, 15, 16, 17)
 MAX_NEW_TOKENS      = 16
-BASELINE_TOKENS     = 576
+BASELINE_TOKENS     = 729   # 27x27 for SigLIP 384/patch14 – used for ratio display
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def extract_option_letter(text: str) -> str:
+def extract_option_letter(text):
     if not text:
         return ""
     text = text.strip().upper()
@@ -63,14 +69,14 @@ def extract_option_letter(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def extract_yes_no(text: str) -> str:
+def extract_yes_no(text):
     if not text:
         return ""
     text = text.strip().upper()
-    if text.startswith("YES"):   return "YES"
-    if text.startswith("NO"):    return "NO"
-    if "YES" in text:            return "YES"
-    if "NO"  in text:            return "NO"
+    if text.startswith("YES"):  return "YES"
+    if text.startswith("NO"):   return "NO"
+    if "YES" in text:           return "YES"
+    if "NO"  in text:           return "NO"
     return ""
 
 
@@ -79,17 +85,11 @@ def load_results(path):
         return [json.loads(l) for l in f]
 
 
-def decode_base64_image(img_str: str) -> Image.Image:
+def decode_base64_image(img_str):
     return Image.open(io.BytesIO(base64.b64decode(img_str))).convert("RGB")
 
 
-def load_image_from_row(raw) -> Image.Image:
-    """
-    Handle multiple image formats stored in parquet:
-      - dict with 'bytes' key  (lmms-lab format)
-      - PIL Image
-      - numpy array
-    """
+def load_image_from_row(raw):
     if isinstance(raw, dict) and "bytes" in raw:
         return Image.open(io.BytesIO(raw["bytes"])).convert("RGB")
     elif isinstance(raw, Image.Image):
@@ -98,23 +98,46 @@ def load_image_from_row(raw) -> Image.Image:
         return Image.fromarray(raw).convert("RGB")
 
 
+def _normalize_answer(text):
+    import string
+    text = text.lower().strip()
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    return " ".join(text.split())
+
+
+def _vqa_accuracy(prediction, answers):
+    pred    = _normalize_answer(prediction)
+    matches = sum(1 for a in answers if _normalize_answer(a) == pred)
+    return min(matches / 3.0, 1.0)
+
+
+def _docvqa_accuracy(prediction, answers):
+    pred = _normalize_answer(prediction)
+    for a in answers:
+        norm_a = _normalize_answer(a)
+        if pred == norm_a:
+            return 1.0
+        if norm_a and pred and (norm_a in pred or pred in norm_a):
+            return 1.0
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Result printing
 # ---------------------------------------------------------------------------
 
-def print_vstar_results(results, run_name) -> dict:
+def print_vstar_results(results, run_name):
     stats = {}
     total = correct = 0
     for r in results:
         pred = str(r["prediction_option"]).strip().upper()
         hit  = int(pred == str(r["label"]).strip().upper())
         cat  = r["category"]
-        total += 1;  correct += hit
+        total += 1; correct += hit
         if cat not in stats:
             stats[cat] = {"correct": 0, "total": 0}
         stats[cat]["correct"] += hit
         stats[cat]["total"]   += 1
-
     overall = correct / total * 100 if total else 0.0
     print("\n" + "=" * 52)
     print("  " + run_name)
@@ -129,19 +152,18 @@ def print_vstar_results(results, run_name) -> dict:
     return {"overall": overall, "per_category": stats}
 
 
-def print_hrbench_results(results, run_name) -> dict:
+def print_hrbench_results(results, run_name):
     stats = {}
     total = correct = 0
     for r in results:
         pred = str(r["prediction_option"]).strip().upper()
         hit  = int(pred == str(r["label"]).strip().upper())
         cat  = r.get("category", "unknown")
-        total += 1;  correct += hit
+        total += 1; correct += hit
         if cat not in stats:
             stats[cat] = {"correct": 0, "total": 0}
         stats[cat]["correct"] += hit
         stats[cat]["total"]   += 1
-
     overall   = correct / total * 100 if total else 0.0
     label_map = {"single": "FSP", "cross": "FCP"}
     print("\n" + "=" * 52)
@@ -158,13 +180,12 @@ def print_hrbench_results(results, run_name) -> dict:
     return {"overall": overall, "per_category": stats}
 
 
-def print_pope_results(results, run_name) -> dict:
+def print_pope_results(results, run_name):
     total = correct = 0
     for r in results:
         pred  = str(r["prediction"]).strip().upper()
         label = str(r["label"]).strip().upper()
-        total += 1;  correct += int(pred == label)
-
+        total += 1; correct += int(pred == label)
     overall = correct / total * 100 if total else 0.0
     print("\n" + "=" * 52)
     print("  " + run_name)
@@ -174,26 +195,11 @@ def print_pope_results(results, run_name) -> dict:
     return {"overall": overall}
 
 
-def _normalize_answer(text: str) -> str:
-    import string
-    text = text.lower().strip()
-    text = text.translate(str.maketrans("", "", string.punctuation))
-    return " ".join(text.split())
-
-
-def _vqa_accuracy(prediction: str, answers: list) -> float:
-    pred    = _normalize_answer(prediction)
-    matches = sum(1 for a in answers if _normalize_answer(a) == pred)
-    return min(matches / 3.0, 1.0)
-
-
-def print_textvqa_results(results, run_name) -> dict:
-    total   = 0
-    acc_sum = 0.0
+def print_textvqa_results(results, run_name):
+    total = 0; acc_sum = 0.0
     for r in results:
         total   += 1
         acc_sum += r.get("vqa_acc", 0.0)
-
     overall = acc_sum / total * 100 if total else 0.0
     print("\n" + "=" * 52)
     print("  " + run_name)
@@ -203,7 +209,7 @@ def print_textvqa_results(results, run_name) -> dict:
     return {"overall": overall}
 
 
-def print_select_ratio_stats(select_ratios):
+def print_select_ratio_stats(select_ratios, baseline_tokens):
     if not select_ratios:
         return
     mean_sel = sum(select_ratios) / len(select_ratios)
@@ -211,7 +217,7 @@ def print_select_ratio_stats(select_ratios):
     print("  QuadTree token selection ratio")
     print("-" * 52)
     print("  mean selected patches: %.1f / %d  (%.1f%%)" % (
-        mean_sel * BASELINE_TOKENS, BASELINE_TOKENS, mean_sel * 100))
+        mean_sel * baseline_tokens, baseline_tokens, mean_sel * 100))
     print("-" * 52)
 
 
@@ -234,32 +240,39 @@ def print_delta(b, t):
 # Tree inference (shared)
 # ---------------------------------------------------------------------------
 
-def _tree_inference(model, processor, image, question, dual=True):
-    from llava_with_tree import (
+def _tree_inference(model, processor, image, question, dual=False):
+    from onevision_with_tree import (
         compute_patch_scores, select_patches,
         pad_resize_with_meta, run_lpd_on_original, run_tree_inference,
+        _get_patch_size,
     )
-    patch_scores     = compute_patch_scores(
+    patch_scores, grid_size, score_size = compute_patch_scores(
         model, processor, image, question, target_layers=TARGET_LAYERS)
-    patch_ids        = select_patches(patch_scores, SPLIT_THRESHOLD, SOFTMAX_TEMPERATURE)
-    num_selected     = int(patch_ids.numel())
-    select_ratio     = num_selected / BASELINE_TOKENS
-    _, meta          = pad_resize_with_meta(image)
-    compact_image, _ = run_lpd_on_original(patch_ids, image, meta)
-    # dual=True : original (576 tokens) + compact (576 tokens) + question
-    # dual=False: compact only (576 tokens) + question
-    pred_text        = run_tree_inference(model, processor, compact_image, question,
-                                         max_new_tokens=MAX_NEW_TOKENS,
-                                         original_image=image if dual else None)
-    return pred_text, num_selected, select_ratio
+
+    patch_ids    = select_patches(patch_scores, grid_size,
+                                  SPLIT_THRESHOLD, SOFTMAX_TEMPERATURE)
+    num_selected = int(patch_ids.numel())
+    total_tokens = grid_size * grid_size
+    select_ratio = num_selected / total_tokens
+
+    patch_size       = _get_patch_size(model)
+    _, meta          = pad_resize_with_meta(image, score_size)
+    compact_image, _ = run_lpd_on_original(patch_ids, image, meta, grid_size, patch_size)
+
+    pred_text = run_tree_inference(
+        model, processor, compact_image, question,
+        original_image=image if dual else None,
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+    return pred_text, num_selected, select_ratio, total_tokens
 
 
 # ---------------------------------------------------------------------------
 # V-Star
 # ---------------------------------------------------------------------------
 
-def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree, dual=True):
-    from llava_with_tree import run_baseline_inference
+def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree, dual=False):
+    from onevision_with_tree import run_baseline_inference
 
     anno = os.path.join(VSTAR_DIR, "test_questions.jsonl")
     with open(anno) as f:
@@ -296,22 +309,22 @@ def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree, dual=
             for s in tqdm(samples, desc="V-Star Tree"):
                 try:
                     image    = Image.open(os.path.join(VSTAR_DIR, s["image"])).convert("RGB")
-                    pred_text, num_sel, sel_ratio = _tree_inference(
+                    pred_text, num_sel, sel_ratio, tot = _tree_inference(
                         model, processor, image, s["text"], dual=dual)
                     pred_opt = extract_option_letter(pred_text)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
                     pred_text, pred_opt = "", ""
-                    num_sel, sel_ratio = 0, 0.0
+                    num_sel, sel_ratio, tot = 0, 0.0, BASELINE_TOKENS
                     print("[ERROR] id={}: {}".format(s.get("question_id"), e))
                 fout.write(json.dumps({
                     "question_id": s["question_id"], "category": s["category"],
                     "label": s["label"], "prediction_text": pred_text,
                     "prediction_option": pred_opt,
-                    "num_selected": num_sel, "num_total": BASELINE_TOKENS,
+                    "num_selected": num_sel, "num_total": tot,
                     "select_ratio": sel_ratio,
                 }) + "\n")
-        print_select_ratio_stats(select_ratios)
+        print_select_ratio_stats(select_ratios, BASELINE_TOKENS)
         print("Saved: " + out_tree)
         tree_results = load_results(out_tree)
 
@@ -322,15 +335,15 @@ def run_vstar(model, processor, mode, max_samples, out_baseline, out_tree, dual=
 # HR-Bench
 # ---------------------------------------------------------------------------
 
-def _hrbench_question(row) -> str:
+def _hrbench_question(row):
     return (
         "{}\n(A) {}\n(B) {}\n(C) {}\n(D) {}\n"
         "Answer with the option's letter from the given choices directly."
     ).format(row["question"], row["A"], row["B"], row["C"], row["D"])
 
 
-def run_hrbench(model, processor, split, mode, max_samples, out_baseline, out_tree, dual=True):
-    from llava_with_tree import run_baseline_inference
+def run_hrbench(model, processor, split, mode, max_samples, out_baseline, out_tree, dual=False):
+    from onevision_with_tree import run_baseline_inference
 
     tsv_path = os.path.join(HRBENCH_DIR, "hr_bench_{}.tsv".format(split))
     df = pd.read_csv(tsv_path, sep="\t")
@@ -369,23 +382,23 @@ def run_hrbench(model, processor, split, mode, max_samples, out_baseline, out_tr
                 try:
                     image    = decode_base64_image(row["image"])
                     question = _hrbench_question(row)
-                    pred_text, num_sel, sel_ratio = _tree_inference(
+                    pred_text, num_sel, sel_ratio, tot = _tree_inference(
                         model, processor, image, question, dual=dual)
                     pred_opt = extract_option_letter(pred_text)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
                     pred_text, pred_opt = "", ""
-                    num_sel, sel_ratio = 0, 0.0
+                    num_sel, sel_ratio, tot = 0, 0.0, BASELINE_TOKENS
                     print("[ERROR] index={}: {}".format(row.get("index", "?"), e))
                 fout.write(json.dumps({
                     "index": int(row["index"]), "split": split,
                     "category": row["category"], "cycle_category": row["cycle_category"],
                     "label": row["answer"], "prediction_text": pred_text,
                     "prediction_option": pred_opt,
-                    "num_selected": num_sel, "num_total": BASELINE_TOKENS,
+                    "num_selected": num_sel, "num_total": tot,
                     "select_ratio": sel_ratio,
                 }) + "\n")
-        print_select_ratio_stats(select_ratios)
+        print_select_ratio_stats(select_ratios, BASELINE_TOKENS)
         print("Saved: " + out_tree)
         tree_results = load_results(out_tree)
 
@@ -402,26 +415,25 @@ def _load_pope_split(split):
         pattern = os.path.join(POPE_DIR, "Full", "{}-*.parquet".format(split))
     else:
         pattern = os.path.join(POPE_DIR, "data", "test-*.parquet")
-
     files = sorted(glob.glob(pattern))
     if not files:
-        raise FileNotFoundError("No parquet files found for split '{}' at {}".format(
-            split, pattern))
+        raise FileNotFoundError(
+            "No parquet files found for split '{}' at {}".format(split, pattern))
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def _pope_question(row) -> str:
+def _pope_question(row):
     return "{} Please answer yes or no.".format(row["question"])
 
 
-def run_pope(model, processor, split, mode, max_samples, out_baseline, out_tree, dual=True):
-    from llava_with_tree import run_baseline_inference
+def run_pope(model, processor, split, mode, max_samples, out_baseline, out_tree, dual=False):
+    from onevision_with_tree import run_baseline_inference
 
     df = _load_pope_split(split)
     if max_samples:
         df = df.iloc[:max_samples]
-
     print("POPE split: {}  samples: {}".format(split, len(df)))
+
     baseline_results = tree_results = None
 
     if mode in ("baseline", "both"):
@@ -453,22 +465,22 @@ def run_pope(model, processor, split, mode, max_samples, out_baseline, out_tree,
                 try:
                     img       = load_image_from_row(row["image"])
                     question  = _pope_question(row)
-                    pred_text, num_sel, sel_ratio = _tree_inference(
+                    pred_text, num_sel, sel_ratio, tot = _tree_inference(
                         model, processor, img, question, dual=dual)
                     prediction = extract_yes_no(pred_text)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
                     pred_text, prediction = "", ""
-                    num_sel, sel_ratio = 0, 0.0
+                    num_sel, sel_ratio, tot = 0, 0.0, BASELINE_TOKENS
                     print("[ERROR] id={}: {}".format(row.get("question_id", "?"), e))
                 fout.write(json.dumps({
                     "question_id": str(row.get("question_id", "")), "split": split,
                     "label": str(row["answer"]).strip().upper(),
                     "prediction_text": pred_text, "prediction": prediction,
-                    "num_selected": num_sel, "num_total": BASELINE_TOKENS,
+                    "num_selected": num_sel, "num_total": tot,
                     "select_ratio": sel_ratio,
                 }) + "\n")
-        print_select_ratio_stats(select_ratios)
+        print_select_ratio_stats(select_ratios, BASELINE_TOKENS)
         print("Saved: " + out_tree)
         tree_results = load_results(out_tree)
 
@@ -488,14 +500,14 @@ def _load_textvqa(split="validation"):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual=True):
-    from llava_with_tree import run_baseline_inference
+def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual=False):
+    from onevision_with_tree import run_baseline_inference
 
     df = _load_textvqa(split="validation")
     if max_samples:
         df = df.iloc[:max_samples]
-
     print("TextVQA validation samples: {}".format(len(df)))
+
     baseline_results = tree_results = None
 
     if mode in ("baseline", "both"):
@@ -504,7 +516,7 @@ def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree, dua
             for _, row in tqdm(df.iterrows(), total=len(df), desc="TextVQA Baseline"):
                 try:
                     img       = load_image_from_row(row["image"])
-                    question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
+                    question  = str(row["question"]) + "\nAnswer the question using a single word or phrase."
                     pred_text = run_baseline_inference(model, processor, img, question,
                                                        max_new_tokens=32)
                     answers   = list(row["answers"])
@@ -527,16 +539,16 @@ def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree, dua
         with open(out_tree, "w") as fout:
             for _, row in tqdm(df.iterrows(), total=len(df), desc="TextVQA Tree"):
                 try:
-                    img      = load_image_from_row(row["image"])
-                    question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
-                    pred_text, num_sel, sel_ratio = _tree_inference(
+                    img       = load_image_from_row(row["image"])
+                    question  = str(row["question"]) + "\nAnswer the question using a single word or phrase."
+                    pred_text, num_sel, sel_ratio, tot = _tree_inference(
                         model, processor, img, question, dual=dual)
                     answers  = list(row["answers"])
                     vqa_acc  = _vqa_accuracy(pred_text, answers)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
                     pred_text, vqa_acc = "", 0.0
-                    num_sel, sel_ratio = 0, 0.0
+                    num_sel, sel_ratio, tot = 0, 0.0, BASELINE_TOKENS
                     print("[ERROR] qid={}: {}".format(row.get("question_id", "?"), e))
                 fout.write(json.dumps({
                     "question_id"    : int(row["question_id"]),
@@ -544,10 +556,10 @@ def run_textvqa(model, processor, mode, max_samples, out_baseline, out_tree, dua
                     "answers"        : list(row["answers"]),
                     "vqa_acc"        : vqa_acc,
                     "num_selected"   : num_sel,
-                    "num_total"      : BASELINE_TOKENS,
+                    "num_total"      : tot,
                     "select_ratio"   : sel_ratio,
                 }) + "\n")
-        print_select_ratio_stats(select_ratios)
+        print_select_ratio_stats(select_ratios, BASELINE_TOKENS)
         print("Saved: " + out_tree)
         tree_results = load_results(out_tree)
 
@@ -567,35 +579,27 @@ def _load_docvqa(split="validation"):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def _docvqa_accuracy(prediction: str, answers: list) -> float:
-    pred = _normalize_answer(prediction)
-    for a in answers:
-        norm_a = _normalize_answer(a)
-        if pred == norm_a:
-            return 1.0
-        # fallback: answer contained in prediction or prediction contained in answer
-        if norm_a and pred and (norm_a in pred or pred in norm_a):
-            return 1.0
-    return 0.0
+def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual=False):
+    from onevision_with_tree import run_baseline_inference
 
-def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual=True):
-    from llava_with_tree import run_baseline_inference
     df = _load_docvqa(split="validation")
     if max_samples:
         df = df.iloc[:max_samples]
     print("DocVQA validation samples: {}".format(len(df)))
+
     baseline_results = tree_results = None
+
     if mode in ("baseline", "both"):
         print("\nRunning DocVQA BASELINE on {} samples ...".format(len(df)))
         with open(out_baseline, "w") as fout:
             for _, row in tqdm(df.iterrows(), total=len(df), desc="DocVQA Baseline"):
                 try:
-                    img       = load_image_from_row(row["image"])
+                    img      = load_image_from_row(row["image"])
                     question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
                     pred_text = run_baseline_inference(model, processor, img, question,
                                                        max_new_tokens=32)
-                    answers   = list(row["answers"])
-                    vqa_acc   = _docvqa_accuracy(pred_text, answers)
+                    answers  = list(row["answers"])
+                    vqa_acc  = _docvqa_accuracy(pred_text, answers)
                 except Exception as e:
                     pred_text, vqa_acc = "", 0.0
                     print("[ERROR] qid={}: {}".format(row.get("questionId", "?"), e))
@@ -607,6 +611,7 @@ def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual
                 }) + "\n")
         print("Saved: " + out_baseline)
         baseline_results = load_results(out_baseline)
+
     if mode in ("tree", "both"):
         print("\nRunning DocVQA TREE on {} samples ...".format(len(df)))
         select_ratios = []
@@ -615,14 +620,14 @@ def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual
                 try:
                     img      = load_image_from_row(row["image"])
                     question = str(row["question"]) + "\nAnswer the question using a single word or phrase."
-                    pred_text, num_sel, sel_ratio = _tree_inference(
+                    pred_text, num_sel, sel_ratio, tot = _tree_inference(
                         model, processor, img, question, dual=dual)
                     answers  = list(row["answers"])
                     vqa_acc  = _docvqa_accuracy(pred_text, answers)
                     select_ratios.append(sel_ratio)
                 except Exception as e:
                     pred_text, vqa_acc = "", 0.0
-                    num_sel, sel_ratio = 0, 0.0
+                    num_sel, sel_ratio, tot = 0, 0.0, BASELINE_TOKENS
                     print("[ERROR] qid={}: {}".format(row.get("questionId", "?"), e))
                 fout.write(json.dumps({
                     "question_id"    : str(row["questionId"]),
@@ -630,12 +635,13 @@ def run_docvqa(model, processor, mode, max_samples, out_baseline, out_tree, dual
                     "answers"        : list(row["answers"]),
                     "vqa_acc"        : vqa_acc,
                     "num_selected"   : num_sel,
-                    "num_total"      : BASELINE_TOKENS,
+                    "num_total"      : tot,
                     "select_ratio"   : sel_ratio,
                 }) + "\n")
-        print_select_ratio_stats(select_ratios)
+        print_select_ratio_stats(select_ratios, BASELINE_TOKENS)
         print("Saved: " + out_tree)
         tree_results = load_results(out_tree)
+
     return baseline_results, tree_results
 
 
@@ -653,30 +659,30 @@ def main():
                         help="hrbench: 4k/8k  |  pope: adversarial/popular/random")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--dual",    action="store_true", default=False,
-                        help="Tree mode: use dual-image inference (original + compact). "
-                             "Default: compact image only.")
+                        help="Tree mode: dual-image (original anyres + compact anyres). "
+                             "Default: local-only (compact image only).")
     args = parser.parse_args()
 
     if args.dataset == "vstar":
-        out_baseline = os.path.join(VSTAR_DIR,   "results_baseline.jsonl")
-        out_tree     = os.path.join(VSTAR_DIR,   "results_tree.jsonl")
+        out_baseline = os.path.join(VSTAR_DIR,   "results_ov_baseline.jsonl")
+        out_tree     = os.path.join(VSTAR_DIR,   "results_ov_tree.jsonl")
         print_fn     = print_vstar_results
     elif args.dataset == "hrbench":
-        out_baseline = os.path.join(HRBENCH_DIR, "results_{}_baseline.jsonl".format(args.split))
-        out_tree     = os.path.join(HRBENCH_DIR, "results_{}_tree.jsonl".format(args.split))
+        out_baseline = os.path.join(HRBENCH_DIR, "results_ov_{}_baseline.jsonl".format(args.split))
+        out_tree     = os.path.join(HRBENCH_DIR, "results_ov_{}_tree.jsonl".format(args.split))
         print_fn     = print_hrbench_results
     elif args.dataset == "pope":
-        out_baseline = os.path.join(POPE_DIR,    "results_{}_baseline.jsonl".format(args.split))
-        out_tree     = os.path.join(POPE_DIR,    "results_{}_tree.jsonl".format(args.split))
+        out_baseline = os.path.join(POPE_DIR,    "results_ov_{}_baseline.jsonl".format(args.split))
+        out_tree     = os.path.join(POPE_DIR,    "results_ov_{}_tree.jsonl".format(args.split))
         print_fn     = print_pope_results
     elif args.dataset == "textvqa":
-        out_baseline = os.path.join(TEXTVQA_DIR, "results_baseline.jsonl")
-        out_tree     = os.path.join(TEXTVQA_DIR, "results_tree.jsonl")
+        out_baseline = os.path.join(TEXTVQA_DIR, "results_ov_baseline.jsonl")
+        out_tree     = os.path.join(TEXTVQA_DIR, "results_ov_tree.jsonl")
         print_fn     = print_textvqa_results
     else:  # docvqa
-        out_baseline = os.path.join(DOCVQA_DIR,  "results_baseline.jsonl")
-        out_tree     = os.path.join(DOCVQA_DIR,  "results_tree.jsonl")
-        print_fn     = print_textvqa_results   # same VQA accuracy metric
+        out_baseline = os.path.join(DOCVQA_DIR,  "results_ov_baseline.jsonl")
+        out_tree     = os.path.join(DOCVQA_DIR,  "results_ov_tree.jsonl")
+        print_fn     = print_textvqa_results
 
     if args.mode == "report":
         for path, name in [(out_baseline, "Baseline"), (out_tree, "Tree")]:
@@ -687,17 +693,30 @@ def main():
         return
 
     import torch
-    from transformers import LlavaForConditionalGeneration, AutoProcessor
+    from transformers import LlavaOnevisionForConditionalGeneration, AutoProcessor
 
     print("Loading model: " + MODEL_ID)
-    print("Tree mode: {}".format("dual-image (original + compact)" if args.dual else "single-image (compact only)"))
+    print("Tree mode: {}".format(
+        "dual-image (original anyres + compact anyres)" if args.dual
+        else "local-only (compact image anyres)"))
+
     processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = LlavaForConditionalGeneration.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float16,
-        device_map="auto", attn_implementation="eager",
+    model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        attn_implementation="eager",
+        ignore_mismatched_sizes=True,
     )
     model.eval()
     print("Model ready. Device: {}".format(next(model.parameters()).device))
+
+    from onevision_with_tree import get_score_size, _get_patch_size, pad_resize_with_meta, run_lpd_on_original, run_tree_inference, compute_patch_scores, select_patches, run_baseline_inference
+    score_size = get_score_size(processor)
+    patch_size = _get_patch_size(model)
+    grid_size  = score_size // patch_size
+    print("Score grid: {}x{}={} tokens  (score_size={}, patch_size={})".format(
+        grid_size, grid_size, grid_size * grid_size, score_size, patch_size))
 
     if args.dataset == "vstar":
         baseline_results, tree_results = run_vstar(
@@ -705,12 +724,12 @@ def main():
             dual=args.dual)
     elif args.dataset == "hrbench":
         baseline_results, tree_results = run_hrbench(
-            model, processor, args.split, args.mode, args.max_samples, out_baseline, out_tree,
-            dual=args.dual)
+            model, processor, args.split, args.mode, args.max_samples,
+            out_baseline, out_tree, dual=args.dual)
     elif args.dataset == "pope":
         baseline_results, tree_results = run_pope(
-            model, processor, args.split, args.mode, args.max_samples, out_baseline, out_tree,
-            dual=args.dual)
+            model, processor, args.split, args.mode, args.max_samples,
+            out_baseline, out_tree, dual=args.dual)
     elif args.dataset == "textvqa":
         baseline_results, tree_results = run_textvqa(
             model, processor, args.mode, args.max_samples, out_baseline, out_tree,
