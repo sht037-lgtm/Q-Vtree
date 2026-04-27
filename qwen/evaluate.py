@@ -8,27 +8,22 @@ import torch
 
 from PIL import Image
 from tqdm import tqdm
-from qwen_vl_utils import process_vision_info
-from .model import run_tree_inference
 
 
 # =========================================================
-# -------------------- Common Utils -----------------------
+# Common Utils
 # =========================================================
+
 def extract_option_letter(text: str) -> str:
     if text is None:
         return ""
-
     text = text.strip().upper()
-
     m = re.search(r"\b([A-D])\b", text)
     if m:
         return m.group(1)
-
     m = re.search(r"^\(?([A-D])\)?[.:)]?", text)
     if m:
         return m.group(1)
-
     return ""
 
 
@@ -37,28 +32,10 @@ def decode_base64_image(img_str: str) -> Image.Image:
     return Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
 
-def evaluate_mcq_predictions(pred_file: str) -> float:
-    total = 0
-    correct = 0
-
-    with open(pred_file, "r", encoding="utf-8") as f:
-        for line in f:
-            item = json.loads(line)
-            pred = str(item["prediction_option"]).strip().upper()
-            label = str(item["label"]).strip().upper()
-
-            total += 1
-            if pred == label:
-                correct += 1
-
-    acc = correct / total if total > 0 else 0.0
-    print(f"Accuracy: {acc:.4f} ({correct}/{total})")
-    return acc
-
-
 # =========================================================
-# ---------------------- V-Star ---------------------------
+# V-Star
 # =========================================================
+
 def run_vstar_inference(
     model,
     processor,
@@ -67,110 +44,110 @@ def run_vstar_inference(
     output_file: str | None = None,
     max_samples: int | None = None,
     max_new_tokens: int = 16,
-    model_type: str = "base_qwen",   # "base_qwen" or "tree_qwen"
+    model_type: str = "base_qwen",   # "base_qwen" | "tree_qwen"
     run_name: str | None = None,
+    warmup: int = 5,
+    resume: bool = False,
 ):
-    print("[DEBUG] model class =", model.__class__.__name__)
-
     if model_type not in ["base_qwen", "tree_qwen"]:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
     anno_path = os.path.join(dataset_dir, anno_file)
-
     if output_file is None:
         tag = run_name if run_name is not None else model_type
         output_file = f"vstar_predictions_{tag}.jsonl"
-
     output_path = os.path.join(dataset_dir, output_file)
 
     with open(anno_path, "r", encoding="utf-8") as f:
         samples = [json.loads(line) for line in f]
-
     if max_samples is not None:
         samples = samples[:max_samples]
 
-    device = next(model.parameters()).device
+    completed_ids = set()
+    if resume and os.path.exists(output_path):
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    completed_ids.add(json.loads(line)["question_id"])
+                except Exception:
+                    pass
+        print(f"[INFO] Resuming: {len(completed_ids)} samples already done, skipping.")
 
-    all_select_ratios = []
-    all_num_selected = []
-    all_num_total = []
+    all_select_ratios, all_num_selected, all_num_total = [], [], []
     category_select_ratios = {}
+    total_gpu_times, total_peak_memories = [], []
 
-    with open(output_path, "w", encoding="utf-8") as fout:
-        for sample in tqdm(samples, desc=f"Running V-Star inference [{model_type}]"):
+    with open(output_path, "a" if completed_ids else "w", encoding="utf-8") as fout:
+        for i, sample in enumerate(tqdm(samples, desc=f"Running V-Star [{model_type}]", miniters=10)):
+            if sample["question_id"] in completed_ids:
+                continue
+
             img_path = os.path.join(dataset_dir, sample["image"])
             question = sample["text"]
-
-            sample_num_selected = None
-            sample_num_total = None
-            sample_select_ratio = None
+            sample_num_selected = sample_num_total = sample_select_ratio = None
 
             try:
                 image = Image.open(img_path).convert("RGB")
 
                 if model_type == "tree_qwen":
-                    pred_text, _, _, _, sample_num_selected, sample_num_total, sample_select_ratio = \
-                        run_tree_inference(model, processor, image, question,
-                                          max_new_tokens=max_new_tokens)
-
-                    all_num_selected.append(sample_num_selected)
-                    all_num_total.append(sample_num_total)
-                    all_select_ratios.append(sample_select_ratio)
-
-                    cat = sample["category"]
-                    if cat not in category_select_ratios:
-                        category_select_ratios[cat] = []
-                    category_select_ratios[cat].append(sample_select_ratio)
+                    model._debug_tree_gpu_time = None
+                    model._debug_tree_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question,
+                        use_tree=True, max_new_tokens=max_new_tokens,
+                    )
+                    if i >= warmup and getattr(model, "_debug_tree_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_tree_gpu_time)
+                        total_peak_memories.append(model._debug_tree_peak_memory)
+                    if getattr(model, "_debug_num_selected_tokens", None):
+                        sample_num_selected = sum(model._debug_num_selected_tokens)
+                        sample_num_total    = sum(model._debug_num_total_tokens)
+                        sample_select_ratio = (
+                            sample_num_selected / sample_num_total if sample_num_total > 0 else 0.0
+                        )
+                        all_num_selected.append(sample_num_selected)
+                        all_num_total.append(sample_num_total)
+                        all_select_ratios.append(sample_select_ratio)
+                        category_select_ratios.setdefault(sample["category"], []).append(sample_select_ratio)
 
                 else:  # base_qwen
-                    messages = [{"role": "user", "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": question},
-                    ]}]
-                    text = processor.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True,
+                    model._debug_baseline_gpu_time = None
+                    model._debug_baseline_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question,
+                        use_tree=False, max_new_tokens=max_new_tokens,
                     )
-                    image_inputs, video_inputs = process_vision_info(messages)
-                    inputs = processor(
-                        text=[text], images=image_inputs, videos=video_inputs,
-                        padding=True, return_tensors="pt",
-                    )
-                    inputs = {k: (v.to(device) if torch.is_tensor(v) else v)
-                              for k, v in inputs.items()}
-                    with torch.inference_mode():
-                        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
-                    pred_text = processor.batch_decode(
-                        outputs[:, inputs["input_ids"].shape[1]:],
-                        skip_special_tokens=True,
-                    )[0].strip()
+                    if i >= warmup and getattr(model, "_debug_baseline_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_baseline_gpu_time)
+                        total_peak_memories.append(model._debug_baseline_peak_memory)
 
                 pred_option = extract_option_letter(pred_text)
 
             except Exception as e:
-                pred_text = ""
-                pred_option = ""
-                sample_num_selected = None
-                sample_num_total = None
-                sample_select_ratio = None
+                pred_text = pred_option = ""
                 print(f"[ERROR][{model_type}] question_id={sample.get('question_id')}: {e}")
 
             result = {
                 "question_id": sample["question_id"],
-                "image": sample["image"],
-                "category": sample["category"],
-                "question": sample["text"],
-                "label": sample["label"],
-                "prediction_text": pred_text,
+                "image":       sample["image"],
+                "category":    sample["category"],
+                "question":    sample["text"],
+                "label":       sample["label"],
+                "prediction_text":   pred_text,
                 "prediction_option": pred_option,
-                "model_type": model_type,
-                "run_name": run_name if run_name is not None else model_type,
+                "model_type":  model_type,
+                "run_name":    run_name if run_name is not None else model_type,
                 "num_selected_tokens": sample_num_selected,
-                "num_total_tokens": sample_num_total,
-                "select_ratio": sample_select_ratio,
+                "num_total_tokens":    sample_num_total,
+                "select_ratio":        sample_select_ratio,
             }
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+            fout.flush()
 
-    if len(all_select_ratios) > 0:
+    if total_gpu_times:
+        print(f"[TIME]   mean GPU time    = {sum(total_gpu_times)/len(total_gpu_times):.3f}s  (n={len(total_gpu_times)})")
+        print(f"[MEMORY] mean peak memory = {sum(total_peak_memories)/len(total_peak_memories):.2f}GB")
+    if all_select_ratios:
         print(f"[STATS] mean selected tokens = {sum(all_num_selected)/len(all_num_selected):.2f}")
         print(f"[STATS] mean total tokens    = {sum(all_num_total)/len(all_num_total):.2f}")
         print(f"[STATS] mean select ratio    = {sum(all_select_ratios)/len(all_select_ratios):.4f}")
@@ -185,24 +162,20 @@ def run_vstar_inference(
 def evaluate_vstar_predictions(pred_file: str) -> float:
     total, correct = 0, 0
     category_stats = {}
-
     with open(pred_file, "r", encoding="utf-8") as f:
         for line in f:
-            item = json.loads(line)
+            item  = json.loads(line)
             pred  = str(item["prediction_option"]).strip().upper()
             label = str(item["label"]).strip().upper()
             cat   = item.get("category", "unknown")
-
             total += 1
             if pred == label:
                 correct += 1
-
             if cat not in category_stats:
                 category_stats[cat] = {"total": 0, "correct": 0}
             category_stats[cat]["total"] += 1
             if pred == label:
                 category_stats[cat]["correct"] += 1
-
     acc = correct / total if total > 0 else 0.0
     print(f"Accuracy: {acc:.4f} ({correct}/{total})")
     for cat, s in sorted(category_stats.items()):
@@ -212,8 +185,9 @@ def evaluate_vstar_predictions(pred_file: str) -> float:
 
 
 # =========================================================
-# --------------------- HR-Bench --------------------------
+# HR-Bench
 # =========================================================
+
 def run_hrbench_inference(
     model,
     processor,
@@ -224,41 +198,46 @@ def run_hrbench_inference(
     max_new_tokens: int = 16,
     model_type: str = "base_qwen",
     run_name: str | None = None,
+    warmup: int = 5,
+    resume: bool = False,
 ):
-    print("[DEBUG] model class =", model.__class__.__name__)
-
     if split not in ["4k", "8k"]:
-        raise ValueError("split must be either '4k' or '8k'")
-
+        raise ValueError("split must be '4k' or '8k'")
     if model_type not in ["base_qwen", "tree_qwen"]:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
     tsv_path = os.path.join(dataset_dir, f"hr_bench_{split}.tsv")
-
     if output_file is None:
         tag = run_name if run_name is not None else model_type
         output_file = f"hr_bench_{split}_predictions_{tag}.jsonl"
-
     output_path = os.path.join(dataset_dir, output_file)
 
     df = pd.read_csv(tsv_path, sep="\t")
     if max_samples is not None:
         df = df.iloc[:max_samples]
 
-    device = next(model.parameters()).device
+    completed_indices = set()
+    if resume and os.path.exists(output_path):
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    completed_indices.add(json.loads(line)["index"])
+                except Exception:
+                    pass
+        print(f"[INFO] Resuming: {len(completed_indices)} samples already done, skipping.")
 
-    all_select_ratios = []
-    all_num_selected = []
-    all_num_total = []
-    category_select_ratios = {}
-    cycle_category_select_ratios = {}
+    all_select_ratios, all_num_selected, all_num_total = [], [], []
+    category_select_ratios, cycle_category_select_ratios = {}, {}
+    total_gpu_times, total_peak_memories = [], []
 
-    with open(output_path, "w", encoding="utf-8") as fout:
-        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Running HR-Bench {split} [{model_type}]"):
-            sample_num_selected = None
-            sample_num_total = None
-            sample_select_ratio = None
+    with open(output_path, "a" if completed_indices else "w", encoding="utf-8") as fout:
+        for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df),
+                                          desc=f"Running HR-Bench {split} [{model_type}]",
+                                          miniters=10)):
+            if int(row["index"]) in completed_indices:
+                continue
 
+            sample_num_selected = sample_num_total = sample_select_ratio = None
             try:
                 image = decode_base64_image(row["image"])
                 question_text = (
@@ -271,78 +250,67 @@ def run_hrbench_inference(
                 )
 
                 if model_type == "tree_qwen":
-                    pred_text, _, _, _, sample_num_selected, sample_num_total, sample_select_ratio = \
-                        run_tree_inference(model, processor, image, question_text,
-                                          max_new_tokens=max_new_tokens)
-
-                    all_num_selected.append(sample_num_selected)
-                    all_num_total.append(sample_num_total)
-                    all_select_ratios.append(sample_select_ratio)
-
-                    cat = row["category"]
-                    if cat not in category_select_ratios:
-                        category_select_ratios[cat] = []
-                    category_select_ratios[cat].append(sample_select_ratio)
-
-                    cyc = row["cycle_category"]
-                    if cyc not in cycle_category_select_ratios:
-                        cycle_category_select_ratios[cyc] = []
-                    cycle_category_select_ratios[cyc].append(sample_select_ratio)
+                    model._debug_tree_gpu_time = None
+                    model._debug_tree_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question_text,
+                        use_tree=True, max_new_tokens=max_new_tokens,
+                    )
+                    if i >= warmup and getattr(model, "_debug_tree_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_tree_gpu_time)
+                        total_peak_memories.append(model._debug_tree_peak_memory)
+                    if getattr(model, "_debug_num_selected_tokens", None):
+                        sample_num_selected = sum(model._debug_num_selected_tokens)
+                        sample_num_total    = sum(model._debug_num_total_tokens)
+                        sample_select_ratio = (
+                            sample_num_selected / sample_num_total if sample_num_total > 0 else 0.0
+                        )
+                        all_num_selected.append(sample_num_selected)
+                        all_num_total.append(sample_num_total)
+                        all_select_ratios.append(sample_select_ratio)
+                        category_select_ratios.setdefault(row["category"], []).append(sample_select_ratio)
+                        cycle_category_select_ratios.setdefault(row["cycle_category"], []).append(sample_select_ratio)
 
                 else:  # base_qwen
-                    messages = [{"role": "user", "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": question_text},
-                    ]}]
-                    text = processor.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True,
+                    model._debug_baseline_gpu_time = None
+                    model._debug_baseline_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question_text,
+                        use_tree=False, max_new_tokens=max_new_tokens,
                     )
-                    image_inputs, video_inputs = process_vision_info(messages)
-                    inputs = processor(
-                        text=[text], images=image_inputs, videos=video_inputs,
-                        padding=True, return_tensors="pt",
-                    )
-                    inputs = {k: (v.to(device) if torch.is_tensor(v) else v)
-                              for k, v in inputs.items()}
-                    with torch.inference_mode():
-                        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
-                    pred_text = processor.batch_decode(
-                        outputs[:, inputs["input_ids"].shape[1]:],
-                        skip_special_tokens=True,
-                    )[0].strip()
+                    if i >= warmup and getattr(model, "_debug_baseline_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_baseline_gpu_time)
+                        total_peak_memories.append(model._debug_baseline_peak_memory)
 
                 pred_option = extract_option_letter(pred_text)
 
             except Exception as e:
-                pred_text = ""
-                pred_option = ""
-                sample_num_selected = None
-                sample_num_total = None
-                sample_select_ratio = None
+                pred_text = pred_option = ""
                 print(f"[ERROR][{model_type}] index={row.get('index', 'unknown')}: {e}")
 
             result = {
-                "index": int(row["index"]),
-                "split": split,
+                "index":    int(row["index"]),
+                "split":    split,
                 "question": row["question"],
-                "A": row["A"],
-                "B": row["B"],
-                "C": row["C"],
-                "D": row["D"],
-                "category": row["category"],
+                "A": row["A"], "B": row["B"], "C": row["C"], "D": row["D"],
+                "category":       row["category"],
                 "cycle_category": row["cycle_category"],
-                "label": row["answer"],
-                "prediction_text": pred_text,
+                "label":          row["answer"],
+                "prediction_text":   pred_text,
                 "prediction_option": pred_option,
                 "model_type": model_type,
-                "run_name": run_name if run_name is not None else model_type,
+                "run_name":   run_name if run_name is not None else model_type,
                 "num_selected_tokens": sample_num_selected,
-                "num_total_tokens": sample_num_total,
-                "select_ratio": sample_select_ratio,
+                "num_total_tokens":    sample_num_total,
+                "select_ratio":        sample_select_ratio,
             }
             fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+            fout.flush()
 
-    if len(all_select_ratios) > 0:
+    if total_gpu_times:
+        print(f"[TIME]   mean GPU time    = {sum(total_gpu_times)/len(total_gpu_times):.3f}s  (n={len(total_gpu_times)})")
+        print(f"[MEMORY] mean peak memory = {sum(total_peak_memories)/len(total_peak_memories):.2f}GB")
+    if all_select_ratios:
         print(f"[STATS] mean selected tokens = {sum(all_num_selected)/len(all_num_selected):.2f}")
         print(f"[STATS] mean total tokens    = {sum(all_num_total)/len(all_num_total):.2f}")
         print(f"[STATS] mean select ratio    = {sum(all_select_ratios)/len(all_select_ratios):.4f}")
@@ -358,4 +326,368 @@ def run_hrbench_inference(
 
 
 def evaluate_hrbench_predictions(pred_file: str) -> float:
-    return evaluate_mcq_predictions(pred_file)
+    total, correct = 0, 0
+    with open(pred_file, "r", encoding="utf-8") as f:
+        for line in f:
+            item  = json.loads(line)
+            pred  = str(item["prediction_option"]).strip().upper()
+            label = str(item["label"]).strip().upper()
+            total += 1
+            if pred == label:
+                correct += 1
+    acc = correct / total if total > 0 else 0.0
+    print(f"Accuracy: {acc:.4f} ({correct}/{total})")
+    return acc
+
+
+# =========================================================
+# MMBench
+# =========================================================
+
+def run_mmbench_inference(
+    model,
+    processor,
+    dataset_dir: str = "datasets/mmbench",
+    output_file: str | None = None,
+    max_samples: int | None = None,
+    max_new_tokens: int = 16,
+    model_type: str = "base_qwen",
+    run_name: str | None = None,
+    warmup: int = 5,
+    resume: bool = True,
+):
+    import glob
+    import pyarrow.parquet as pq
+
+    if model_type not in ["base_qwen", "tree_qwen"]:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    parquet_files = glob.glob(os.path.join(dataset_dir, "**", "*.parquet"), recursive=True)
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {dataset_dir}")
+
+    table = pq.read_table(parquet_files[0])
+    df = table.to_pandas()
+    if max_samples is not None:
+        df = df.iloc[:max_samples]
+
+    if output_file is None:
+        tag = run_name if run_name is not None else model_type
+        output_file = f"mmbench_predictions_{tag}.jsonl"
+    output_path = os.path.join(dataset_dir, output_file)
+
+    completed_indices = set()
+    if resume and os.path.exists(output_path):
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    completed_indices.add(json.loads(line)["index"])
+                except Exception:
+                    pass
+        print(f"[INFO] Resuming: {len(completed_indices)} samples already done, skipping.")
+
+    IDX2LETTER = {0: "A", 1: "B", 2: "C", 3: "D"}
+    all_select_ratios, all_num_selected, all_num_total = [], [], []
+    total_gpu_times, total_peak_memories = [], []
+
+    with open(output_path, "a" if completed_indices else "w", encoding="utf-8") as fout:
+        for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df),
+                                          desc=f"Running MMBench [{model_type}]", miniters=10)):
+            if i in completed_indices:
+                continue
+
+            sample_num_selected = sample_num_total = sample_select_ratio = None
+            try:
+                img_bytes = row["image"]["bytes"] if isinstance(row["image"], dict) else row["image"]
+                image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+                options_str = f"(A) {row['A']}\n(B) {row['B']}"
+                if row.get("C") and str(row["C"]) != "None":
+                    options_str += f"\n(C) {row['C']}"
+                if row.get("D") and str(row["D"]) != "None":
+                    options_str += f"\n(D) {row['D']}"
+                hint_str = (
+                    f"Hint: {row['hint']}\n"
+                    if row.get("hint") and str(row["hint"]) != "None" else ""
+                )
+                question_text = (
+                    f"{hint_str}{row['question']}\n"
+                    f"{options_str}\n"
+                    f"Answer with the option's letter from the given choices directly."
+                )
+
+                if model_type == "tree_qwen":
+                    model._debug_tree_gpu_time = None
+                    model._debug_tree_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question_text,
+                        use_tree=True, max_new_tokens=max_new_tokens,
+                    )
+                    if i >= warmup and getattr(model, "_debug_tree_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_tree_gpu_time)
+                        total_peak_memories.append(model._debug_tree_peak_memory)
+                    if getattr(model, "_debug_num_selected_tokens", None):
+                        sample_num_selected = sum(model._debug_num_selected_tokens)
+                        sample_num_total    = sum(model._debug_num_total_tokens)
+                        sample_select_ratio = (
+                            sample_num_selected / sample_num_total if sample_num_total > 0 else 0.0
+                        )
+                        all_num_selected.append(sample_num_selected)
+                        all_num_total.append(sample_num_total)
+                        all_select_ratios.append(sample_select_ratio)
+
+                else:  # base_qwen
+                    model._debug_baseline_gpu_time = None
+                    model._debug_baseline_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question_text,
+                        use_tree=False, max_new_tokens=max_new_tokens,
+                    )
+                    if i >= warmup and getattr(model, "_debug_baseline_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_baseline_gpu_time)
+                        total_peak_memories.append(model._debug_baseline_peak_memory)
+
+                pred_option = extract_option_letter(pred_text)
+
+            except Exception as e:
+                pred_text = pred_option = ""
+                print(f"[ERROR][{model_type}] index={i}: {e}")
+
+            label_letter = IDX2LETTER.get(int(row["label"]), "A")
+            result = {
+                "index":    i,
+                "question": row["question"],
+                "A": row["A"], "B": row["B"],
+                "C": row.get("C"), "D": row.get("D"),
+                "label":             label_letter,
+                "prediction_text":   pred_text,
+                "prediction_option": pred_option,
+                "model_type": model_type,
+                "run_name":   run_name if run_name is not None else model_type,
+                "num_selected_tokens": sample_num_selected,
+                "num_total_tokens":    sample_num_total,
+                "select_ratio":        sample_select_ratio,
+            }
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+            fout.flush()
+
+    if total_gpu_times:
+        print(f"[TIME]   mean GPU time    = {sum(total_gpu_times)/len(total_gpu_times):.3f}s  (n={len(total_gpu_times)})")
+        print(f"[MEMORY] mean peak memory = {sum(total_peak_memories)/len(total_peak_memories):.2f}GB")
+    if all_select_ratios:
+        print(f"[STATS] mean selected = {sum(all_num_selected)/len(all_num_selected):.2f}, "
+              f"total = {sum(all_num_total)/len(all_num_total):.2f}, "
+              f"ratio = {sum(all_select_ratios)/len(all_select_ratios):.4f}")
+
+    print(f"[INFO] Saved predictions to: {output_path}")
+    return output_path
+
+
+def evaluate_mmbench_predictions(pred_file: str) -> dict:
+    records = []
+    with open(pred_file, "r", encoding="utf-8") as f:
+        for line in f:
+            records.append(json.loads(line))
+    df = pd.DataFrame(records)
+    df["correct"] = df.apply(
+        lambda r: str(r["prediction_option"]).strip().upper() == str(r["label"]).strip().upper(),
+        axis=1,
+    )
+    total   = len(df)
+    correct = df["correct"].sum()
+    acc     = correct / total if total > 0 else 0.0
+    print(f"\nMMBench Overall Accuracy: {acc:.4f} ({correct}/{total})")
+    results = {"overall": acc}
+    for cat_col in ["category", "l2-category"]:
+        if cat_col not in df.columns:
+            continue
+        print(f"\n── by {cat_col} ──")
+        cat_stats = (
+            df.groupby(cat_col)["correct"]
+            .agg(total="count", correct="sum")
+            .assign(acc=lambda x: x["correct"] / x["total"])
+            .sort_values("acc", ascending=False)
+        )
+        for cat, row in cat_stats.iterrows():
+            print(f"  {cat:<40s}  {row['acc']:.4f}  ({int(row['correct'])}/{int(row['total'])})")
+        results[cat_col] = cat_stats["acc"].to_dict()
+    return results
+
+
+# =========================================================
+# MME-RealWorld
+# =========================================================
+
+def run_mme_realworld_inference(
+    model,
+    processor,
+    dataset_dir: str = "datasets/mme_realworld",
+    output_file: str | None = None,
+    max_samples: int | None = None,
+    max_new_tokens: int = 16,
+    model_type: str = "base_qwen",
+    run_name: str | None = None,
+    warmup: int = 5,
+    resume: bool = True,
+):
+    import glob
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if model_type not in ["base_qwen", "tree_qwen"]:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    parquet_files = sorted(glob.glob(os.path.join(dataset_dir, "**", "*.parquet"), recursive=True))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {dataset_dir}")
+
+    table = pa.concat_tables([pq.read_table(f) for f in parquet_files])
+    df = table.to_pandas()
+    if max_samples is not None:
+        df = df.iloc[:max_samples]
+
+    if output_file is None:
+        tag = run_name if run_name is not None else model_type
+        output_file = f"mme_realworld_predictions_{tag}.jsonl"
+    output_path = os.path.join(dataset_dir, output_file)
+
+    completed_indices = set()
+    if resume and os.path.exists(output_path):
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    completed_indices.add(json.loads(line)["index"])
+                except Exception:
+                    pass
+        print(f"[INFO] Resuming: {len(completed_indices)} samples already done, skipping.")
+
+    all_select_ratios, all_num_selected, all_num_total = [], [], []
+    total_gpu_times, total_peak_memories = [], []
+
+    with open(output_path, "a" if completed_indices else "w", encoding="utf-8") as fout:
+        for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df),
+                                          desc=f"Running MME-RealWorld [{model_type}]", miniters=10)):
+            if i in completed_indices:
+                continue
+
+            sample_num_selected = sample_num_total = sample_select_ratio = None
+            try:
+                img_data = row["image"]
+                if isinstance(img_data, dict):
+                    image = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
+                else:
+                    image = decode_base64_image(str(img_data))
+
+                options = row["options"]
+                options_str = (
+                    "\n".join(options)
+                    if hasattr(options, "__iter__") and not isinstance(options, str)
+                    else str(options)
+                )
+                question_text = (
+                    f"{row['question']}\n"
+                    f"{options_str}\n"
+                    f"Answer with the option's letter from the given choices directly."
+                )
+
+                if model_type == "tree_qwen":
+                    model._debug_tree_gpu_time = None
+                    model._debug_tree_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question_text,
+                        use_tree=True, max_new_tokens=max_new_tokens,
+                    )
+                    if i >= warmup and getattr(model, "_debug_tree_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_tree_gpu_time)
+                        total_peak_memories.append(model._debug_tree_peak_memory)
+                    if getattr(model, "_debug_num_selected_tokens", None):
+                        sample_num_selected = sum(model._debug_num_selected_tokens)
+                        sample_num_total    = sum(model._debug_num_total_tokens)
+                        sample_select_ratio = (
+                            sample_num_selected / sample_num_total if sample_num_total > 0 else 0.0
+                        )
+                        all_num_selected.append(sample_num_selected)
+                        all_num_total.append(sample_num_total)
+                        all_select_ratios.append(sample_select_ratio)
+
+                else:  # base_qwen
+                    model._debug_baseline_gpu_time = None
+                    model._debug_baseline_peak_memory = None
+                    pred_text = model.infer(
+                        processor, image, question_text,
+                        use_tree=False, max_new_tokens=max_new_tokens,
+                    )
+                    if i >= warmup and getattr(model, "_debug_baseline_gpu_time", None) is not None:
+                        total_gpu_times.append(model._debug_baseline_gpu_time)
+                        total_peak_memories.append(model._debug_baseline_peak_memory)
+
+                pred_option = extract_option_letter(pred_text)
+
+            except Exception as e:
+                pred_text = pred_option = ""
+                print(f"[ERROR][{model_type}] index={i}: {e}")
+
+            result = {
+                "index":    i,
+                "question": row.get("question", ""),
+                "options":  (list(row["options"])
+                             if hasattr(row.get("options", []), "__iter__")
+                             else row.get("options", [])),
+                "label":         str(row.get("answer", row.get("label", ""))).strip().upper(),
+                "category":      str(row.get("category", row.get("task_category", "unknown"))),
+                "question_type": str(row.get("question_type", row.get("sub_category", ""))),
+                "prediction_text":   pred_text,
+                "prediction_option": pred_option,
+                "model_type": model_type,
+                "run_name":   run_name if run_name is not None else model_type,
+                "num_selected_tokens": sample_num_selected,
+                "num_total_tokens":    sample_num_total,
+                "select_ratio":        sample_select_ratio,
+            }
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+            fout.flush()
+
+    if total_gpu_times:
+        print(f"[TIME]   mean GPU time    = {sum(total_gpu_times)/len(total_gpu_times):.3f}s  (n={len(total_gpu_times)})")
+        print(f"[MEMORY] mean peak memory = {sum(total_peak_memories)/len(total_peak_memories):.2f}GB")
+    if all_select_ratios:
+        print(f"[STATS] mean selected = {sum(all_num_selected)/len(all_num_selected):.2f}, "
+              f"total = {sum(all_num_total)/len(all_num_total):.2f}, "
+              f"ratio = {sum(all_select_ratios)/len(all_select_ratios):.4f}")
+
+    print(f"[INFO] Saved predictions to: {output_path}")
+    return output_path
+
+
+def evaluate_mme_realworld_predictions(pred_file: str) -> dict:
+    records = []
+    with open(pred_file, "r", encoding="utf-8") as f:
+        for line in f:
+            records.append(json.loads(line))
+    df = pd.DataFrame(records)
+    df["correct"] = df.apply(
+        lambda r: str(r["prediction_option"]).strip().upper() == str(r["label"]).strip().upper(),
+        axis=1,
+    )
+    total   = len(df)
+    correct = df["correct"].sum()
+    acc     = correct / total if total > 0 else 0.0
+    print(f"\nMME-RealWorld Overall Accuracy: {acc:.4f} ({correct}/{total})")
+    results = {"overall": acc}
+    for cat_col in ["category", "question_type"]:
+        if cat_col not in df.columns or df[cat_col].isna().all():
+            continue
+        valid = df[df[cat_col].notna() & (df[cat_col] != "")]
+        if valid.empty:
+            continue
+        print(f"\n── by {cat_col} ──")
+        cat_stats = (
+            valid.groupby(cat_col)["correct"]
+            .agg(total="count", correct="sum")
+            .assign(acc=lambda x: x["correct"] / x["total"])
+            .sort_values("acc", ascending=False)
+        )
+        for cat, row in cat_stats.iterrows():
+            print(f"  {cat:<45s}  {row['acc']:.4f}  ({int(row['correct'])}/{int(row['total'])})")
+        results[cat_col] = cat_stats["acc"].to_dict()
+    return results
