@@ -1,7 +1,7 @@
 """
 onevision_with_tree.py
 Q-VTree core logic for LLaVA-OneVision-Qwen2-7B.
-All prompts use apply_chat_template (no legacy USER:<image> format).
+Official HuggingFace usage: processor(images=..., text=...).to("cuda:0", float16)
 """
 from __future__ import annotations
 import os, re, sys
@@ -139,9 +139,9 @@ def load_model(model_id, device="auto"):
     from transformers import LlavaOnevisionForConditionalGeneration, AutoProcessor
     processor = AutoProcessor.from_pretrained(model_id)
     model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype=torch.float16, device_map=device,
-        attn_implementation="eager", ignore_mismatched_sizes=True,
-    )
+        model_id, torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    ).to("cuda:0")
     model.eval()
     return model, processor
 
@@ -159,19 +159,26 @@ def _extract_attn_scores(outputs, text_pos, image_pos, layers):
     return torch.stack(scores).mean(0)
 
 
-def _make_score_inputs(processor, image, text, device, score_size):
-    """Build inputs for scoring pass using apply_chat_template, no tiling."""
+def _make_score_inputs(processor, image, text, score_size):
+    """Build inputs for scoring pass — single tile only.
+    Force exact score_size x score_size so processor picks exactly 1 tile.
+    """
+    # Force exact square so no tiling occurs
+    canvas = Image.new("RGB", (score_size, score_size), (0, 0, 0))
+    img = image.copy().convert("RGB")
+    img.thumbnail((score_size, score_size), Image.BILINEAR)
+    canvas.paste(img, ((score_size - img.width) // 2, (score_size - img.height) // 2))
+
     conversation = [{"role": "user", "content": [
         {"type": "image"},
         {"type": "text", "text": text},
     ]}]
-    prompt = processor.tokenizer.apply_chat_template(conversation, add_generation_prompt=True)
+    prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
     inputs = processor(
+        images=canvas,
         text=prompt,
-        images=[image],
         return_tensors="pt",
-        do_image_splitting=False,
-    ).to(device)
+    ).to("cuda:0", torch.float16)
     return inputs
 
 
@@ -180,7 +187,6 @@ def compute_patch_scores(
     target_layers=(14, 15, 16, 17),
     gaussian_sigma=1.0, gaussian_ks=3,
 ):
-    device         = next(model.parameters()).device
     score_size     = get_score_size(processor)
     grid_size      = score_size // PATCH_SIZE
     n_patches      = grid_size * grid_size
@@ -190,10 +196,15 @@ def compute_patch_scores(
     clean_q  = _clean_question(question)
 
     # Pass 1: question-specific
-    inputs_q    = _make_score_inputs(processor, padded, clean_q, device, score_size)
+    inputs_q    = _make_score_inputs(processor, padded, clean_q, score_size)
     full_ids    = inputs_q["input_ids"]
     seq_len     = full_ids.shape[1]
-    image_pos   = (full_ids[0] == image_token_id).nonzero(as_tuple=True)[0].cpu()
+    # Find image pad token — it's the most frequent token with id > 150000
+    ids_list = full_ids[0].tolist()
+    from collections import Counter
+    high_tokens = Counter(t for t in ids_list if t > 150000)
+    image_token_id_actual = high_tokens.most_common(1)[0][0] if high_tokens else image_token_id
+    image_pos   = (full_ids[0] == image_token_id_actual).nonzero(as_tuple=True)[0].cpu()
     img_end     = int(image_pos[-1])
     text_pos    = torch.arange(img_end + 1, seq_len, dtype=torch.long)
     pixel_vals  = inputs_q["pixel_values"]
@@ -204,13 +215,16 @@ def compute_patch_scores(
     if "image_sizes" in inputs_q:
         fwd_kw["image_sizes"] = inputs_q["image_sizes"]
 
+    # Temporarily switch to eager attention for output_attentions support
+    orig_attn = model.config._attn_implementation if hasattr(model.config, '_attn_implementation') else None
+    model.config._attn_implementation = "eager"
     with torch.inference_mode():
         out_q = model(input_ids=full_ids, **fwd_kw)
     A_q = _extract_attn_scores(out_q, text_pos, image_pos, target_layers)
     del out_q; torch.cuda.empty_cache()
 
     # Pass 2: generic
-    inputs_g     = _make_score_inputs(processor, padded, GENERIC_PROMPT, device, score_size)
+    inputs_g     = _make_score_inputs(processor, padded, GENERIC_PROMPT, score_size)
     gen_ids      = inputs_g["input_ids"]
     gen_text_pos = torch.arange(img_end + 1, gen_ids.shape[1], dtype=torch.long)
 
@@ -224,6 +238,9 @@ def compute_patch_scores(
         out_g = model(input_ids=gen_ids, **fwd_g)
     A_g = _extract_attn_scores(out_g, gen_text_pos, image_pos, target_layers)
     del out_g; torch.cuda.empty_cache()
+    # Restore original attention implementation
+    if orig_attn is not None:
+        model.config._attn_implementation = orig_attn
 
     patch_scores = A_q / (A_g + 1e-8)
 
@@ -332,33 +349,39 @@ def run_lpd_on_original(patch_ids, original_image, meta, grid_size, patch_size=N
 
 
 # =========================================================
-# Inference  (all via apply_chat_template)
+# Inference — official HuggingFace usage
+# Key: processor(images=..., text=...).to("cuda:0", torch.float16)
 # =========================================================
 
 def _ov_generate(model, processor, images, question, max_new_tokens):
-    device = next(model.parameters()).device
-    img_tokens = "<image>" * len(images)
-    # Qwen2 chat format: content must be plain string
-    conversation = [{"role": "user", "content": img_tokens + "\n" + question}]
-    prompt = processor.tokenizer.apply_chat_template(
-        conversation, add_generation_prompt=True, tokenize=False)
-    img_input = images[0] if len(images) == 1 else images
-    inputs = processor(text=prompt, images=img_input, return_tensors="pt").to(device)
-    # image_sizes is required by modeling_llava_onevision; inject if missing
-    if "image_sizes" not in inputs:
-        pv = inputs["pixel_values"]
-        # pv shape: [B, C, H, W]
-        h, w = int(pv.shape[-2]), int(pv.shape[-1])
-        inputs["image_sizes"] = torch.tensor([[h, w]] * pv.shape[0], device=pv.device)
-    with torch.inference_mode():
-        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    return processor.batch_decode(
-        out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
-    )[0].strip()
+    content_list = []
+    for _ in images:
+        content_list.append({"type": "image"})
+    content_list.append({"type": "text", "text": question})
+    conversation = [{"role": "user", "content": content_list}]
+    prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+
+    # Limit each image to max 6 sub-tiles + 1 global = 7 tiles
+    # by capping the longest edge so processor picks a valid pinpoint <= 6 sub-tiles
+    tile_size = 384
+    max_long_edge = tile_size * 6  # 2304 — fits in a 1x6 or 2x3 grid = 6 sub-tiles
+    capped = []
+    for img in images:
+        w, h = img.size
+        if max(w, h) > max_long_edge:
+            scale = max_long_edge / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+        capped.append(img)
+
+    img_input = capped if len(capped) > 1 else capped[0]
+    inputs = processor(images=img_input, text=prompt, return_tensors="pt").to(0, torch.float16)
+    eos_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+    output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=eos_id)
+    return processor.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
 
 
 def run_baseline_inference(model, processor, image, question, max_new_tokens=32):
-    """Baseline: original image with native OneVision anyres."""
+    """Baseline: original image with native OneVision anyres, max 7 tiles (6 sub + 1 global)."""
     return _ov_generate(model, processor, [image.convert("RGB")], question, max_new_tokens)
 
 

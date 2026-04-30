@@ -32,6 +32,10 @@ import argparse
 import pandas as pd
 from tqdm import tqdm
 from PIL import Image
+import logging
+import warnings
+logging.getLogger("transformers").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
 
 _HERE         = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
@@ -704,10 +708,8 @@ def main():
     model = LlavaOnevisionForConditionalGeneration.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
-        device_map="auto",
-        attn_implementation="eager",
-        ignore_mismatched_sizes=True,
-    )
+        low_cpu_mem_usage=True,
+    ).to(0)
     model.eval()
     print("Model ready. Device: {}".format(next(model.parameters()).device))
 
