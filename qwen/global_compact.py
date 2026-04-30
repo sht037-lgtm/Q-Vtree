@@ -5,8 +5,7 @@ Pipeline (tree mode):
   Pass 1  : score patches via relative cross-attention (question vs generic)
   Select  : QuadTree navigator picks salient patches
   LPD     : build a compact image from selected patches only
-  Pass 2  : inference with the original full image AND the compact image together,
-            giving the model global context + fine-grained selected detail
+  Pass 2  : inference with the original full image AND the compact image together
 """
 from __future__ import annotations
 
@@ -337,7 +336,7 @@ def run_baseline_inference(
     inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
     with torch.inference_mode():
-        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
     return processor.batch_decode(
         out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
@@ -369,18 +368,14 @@ def run_tree_inference(
     n_selected   = int(patch_ids.numel())
     n_total      = grid_h * grid_w
     select_ratio = n_selected / n_total if n_total > 0 else 0.0
-    print(f"[GLOBAL-COMPACT] selected: {n_selected} / {n_total} = {select_ratio:.1%}")
 
     compact_image, merged_bboxes = run_lpd(patch_ids, image, grid_h, grid_w)
 
-    # Pass 2: 原图（全局上下文）+ compact 图（选中的细节区域）
+    # Pass 2: 原图 + compact 图，跟 compact 版本唯一的差别
     messages = [{"role": "user", "content": [
-        {"type": "image", "image": image, "max_pixels": MAX_PIXELS},
+        {"type": "image", "image": image,         "max_pixels": MAX_PIXELS},
         {"type": "image", "image": compact_image, "max_pixels": MAX_PIXELS},
-        {"type": "text",  "text": (
-            "The second image is a detailed view of the first image. "
-            f"{question}"
-        )},
+        {"type": "text",  "text": question},
     ]}]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
@@ -391,7 +386,7 @@ def run_tree_inference(
     inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
     with torch.inference_mode():
-        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
     pred_text = processor.batch_decode(
         out_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
@@ -410,6 +405,17 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
 
     Drop-in replacement for Qwen2_5_VLForConditionalGeneration.
     Pass 2 uses the original image + compact image together.
+
+    Debug attributes written after each `infer()` call:
+        _debug_patch_ids              : List[Tensor]  selected patch indices
+        _debug_patch_scores           : List[Tensor]  raw patch scores
+        _debug_num_selected_tokens    : List[int]
+        _debug_num_total_tokens       : List[int]
+        _debug_compact_image          : PIL.Image     compact image used in Pass 2
+        _debug_baseline_gpu_time      : float  seconds (baseline mode)
+        _debug_baseline_peak_memory   : float  GB      (baseline mode)
+        _debug_tree_gpu_time          : float  seconds (tree mode, end-to-end)
+        _debug_tree_peak_memory       : float  GB      (tree mode, peak)
     """
 
     def __init__(self, config):
@@ -470,7 +476,7 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
             _e = torch.cuda.Event(enable_timing=True)
             _s.record()
             with torch.inference_mode():
-                out_ids = self.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+                out_ids = self.generate(**inputs, max_new_tokens=max_new_tokens)
             _e.record()
             torch.cuda.synchronize()
 
@@ -485,7 +491,10 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
             return pred_text
 
         # ── Tree (Global-Compact) mode ──────────────────────────────────
-        torch.cuda.reset_peak_memory_stats()
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
         _st = torch.cuda.Event(enable_timing=True)
         _et = torch.cuda.Event(enable_timing=True)
         _st.record()
@@ -521,13 +530,11 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
         self._debug_compact_image = compact_image
 
         # Step 4 – inference with original image + compact image
+        # 跟 compact 版本唯一的差别：多加了一张原图
         messages = [{"role": "user", "content": [
-            {"type": "image", "image": image, "max_pixels": MAX_PIXELS},
+            {"type": "image", "image": image,         "max_pixels": MAX_PIXELS},
             {"type": "image", "image": compact_image, "max_pixels": MAX_PIXELS},
-            {"type": "text",  "text": (
-                "The second image is a detailed view of the first image. "
-                f"{question}"
-            )},
+            {"type": "text",  "text": question},
         ]}]
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -540,7 +547,7 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
         inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
         with torch.inference_mode():
-            out_ids = self.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            out_ids = self.generate(**inputs, max_new_tokens=max_new_tokens)
 
         _et.record()
         torch.cuda.synchronize()
