@@ -561,7 +561,7 @@ class Qwen2_5_VLForConditionalGenerationWithTree(Qwen2_5_VLForConditionalGenerat
 
         # Step 4 – inference with compact image only
         messages = [{"role": "user", "content": [
-            {"type": "image", "image": compact_image},
+            {"type": "image", "image": compact_image, "max_pixels": MAX_PIXELS},
             {"type": "text",  "text": question},
         ]}]
         text = processor.apply_chat_template(

@@ -388,7 +388,6 @@ class InternVLChatModelWithTree(InternVLChatModel):
             best_ratio: Optional[Tuple[int, int]] = None,
             **generate_kwargs,
     ) -> torch.LongTensor:
-
         assert self.img_context_token_id is not None
 
         if pixel_values is not None:
@@ -521,6 +520,12 @@ class InternVLChatModelWithTree(InternVLChatModel):
         _et = torch.cuda.Event(enable_timing=True)
         _st.record()
 
+        DUAL_IMAGE_GUIDANCE = (
+            "The first image is the full image. "
+            "The second image is a compact detailed view made from selected relevant regions of the first image. "
+            "Use the second image to inspect fine details, and use the first image only for global spatial context.\n"
+        )
+
         def _build_query(n_patches):
             template = get_conv_template(self.template)
             template.system_message = self.system_message
@@ -529,6 +534,22 @@ class InternVLChatModelWithTree(InternVLChatModel):
             q = template.get_prompt()
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * n_patches + IMG_END_TOKEN
             q = q.replace('<image>', image_tokens, 1)
+            eos = tokenizer.convert_tokens_to_ids(template.sep.strip())
+            return q, eos
+
+        def _build_query_dual(n_patches_1, n_patches_2):
+            template = get_conv_template(self.template)
+            template.system_message = self.system_message
+            template.append_message(
+                template.roles[0],
+                '<image>\n<image>\n' + DUAL_IMAGE_GUIDANCE + question,
+            )
+            template.append_message(template.roles[1], None)
+            q = template.get_prompt()
+            img_tok_1 = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * n_patches_1 + IMG_END_TOKEN
+            img_tok_2 = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * n_patches_2 + IMG_END_TOKEN
+            q = q.replace('<image>', img_tok_1, 1)
+            q = q.replace('<image>', img_tok_2, 1)
             eos = tokenizer.convert_tokens_to_ids(template.sep.strip())
             return q, eos
 
@@ -607,33 +628,24 @@ class InternVLChatModelWithTree(InternVLChatModel):
         self._debug_select_ratios       = [n_sel / n_tot if n_tot > 0 else 0.0]
 
         # ── Pass 2: inference with global image + compact image ──
-        import tempfile, os as _os
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        compact_image.save(tmp.name)
-        tmp.close()
-
         compact_tiles, compact_ratio = dynamic_preprocess(
             compact_image, min_num=1, max_num=max_num,
             image_size=input_size, use_thumbnail=True,
         )
         compact_pv = torch.stack([transform(t) for t in compact_tiles]).to(dtype=dtype, device=device)
 
-        # combine global pixel_values + compact pixel_values
         combined_pv = torch.cat([pixel_values, compact_pv], dim=0)
-        n_combined = len(tiles) + len(compact_tiles)
 
-        query2, _ = _build_query(n_combined)
+        query2, _ = _build_query_dual(len(tiles), len(compact_tiles))
         inputs2 = tokenizer(query2, return_tensors='pt')
         input_ids2 = inputs2['input_ids'].to(device)
         attention_mask2 = inputs2['attention_mask'].to(device)
-
-        _os.unlink(tmp.name)
 
         _s2 = torch.cuda.Event(enable_timing=True)
         _e2 = torch.cuda.Event(enable_timing=True)
         _s2.record()
 
-        outputs = super().generate(
+        outputs = super(InternVLChatModelWithTree, self).generate(
             pixel_values=combined_pv,
             input_ids=input_ids2,
             attention_mask=attention_mask2,
@@ -652,4 +664,3 @@ class InternVLChatModelWithTree(InternVLChatModel):
         response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
         response = response.split(tokenizer.decode([eos_token_id]).strip())[0].strip()
         return response
-        
